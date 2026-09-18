@@ -341,10 +341,16 @@ int SetWPAVersion(struct SDIO *sdio, struct WiFiNetwork *network, ULONG wpa_vers
    after the last frame before it goes back to sleep */
 #define POLL_STACKSIZE          (8192 / sizeof(ULONG))
 #define POLL_PRIORITY           -128
-#define POLL_GRACE_US           2000
+#define POLL_GRACE_US           10000
 
 #define PACKET_WAIT_DELAY_MIN   1000
-#define PACKET_WAIT_DELAY_MAX   100000
+/*
+ * The idle back-off used to reach 100 ms, and the first frame after a quiet
+ * second waited for it: ping at 1 s intervals averaged 51 ms (max 169) against
+ * 6.9 ms at 20 ms intervals, A1200 + PiStorm32 Lite, 2026-09-18.  8 ms caps
+ * that at the cost of 125 empty looks a second when idle.
+ */
+#define PACKET_WAIT_DELAY_MAX   8000
 
 #define PACKET_INITIAL_FETCH_SIZE   16
 
