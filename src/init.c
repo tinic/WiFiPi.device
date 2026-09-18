@@ -146,9 +146,23 @@ int _strncmp(CONST_STRPTR s1, CONST_STRPTR s2, ULONG n)
 	return (*(const unsigned char *)s1 - *(const unsigned char *)(s2 - 1));
 }
 
+/*
+ * ExecBase from location 4, read in a way GCC does not see through: a plain
+ * `*(struct ExecBase **)4` is "array subscript 0 outside the bounds of an
+ * array at address 4" to -Warray-bounds once optimisation looks at it, and
+ * the tree that builds this driver compiles with -Werror.
+ */
+static inline struct ExecBase *AbsExecBase(void)
+{
+    struct ExecBase *base;
+
+    __asm volatile ("move.l 4.w,%0" : "=r" (base));
+    return base;
+}
+
 APTR AllocVecPooled(APTR pool, ULONG byteSize)
 {
-    struct ExecBase *SysBase = *(struct ExecBase **)4UL;
+    struct ExecBase *SysBase = AbsExecBase();
     ULONG *buffer = AllocPooled(pool, byteSize + 8);
 
     /* Do not continue on failure! */
@@ -161,7 +175,7 @@ APTR AllocVecPooled(APTR pool, ULONG byteSize)
 
 APTR AllocVecPooledClear(APTR pool, ULONG byteSize)
 {
-    struct ExecBase *SysBase = *(struct ExecBase **)4UL;
+    struct ExecBase *SysBase = AbsExecBase();
     ULONG *buffer = AllocPooled(pool, byteSize + 8);
     
     /* Do not continue on failure! */
@@ -178,7 +192,7 @@ APTR AllocVecPooledClear(APTR pool, ULONG byteSize)
 
 APTR AllocPooledClear(APTR pool, ULONG byteSize)
 {
-    struct ExecBase *SysBase = *(struct ExecBase **)4UL;
+    struct ExecBase *SysBase = AbsExecBase();
     ULONG *buffer = AllocPooled(pool, byteSize);
 
     /* Do not continue on failure! */
@@ -194,7 +208,7 @@ APTR AllocPooledClear(APTR pool, ULONG byteSize)
 
 void FreeVecPooled(APTR pool, APTR buf)
 {
-    struct ExecBase *SysBase = *(struct ExecBase **)4UL;
+    struct ExecBase *SysBase = AbsExecBase();
     
     if (!buf) return;
 
