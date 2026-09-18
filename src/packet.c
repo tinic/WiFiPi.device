@@ -337,6 +337,12 @@ int SetWPAVersion(struct SDIO *sdio, struct WiFiNetwork *network, ULONG wpa_vers
 #define PACKET_RECV_STACKSIZE   (65536 / sizeof(ULONG))
 #define PACKET_RECV_PRIORITY    5
 
+/* The poller: lowest priority, a small stack, and how long it keeps looking
+   after the last frame before it goes back to sleep */
+#define POLL_STACKSIZE          (8192 / sizeof(ULONG))
+#define POLL_PRIORITY           -128
+#define POLL_GRACE_US           2000
+
 #define PACKET_WAIT_DELAY_MIN   1000
 #define PACKET_WAIT_DELAY_MAX   100000
 
@@ -813,6 +819,127 @@ ULONG ProcessPacket(struct SDIO *sdio, struct Packet *pkt)
 
 int SendGlomDataPacket(struct SDIO *sdio, struct IOSana2Req **ioList, UBYTE count);
 
+/*
+ * THE POLLER.  On Emu68 every interrupt costs ~20 us of exception entry
+ * and the WLAN host's line is not to be had anyway (it is the SD card's,
+ * see sdio_int_attach); a timer tick sees a frame up to a millisecond late.
+ * This task runs at the lowest priority -- it only ever gets the CPU when
+ * nothing else wants it -- and looks at the card's line in the host's
+ * status register, a 20 ns read.  The moment the line is up it signals the
+ * receiver and waits; the receiver drains the card and signals it back, and
+ * it looks again.  After POLL_GRACE_US without a frame it sleeps until the
+ * receiver has seen traffic (a tick that found a frame or sent one).  The
+ * timer tick stays: it is what wakes everything when the machine was idle.
+ */
+static inline ULONG PollClock(struct WiFiBase *WiFiBase)
+{
+    return rd32(WiFiBase->w_SysTimer, 4);       /* CLO, 1 MHz */
+}
+
+static void PacketPoller(struct SDIO *sdio)
+{
+    struct ExecBase *SysBase = sdio->s_SysBase;
+    struct WiFiBase *WiFiBase = sdio->s_WiFiBase;
+    BYTE sig = AllocSignal(-1);
+    ULONG got;
+
+    if (sig < 0 || WiFiBase->w_SysTimer == NULL)
+    {
+        sdio->s_PollTask = NULL;
+        if (sig >= 0)
+            FreeSignal(sig);
+        return;
+    }
+    sdio->s_PollWake = 1UL << sig;
+
+    for (;;)
+    {
+        sdio->s_PollAsleep = TRUE;
+        got = Wait(SIGBREAKF_CTRL_C | sdio->s_PollWake);
+        sdio->s_PollAsleep = FALSE;
+        if (got & SIGBREAKF_CTRL_C)
+            break;
+
+        ULONG since = PollClock(WiFiBase);
+        for (;;)
+        {
+            if (sdio_card_asserting(sdio))
+            {
+                sdio->s_StatPollHits++;
+                /* asleep BEFORE the Signal: the receiver outranks this task
+                   and may run to its PokePoller before the next line here */
+                sdio->s_PollAsleep = TRUE;
+                Signal(sdio->s_ReceiverTask, 1UL << sdio->s_PollSignal);
+                got = Wait(SIGBREAKF_CTRL_C | sdio->s_PollWake);
+                sdio->s_PollAsleep = FALSE;
+                if (got & SIGBREAKF_CTRL_C)
+                    goto out;
+                since = PollClock(WiFiBase);
+                continue;
+            }
+            if ((ULONG)(PollClock(WiFiBase) - since) > POLL_GRACE_US)
+            {
+                sdio->s_StatPollSleeps++;
+                break;
+            }
+        }
+    }
+out:
+    sdio->s_PollWake = 0;
+    sdio->s_PollTask = NULL;
+    /* the receiver waits for this before it frees the signal and goes */
+    Signal(sdio->s_ReceiverTask, 1UL << sdio->s_PollSignal);
+    FreeSignal(sig);
+}
+
+static void StartPoller(struct SDIO *sdio)
+{
+    struct ExecBase *SysBase = sdio->s_SysBase;
+    struct Task *task = AllocMem(sizeof(struct Task), MEMF_PUBLIC | MEMF_CLEAR);
+    struct MemList *ml = AllocMem(sizeof(struct MemList) + sizeof(struct MemEntry), MEMF_PUBLIC | MEMF_CLEAR);
+    ULONG *stack = AllocMem(POLL_STACKSIZE * sizeof(ULONG), MEMF_PUBLIC | MEMF_CLEAR);
+    static const char task_name[] = "WiFiPi Poller";
+
+    if (task == NULL || ml == NULL || stack == NULL)
+    {
+        if (task) FreeMem(task, sizeof(struct Task));
+        if (ml) FreeMem(ml, sizeof(struct MemList) + sizeof(struct MemEntry));
+        if (stack) FreeMem(stack, POLL_STACKSIZE * sizeof(ULONG));
+        return;
+    }
+
+    ml->ml_NumEntries = 2;
+    ml->ml_ME[0].me_Un.meu_Addr = task;
+    ml->ml_ME[0].me_Length = sizeof(struct Task);
+    ml->ml_ME[1].me_Un.meu_Addr = &stack[0];
+    ml->ml_ME[1].me_Length = POLL_STACKSIZE * sizeof(ULONG);
+
+    task->tc_UserData = sdio;
+    task->tc_SPLower = &stack[0];
+    task->tc_SPUpper = &stack[POLL_STACKSIZE];
+    stack = (ULONG *)task->tc_SPUpper;
+    *--stack = (ULONG)sdio;
+    task->tc_SPReg = stack;
+    task->tc_Node.ln_Name = (char *)task_name;
+    task->tc_Node.ln_Type = NT_TASK;
+    task->tc_Node.ln_Pri = POLL_PRIORITY;
+    _NewList((struct MinList *)&task->tc_MemEntry);
+    AddHead(&task->tc_MemEntry, &ml->ml_Node);
+
+    sdio->s_PollTask = task;
+    AddTask(task, (APTR)PacketPoller, NULL);
+}
+
+/* Wake the poller if it sleeps: one Signal() (an 11 us trap on Emu68) per
+   burst, not per frame */
+static inline void PokePoller(struct SDIO *sdio)
+{
+    struct ExecBase *SysBase = sdio->s_SysBase;
+
+    if (sdio->s_PollTask != NULL && sdio->s_PollAsleep && sdio->s_PollWake != 0)
+        Signal(sdio->s_PollTask, sdio->s_PollWake);
+}
+
 void PacketReceiver(struct SDIO *sdio, struct Task *caller)
 {
     struct ExecBase *SysBase = sdio->s_SysBase;
@@ -882,6 +1009,10 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
     ULONG irqEmpty = 0;         // consecutive card interrupts that found no frame
     ULONG irqStorms = 0;        // consecutive ticks that found the line parked
     BOOL  irqParked = FALSE;    // line left masked until the next tick (storm breaker)
+    ULONG pollMask = 0;
+    ULONG pollEmpty = 0;        // consecutive poller wake-ups that found no frame
+    BOOL  pollDead = FALSE;     // a line that stays up with nothing behind it: poller retired
+    sdio_card_int_expose(sdio);
     sdio->s_IRQSignal = AllocSignal(-1);
     if (sdio->s_IRQSignal >= 0)
     {
@@ -892,6 +1023,12 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
             FreeSignal(sdio->s_IRQSignal);
             sdio->s_IRQSignal = -1;
         }
+    }
+    sdio->s_PollSignal = AllocSignal(-1);
+    if (sdio->s_PollSignal >= 0)
+    {
+        pollMask = 1UL << sdio->s_PollSignal;
+        StartPoller(sdio);
     }
 
     // Signal caller that we are done with setup
@@ -917,7 +1054,7 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
         ULONG sigSet = Wait(SIGBREAKF_CTRL_C | 
                             (1 << port->mp_SigBit) |
                             (1 << ctrl->mp_SigBit) |
-                            irqMask);
+                            irqMask | pollMask);
        
         // Signal from control message port?
         if (sigSet & (1 << ctrl->mp_SigBit))
@@ -1023,7 +1160,7 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
 
         // Signal from timer.device, from the control message port or from the card?
         // All are great occasions to test if some data is pending
-        if (sigSet & ((1 << port->mp_SigBit) | (1 << ctrl->mp_SigBit) | irqMask))
+        if (sigSet & ((1 << port->mp_SigBit) | (1 << ctrl->mp_SigBit) | irqMask | pollMask))
         {
             if (sigSet & (1 << ctrl->mp_SigBit))
             {
@@ -1032,12 +1169,15 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
             }
 
             /*
-             * The card's interrupt status is sticky: clear it BEFORE the
-             * frames are read, so a frame that lands after the last read
-             * sets it again and raises the line once the host looks again.
+             * The card's interrupt status is sticky and, once its interrupts
+             * are enabled, the firmware expects it serviced -- with the line
+             * up and nobody clearing it TX credits came back late and TX
+             * halved (57 -> 25 Mbit/s, 2026-09-18).  Clear it whenever the
+             * line is up, whatever woke us, and BEFORE the frames are read,
+             * so a frame that lands after the last read sets it again.
              */
-            if (sigSet & irqMask)
-                sdio->GetIntStatus(sdio);
+            if (sdio_card_asserting(sdio))
+                sdio_service_card(sdio);
 
             sdio->RecvPKT(buffer, PACKET_INITIAL_FETCH_SIZE, sdio);
 
@@ -1176,6 +1316,22 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
             }
 
             /*
+             * Traffic: the poller watches the line for the next POLL_GRACE_US.
+             * The line is up for credits and mailbox events too, not only for
+             * frames, so an empty poll wake-up is normal; a line that is STILL
+             * up after the clear, sixteen wake-ups running with nothing read,
+             * is a status the clear does not reach and would have the two
+             * tasks chase each other at full speed -- the poller is retired
+             * and the tick carries on alone.
+             */
+            if (sigSet & pollMask)
+                pollEmpty = (!gotTransfer && sdio_card_asserting(sdio)) ? pollEmpty + 1 : 0;
+            if (pollEmpty >= 16)
+                pollDead = TRUE;
+            if (!pollDead && (gotTransfer || sendTransfer || (sigSet & pollMask)))
+                PokePoller(sdio);
+
+            /*
              * Drained: let the host raise the card's line again.  A line that
              * keeps asserting with nothing to read (a status the clear did
              * not reach) would otherwise spin this task; after four such
@@ -1222,6 +1378,17 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
     }
 
     D(bug("[WiFi.RECV] Packet receiver is closing now\n"));
+    if (sdio->s_PollTask != NULL)
+    {
+        /* it runs at -128: wait for its goodbye so it gets the CPU to leave */
+        Signal(sdio->s_PollTask, SIGBREAKF_CTRL_C);
+        Wait(pollMask);
+    }
+    if (sdio->s_PollSignal >= 0)
+    {
+        FreeSignal(sdio->s_PollSignal);
+        sdio->s_PollSignal = -1;
+    }
     sdio_int_detach(sdio);
     if (sdio->s_IRQSignal >= 0)
     {

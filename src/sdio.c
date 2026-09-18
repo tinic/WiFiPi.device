@@ -781,8 +781,10 @@ ULONG sdio_getintstatus(struct SDIO * sdio)
 
     S_LOCK(sdio);
 
-    /* clear all interrupts */
-    reg_addr = sdio->s_CC->c_BaseAddress + SD_REG(intstatus);
+    /* Read and clear the SDIO device core's intstatus -- the register the
+       hostintmask was written to (wifipi.c).  It used to read chipcommon's,
+       which cleared nothing: the card's line stayed up after every "clear". */
+    reg_addr = sdio->s_SDIOC->c_BaseAddress + SD_REG(intstatus);
 
     D(bug("[WiFi] sdio_getintstatus, reg_addr = %08lx, ints = ", reg_addr));
 
@@ -906,14 +908,69 @@ BOOL sdio_int_attach(struct SDIO *sdio)
     }
     sdio->s_StatIRQLine = WiFiBase->w_SDIOIRQ;
 
+    /* The card's line is already exposed (sdio_card_int_expose); raise the IRQ on it too */
+    sdio_int_gate(sdio, TRUE);
+    return TRUE;
+}
+
+void sdio_card_int_expose(struct SDIO *sdio)
+{
+    struct ExecBase *SysBase = sdio->s_SysBase;
+
     /* The card: master enable plus both functions, as brcmfmac claims them */
     S_LOCK(sdio);
     sdio->WriteByte(SD_FUNC_CIA, SDIO_CCCR_IENx, SDIO_CCCR_IEN_M | SDIO_CCCR_IEN_1 | SDIO_CCCR_IEN_2, sdio);
     S_UNLOCK(sdio);
 
-    /* The host: show the line in the status register and raise the IRQ on it */
-    sdio_int_gate(sdio, TRUE);
-    return TRUE;
+    /* The host: the status enable only; IRPT_EN stays as it is */
+    wr32(sdio->s_SDIO, EMMC_IRPT_MASK, rd32(sdio->s_SDIO, EMMC_IRPT_MASK) | SD_CARD_INTERRUPT);
+}
+
+BOOL sdio_card_asserting(struct SDIO *sdio)
+{
+    return (rd32(sdio->s_SDIO, EMMC_INTERRUPT) & SD_CARD_INTERRUPT) != 0;
+}
+
+ULONG sdio_service_card(struct SDIO *sdio)
+{
+    struct ExecBase *SysBase = sdio->s_SysBase;
+    ULONG base = sdio->s_SDIOC->c_BaseAddress;
+    ULONG ints;
+
+    S_LOCK(sdio);
+    ints = sdio->Read32(base + SD_REG(intstatus), sdio);
+    if (ints != 0)
+    {
+        sdio->Write32(base + SD_REG(intstatus), ints, sdio);
+        sdio->s_StatIntStatus = ints;
+    }
+    if (ints & I_HMB_HOST_INT)
+    {
+        /* brcmf_sdio_hostmail(): read the word, acknowledge the interrupt.
+           What the word says (a NAK to handle, flow control per priority,
+           firmware ready or halted) is recorded, not yet acted on. */
+        sdio->s_StatMailboxData = sdio->Read32(base + SD_REG(tohostmailboxdata), sdio);
+        sdio->Write32(base + SD_REG(tosbmailbox), SMB_INT_ACK, sdio);
+        sdio->s_StatMailboxes++;
+    }
+    S_UNLOCK(sdio);
+
+    /*
+     * The host latches the card-interrupt status: measured 2026-09-18, with
+     * the card's intstatus cleared and CCCR INTx pending reading 0, bit 8
+     * stayed set, and writing it (it is not write-1-to-clear, SDHCI 2.2.17)
+     * changed nothing.  What re-samples the line is the status enable: off
+     * and on again, the way the SDHCI spec says a card interrupt is cleared.
+     * A card that still asserts sets the bit again at once, which is the
+     * level the poller wants.
+     */
+    {
+        ULONG mask = rd32(sdio->s_SDIO, EMMC_IRPT_MASK);
+
+        wr32(sdio->s_SDIO, EMMC_IRPT_MASK, mask & ~SD_CARD_INTERRUPT);
+        wr32(sdio->s_SDIO, EMMC_IRPT_MASK, mask | SD_CARD_INTERRUPT);
+    }
+    return ints;
 }
 
 void sdio_int_rearm(struct SDIO *sdio)
@@ -929,10 +986,8 @@ void sdio_int_detach(struct SDIO *sdio)
     if (sdio->s_GICBase == NULL)
         return;
 
-    sdio_int_gate(sdio, FALSE);
-    S_LOCK(sdio);
-    sdio->WriteByte(SD_FUNC_CIA, SDIO_CCCR_IENx, 0, sdio);
-    S_UNLOCK(sdio);
+    /* The IRQ enable only: the status enable stays for the poller */
+    wr32(sdio->s_SDIO, EMMC_IRPT_EN, rd32(sdio->s_SDIO, EMMC_IRPT_EN) & ~SD_CARD_INTERRUPT);
     gic_rem(sdio->s_GICBase, WiFiBase->w_SDIOIRQ, &sdio->s_Interrupt);
     CloseLibrary(sdio->s_GICBase);
     sdio->s_GICBase = NULL;
@@ -954,6 +1009,7 @@ struct SDIO *sdio_init(struct WiFiBase *WiFiBase)
 
     InitSemaphore(&sdio->s_Lock);
     sdio->s_IRQSignal = -1;
+    sdio->s_PollSignal = -1;
 
     /* Put few functions into the struct */
     sdio->IsError = is_error;

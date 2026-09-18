@@ -1374,7 +1374,8 @@ static int Do_S2_GETSPECIALSTATS(struct IOSana2Req *io)
     static const char * const names[] = {
         "receiver wake-ups", "wake-ups with no frame", "frames received", "wake-ups with a burst",
         "longest burst", "frames sent", "wake-ups stalled on TX credit", "card interrupts",
-        "card interrupt line (GIC)"
+        "card interrupt line (GIC)", "poller saw the line", "poller went to sleep",
+        "card intstatus (last)", "mailbox interrupts", "mailbox data (last)"
     };
     const ULONG *counters = &sdio->s_StatWakes;
     ULONG n = sizeof(names) / sizeof(names[0]);

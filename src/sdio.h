@@ -303,11 +303,24 @@ struct SDIO {
     ULONG               s_StatTXStalls;     // wake-ups with writes waiting and no TX credit
     ULONG               s_StatIRQs;         // card interrupts taken by the server
     ULONG               s_StatIRQLine;      // the GIC number the server is on, 0 = polling only
+    ULONG               s_StatPollHits;     // times the poller saw the card's line up
+    ULONG               s_StatPollSleeps;   // times the poller's grace ran out
+    ULONG               s_StatIntStatus;    // the card's last non-zero intstatus, as cleared
+    ULONG               s_StatMailboxes;    // host mailbox interrupts acknowledged
+    ULONG               s_StatMailboxData;  // the last tohostmailboxdata
 
     /* The card interrupt: a server on the GIC through gic400.library */
     struct Interrupt    s_Interrupt;
     struct Library *    s_GICBase;
     BYTE                s_IRQSignal;        // receiver task's signal the server raises, -1 = none
+
+    /* The poller: a task at the lowest priority that watches the card's
+       line in the host's status register (20 ns a look) while the machine
+       has nothing better to do, and wakes the receiver the moment it rises */
+    struct Task *       s_PollTask;
+    ULONG               s_PollWake;         // the poller's own signal, raised by the receiver
+    BYTE                s_PollSignal;       // receiver task's signal the poller raises, -1 = none
+    volatile UBYTE      s_PollAsleep;       // the poller is in Wait(); a Signal is needed to resume it
 
     APTR                s_TXBuffer;
     APTR                s_RXBuffer;
@@ -345,5 +358,16 @@ struct SDIO * sdio_init(struct WiFiBase *WiFiBase);
 BOOL sdio_int_attach(struct SDIO *sdio);
 void sdio_int_detach(struct SDIO *sdio);
 void sdio_int_rearm(struct SDIO *sdio);
+
+/* The card's line without an interrupt: the card's interrupt enables and the
+   host's status enable, but not its IRQ enable, so the SDHCI status register
+   shows the line's level and raises nothing.  asserting() is that one bit. */
+void sdio_card_int_expose(struct SDIO *sdio);
+BOOL sdio_card_asserting(struct SDIO *sdio);
+
+/* Read and clear the SDIO core's intstatus, acknowledge a host mailbox
+   interrupt the way brcmfmac's DPC does (the firmware holds the line until
+   it is); returns the status as it was. */
+ULONG sdio_service_card(struct SDIO *sdio);
 
 #endif /* _SDIO_H */

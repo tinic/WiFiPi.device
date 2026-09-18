@@ -49,6 +49,7 @@ struct WiFiBase
     ULONG *             w_Request;
     ULONG               w_SDIOClock;
     ULONG               w_SDIOIRQ;          // the SDIO host's GIC interrupt number, 0 = none in the tree
+    APTR                w_SysTimer;         // the Pi's 1 MHz system timer (CLO at +4), for the poller
     struct SDIO *       w_SDIO;
     UBYTE *             w_NetworkConfigVar;
     ULONG               w_NetworkConfigLength;

@@ -803,6 +803,9 @@ struct WiFiBase * WiFi_Init(REGARG(struct WiFiBase *base, "d0"), REGARG(BPTR seg
 
             WiFiBase->w_MailBox = (APTR)((ULONG)WiFiBase->w_MailBox - phys_vc4 + phys_cpu);
             WiFiBase->w_SDIOBase = (APTR)((ULONG)WiFiBase->w_SDIOBase - phys_vc4 + phys_cpu);
+            /* The system timer has no node of its own in Emu68's tree; it is at the
+               SoC's fixed 0x7e003000 and translates like the rest of /soc. */
+            WiFiBase->w_SysTimer = (APTR)(0x7e003000UL - phys_vc4 + phys_cpu);
             WiFiBase->w_GPIOBase = (APTR)((ULONG)WiFiBase->w_GPIOBase - phys_vc4 + phys_cpu);
 
             D(bug("[WiFi]   Mailbox at %08lx\n", (ULONG)WiFiBase->w_MailBox));
