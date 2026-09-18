@@ -733,6 +733,19 @@ struct WiFiBase * WiFi_Init(REGARG(struct WiFiBase *base, "d0"), REGARG(BPTR seg
 
                     const ULONG *reg = DT_GetPropValue(DT_FindProperty(key, (CONST_STRPTR)"reg"));
                     WiFiBase->w_SDIOBase = (APTR)reg[address_cells - 1];
+
+                    /*
+                     * `interrupts` in the GIC's three-cell form: type, number,
+                     * flags.  A type-0 entry is an SPI, whose GIC number is 32
+                     * above what the tree says; type 1 is a PPI, 16 above.
+                     * gic400.library takes the GIC number.
+                     */
+                    APTR irq = DT_FindProperty(key, (CONST_STRPTR)"interrupts");
+                    if (irq != NULL && DT_GetPropLen(irq) >= 12)
+                    {
+                        const ULONG *cells = DT_GetPropValue(irq);
+                        WiFiBase->w_SDIOIRQ = cells[1] + (cells[0] == 0 ? 32 : cells[0] == 1 ? 16 : 0);
+                    }
                     DT_CloseKey(key);
                 }
             }               

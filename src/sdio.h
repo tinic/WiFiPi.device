@@ -4,6 +4,7 @@
 #include <exec/execbase.h>
 #include <exec/types.h>
 #include <exec/semaphores.h>
+#include <exec/interrupts.h>
 #include <devices/sana2.h>
 #include <stdint.h>
 
@@ -300,6 +301,13 @@ struct SDIO {
     ULONG               s_StatMaxBurst;     // most frames taken in one wake-up
     ULONG               s_StatTXFrames;     // SANA-II writes pushed to the chip
     ULONG               s_StatTXStalls;     // wake-ups with writes waiting and no TX credit
+    ULONG               s_StatIRQs;         // card interrupts taken by the server
+    ULONG               s_StatIRQLine;      // the GIC number the server is on, 0 = polling only
+
+    /* The card interrupt: a server on the GIC through gic400.library */
+    struct Interrupt    s_Interrupt;
+    struct Library *    s_GICBase;
+    BYTE                s_IRQSignal;        // receiver task's signal the server raises, -1 = none
 
     APTR                s_TXBuffer;
     APTR                s_RXBuffer;
@@ -329,5 +337,13 @@ struct SDIO {
 };
 
 struct SDIO * sdio_init(struct WiFiBase *WiFiBase);
+
+/* The card interrupt.  attach: a server on the GIC, the card's and the host's
+   interrupt enables; FALSE when the tree names no line or gic400.library is
+   missing, and the receiver polls as before.  rearm: after the receiver has
+   drained the card, let the host raise the line again. */
+BOOL sdio_int_attach(struct SDIO *sdio);
+void sdio_int_detach(struct SDIO *sdio);
+void sdio_int_rearm(struct SDIO *sdio);
 
 #endif /* _SDIO_H */

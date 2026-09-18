@@ -48,6 +48,7 @@ struct WiFiBase
     APTR                w_MemPool;
     ULONG *             w_Request;
     ULONG               w_SDIOClock;
+    ULONG               w_SDIOIRQ;          // the SDIO host's GIC interrupt number, 0 = none in the tree
     struct SDIO *       w_SDIO;
     UBYTE *             w_NetworkConfigVar;
     ULONG               w_NetworkConfigLength;

@@ -330,26 +330,6 @@ static int reset_dat(struct SDIO *sdio)
     return 0;
 }
 
-static void handle_card_interrupt(struct SDIO *sdio)
-{
-    // Handle a card interrupt
-
-    // Get the card status
-    if(sdio->s_CardRCA)
-    {
-        cmd_int(SEND_STATUS, sdio->s_CardRCA << 16, 500000, sdio);
-        if(FAIL(sdio))
-        {
-        }
-        else
-        {
-        }
-    }
-    else
-    {
-    }
-}
-
 static void handle_interrupts(struct SDIO *sdio)
 {
     struct ExecBase *SysBase = sdio->s_SysBase;
@@ -407,11 +387,13 @@ static void handle_interrupts(struct SDIO *sdio)
         //SDCardBase->sd_CardRemoval = 1;
     }
 
-    if(irpts & SD_CARD_INTERRUPT)
-    {
-        handle_card_interrupt(sdio);
-        reset_mask |= SD_CARD_INTERRUPT;
-    }
+    /*
+     * SD_CARD_INTERRUPT is the level of the card's interrupt line (DAT1),
+     * not an event: it reads as long as the WLAN chip has something for the
+     * host and clears when IRPT_MASK stops looking at it.  It is the
+     * receiver's business (sdio_int_attach); a SEND_STATUS here would be
+     * answered by nobody -- an SDIO-only card has no CMD13.
+     */
 
     if(irpts & 0x8000)
     {
@@ -813,6 +795,151 @@ ULONG sdio_getintstatus(struct SDIO * sdio)
     return ints;
 }
 
+/* ---------------------------------------------------- card interrupt ---- */
+
+/*
+ * gic400.library: Emu68 delivers the Pi's peripheral interrupts through it.
+ * AddIntServer-shaped: d0 GIC number, d1 priority, d2 0 = level, a1 server;
+ * the LVOs are what the library exports (-30 add, -36 remove).
+ */
+static ULONG gic_add(struct Library *base, ULONG irq, struct Interrupt *is)
+{
+    register ULONG             d0 __asm("d0") = irq;
+    register ULONG             d1 __asm("d1") = 0;
+    register ULONG             d2 __asm("d2") = 0;
+    register struct Interrupt *a1 __asm("a1") = is;
+    register struct Library   *a6 __asm("a6") = base;
+    register ULONG             r  __asm("d0");
+
+    __asm volatile ("jsr a6@(-30:W)"
+                    : "=r" (r) : "r" (a6), "0" (d0), "r" (d1), "r" (d2), "r" (a1)
+                    : "cc", "memory", "a0");
+    return r;
+}
+
+static ULONG gic_rem(struct Library *base, ULONG irq, struct Interrupt *is)
+{
+    register ULONG             d0 __asm("d0") = irq;
+    register struct Interrupt *a1 __asm("a1") = is;
+    register struct Library   *a6 __asm("a6") = base;
+    register ULONG             r  __asm("d0");
+
+    __asm volatile ("jsr a6@(-36:W)"
+                    : "=r" (r) : "r" (a6), "0" (d0), "r" (a1)
+                    : "cc", "memory", "d1", "a0");
+    return r;
+}
+
+/*
+ * The server.  The card interrupt bit is a level (see handle_interrupts), so
+ * the line is silenced by taking it out of both enables -- IRPT_MASK (the
+ * status) and IRPT_EN (the IRQ), the pair Linux's sdhci clears -- not by
+ * writing the status; the receiver drains the card and puts them back
+ * (sdio_int_rearm).  Nothing here touches the SDIO bus.
+ */
+static void sdio_int_gate(struct SDIO *sdio, BOOL open)
+{
+    ULONG mask = rd32(sdio->s_SDIO, EMMC_IRPT_MASK);
+    ULONG en   = rd32(sdio->s_SDIO, EMMC_IRPT_EN);
+
+    if (open)
+    {
+        wr32(sdio->s_SDIO, EMMC_IRPT_MASK, mask | SD_CARD_INTERRUPT);
+        wr32(sdio->s_SDIO, EMMC_IRPT_EN, en | SD_CARD_INTERRUPT);
+    }
+    else
+    {
+        wr32(sdio->s_SDIO, EMMC_IRPT_EN, en & ~SD_CARD_INTERRUPT);
+        wr32(sdio->s_SDIO, EMMC_IRPT_MASK, mask & ~SD_CARD_INTERRUPT);
+    }
+}
+
+static ULONG sdio_int_server(register struct SDIO *sdio __asm("a1"))
+{
+    struct ExecBase *SysBase = sdio->s_SysBase;
+
+    if ((rd32(sdio->s_SDIO, EMMC_INTERRUPT) & SD_CARD_INTERRUPT) == 0)
+        return 0;
+
+    sdio_int_gate(sdio, FALSE);
+    sdio->s_StatIRQs++;
+    Signal(sdio->s_ReceiverTask, 1UL << sdio->s_IRQSignal);
+    return 1;
+}
+
+#define SDIO_CCCR_IENx      0x04
+#define SDIO_CCCR_IEN_M     0x01
+#define SDIO_CCCR_IEN_1     0x02
+#define SDIO_CCCR_IEN_2     0x04
+
+BOOL sdio_int_attach(struct SDIO *sdio)
+{
+    struct ExecBase *SysBase = sdio->s_SysBase;
+    struct WiFiBase *WiFiBase = sdio->s_WiFiBase;
+
+    /* s_StatIRQLine carries the line once attached, else why not: 1 no line
+       in the tree, 2 no signal, 3 no gic400.library, 4 the library refused */
+    if (WiFiBase->w_SDIOIRQ == 0) { sdio->s_StatIRQLine = 1; return FALSE; }
+    if (sdio->s_IRQSignal < 0 || sdio->s_ReceiverTask == NULL) { sdio->s_StatIRQLine = 2; return FALSE; }
+
+    sdio->s_GICBase = OpenLibrary((CONST_STRPTR)"gic400.library", 0);
+    if (sdio->s_GICBase == NULL) { sdio->s_StatIRQLine = 3; return FALSE; }
+
+    sdio->s_Interrupt.is_Node.ln_Type = NT_INTERRUPT;
+    sdio->s_Interrupt.is_Node.ln_Pri  = 0;
+    sdio->s_Interrupt.is_Node.ln_Name = (char *)"wifipi.device";
+    sdio->s_Interrupt.is_Data         = sdio;
+    sdio->s_Interrupt.is_Code         = (void (*)())sdio_int_server;
+    /*
+     * gic400.library (through 1.8) takes ONE server per line, and on the
+     * BCM2711 the WLAN host shares SPI 126 with the SD card host, whose
+     * driver is there first: a refusal here is the normal case on Emu68 and
+     * means polling only.  Enabling the card interrupt anyway would raise a
+     * level the other driver cannot clear -- an INT6 storm and a dead machine.
+     */
+    if (gic_add(sdio->s_GICBase, WiFiBase->w_SDIOIRQ, &sdio->s_Interrupt) != 0)
+    {
+        CloseLibrary(sdio->s_GICBase);
+        sdio->s_GICBase = NULL;
+        sdio->s_StatIRQLine = 4;
+        return FALSE;
+    }
+    sdio->s_StatIRQLine = WiFiBase->w_SDIOIRQ;
+
+    /* The card: master enable plus both functions, as brcmfmac claims them */
+    S_LOCK(sdio);
+    sdio->WriteByte(SD_FUNC_CIA, SDIO_CCCR_IENx, SDIO_CCCR_IEN_M | SDIO_CCCR_IEN_1 | SDIO_CCCR_IEN_2, sdio);
+    S_UNLOCK(sdio);
+
+    /* The host: show the line in the status register and raise the IRQ on it */
+    sdio_int_gate(sdio, TRUE);
+    return TRUE;
+}
+
+void sdio_int_rearm(struct SDIO *sdio)
+{
+    sdio_int_gate(sdio, TRUE);
+}
+
+void sdio_int_detach(struct SDIO *sdio)
+{
+    struct ExecBase *SysBase = sdio->s_SysBase;
+    struct WiFiBase *WiFiBase = sdio->s_WiFiBase;
+
+    if (sdio->s_GICBase == NULL)
+        return;
+
+    sdio_int_gate(sdio, FALSE);
+    S_LOCK(sdio);
+    sdio->WriteByte(SD_FUNC_CIA, SDIO_CCCR_IENx, 0, sdio);
+    S_UNLOCK(sdio);
+    gic_rem(sdio->s_GICBase, WiFiBase->w_SDIOIRQ, &sdio->s_Interrupt);
+    CloseLibrary(sdio->s_GICBase);
+    sdio->s_GICBase = NULL;
+    sdio->s_StatIRQLine = 0;
+}
+
+
 struct SDIO *sdio_init(struct WiFiBase *WiFiBase)
 {
     struct ExecBase *SysBase = WiFiBase->w_SysBase;
@@ -826,6 +953,7 @@ struct SDIO *sdio_init(struct WiFiBase *WiFiBase)
         return NULL;
 
     InitSemaphore(&sdio->s_Lock);
+    sdio->s_IRQSignal = -1;
 
     /* Put few functions into the struct */
     sdio->IsError = is_error;

@@ -825,7 +825,12 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
 
     _NewList(&ctrlWaitList);
 
-    /* Sender port is signal-free */
+    /*
+     * Sender port is signal-free: writes wait for the next wake-up, and the
+     * wake-up sends everything queued as one glom.  Measured 2026-09-18 on
+     * an A1200 + PiStorm32 Lite, 5 GHz: waking on every write cost TX a
+     * third (57 -> 39 Mbit/s, twice) and gave RX and ping nothing.
+     */
     FreeSignal(sender->mp_SigBit);
     sender->mp_Flags = PA_IGNORE;
 
@@ -867,6 +872,27 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
     sdio->s_SenderPort = sender;
     sdio->s_CtrlWaitList = &ctrlWaitList;
 
+    /*
+     * The card's interrupt line, when the tree names one and gic400.library
+     * is there: a frame or a TX credit wakes this task at once instead of at
+     * the next timer tick.  The tick stays as it was, as the fallback.
+     */
+    ULONG irqMask = 0;
+    ULONG irqEmpty = 0;         // consecutive card interrupts that found no frame
+    ULONG irqStorms = 0;        // consecutive ticks that found the line parked
+    BOOL  irqParked = FALSE;    // line left masked until the next tick (storm breaker)
+    sdio->s_IRQSignal = AllocSignal(-1);
+    if (sdio->s_IRQSignal >= 0)
+    {
+        if (sdio_int_attach(sdio))
+            irqMask = 1UL << sdio->s_IRQSignal;
+        else
+        {
+            FreeSignal(sdio->s_IRQSignal);
+            sdio->s_IRQSignal = -1;
+        }
+    }
+
     // Signal caller that we are done with setup
     Signal(caller, SIGBREAKF_CTRL_C);
 
@@ -889,7 +915,8 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
 
         ULONG sigSet = Wait(SIGBREAKF_CTRL_C | 
                             (1 << port->mp_SigBit) |
-                            (1 << ctrl->mp_SigBit));
+                            (1 << ctrl->mp_SigBit) |
+                            irqMask);
        
         // Signal from control message port?
         if (sigSet & (1 << ctrl->mp_SigBit))
@@ -993,15 +1020,23 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
             }
         }
 
-        // Signal from timer.device or from control message port?
-        // Both are great occasions to test if some data is pending
-        if (sigSet & ((1 << port->mp_SigBit) | (1 << ctrl->mp_SigBit)))
+        // Signal from timer.device, from the control message port or from the card?
+        // All are great occasions to test if some data is pending
+        if (sigSet & ((1 << port->mp_SigBit) | (1 << ctrl->mp_SigBit) | irqMask))
         {
             if (sigSet & (1 << ctrl->mp_SigBit))
             {
                 AbortIO(&tr->tr_node);
                 WaitIO(&tr->tr_node);
             }
+
+            /*
+             * The card's interrupt status is sticky: clear it BEFORE the
+             * frames are read, so a frame that lands after the last read
+             * sets it again and raises the line once the host looks again.
+             */
+            if (sigSet & irqMask)
+                sdio->GetIntStatus(sdio);
 
             sdio->RecvPKT(buffer, PACKET_INITIAL_FETCH_SIZE, sdio);
 
@@ -1138,6 +1173,40 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
                 if (burst > sdio->s_StatMaxBurst)
                     sdio->s_StatMaxBurst = burst;
             }
+
+            /*
+             * Drained: let the host raise the card's line again.  A line that
+             * keeps asserting with nothing to read (a status the clear did
+             * not reach) would otherwise spin this task; after four such
+             * interrupts in a row the line stays masked until the next
+             * timer tick re-arms it, so a storm costs at most four
+             * interrupts per tick.
+             */
+            if (sigSet & irqMask)
+            {
+                if (gotTransfer)
+                    irqEmpty = irqStorms = 0;
+                else
+                    irqEmpty++;
+                if (irqEmpty >= 4)
+                    irqParked = TRUE;
+                else
+                    sdio_int_rearm(sdio);
+            }
+            if (irqParked && (sigSet & (1 << port->mp_SigBit)))
+            {
+                irqParked = FALSE;
+                irqEmpty = 0;
+                if (++irqStorms >= 250)
+                {
+                    /* A line that asserts with nothing behind it for a quarter
+                       of a second of ticks is not one to listen to: polling only. */
+                    sdio_int_detach(sdio);
+                    irqMask = 0;
+                }
+                else
+                    sdio_int_rearm(sdio);
+            }
         }
 
         // Shutdown signal?
@@ -1152,6 +1221,12 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
     }
 
     D(bug("[WiFi.RECV] Packet receiver is closing now\n"));
+    sdio_int_detach(sdio);
+    if (sdio->s_IRQSignal >= 0)
+    {
+        FreeSignal(sdio->s_IRQSignal);
+        sdio->s_IRQSignal = -1;
+    }
     CloseDevice(&tr->tr_node);
     DeleteIORequest(&tr->tr_node);
     DeleteMsgPort(port);
