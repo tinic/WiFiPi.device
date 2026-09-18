@@ -1037,71 +1037,91 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
 
             if (gotTransfer)
             {
-                UWORD pktLen = LE16(pkt->p_Length);
-                UWORD pktChk = LE16(pkt->c_ChkSum);
-                
-                if ((pktChk | pktLen) == 0xffff)
+                /*
+                 * Drain.  One SDPCM frame per timer tick was the rule; the
+                 * chip queues more than that as soon as traffic flows (on an
+                 * A1200 + PiStorm32 Lite at 27 Mbit/s in, a third of the ticks
+                 * that found a frame found several, up to 29, 2026-09-18) and
+                 * every extra frame waited for another tick.  Ask again until
+                 * the header read comes back empty; bounded so a flood cannot
+                 * starve the control port.
+                 */
+                ULONG burst = 0;
+
+                for (;;)
                 {
-                    // Until now we have fetched PACKET_INITIAL_FETCH_SIZE bytes only. If packet length is larger, fetch 
-                    // the rest now
-                    if (pktLen > PACKET_INITIAL_FETCH_SIZE)
+                    UWORD pktLen = LE16(pkt->p_Length);
+                    UWORD pktChk = LE16(pkt->c_ChkSum);
+                
+                    if ((pktChk | pktLen) == 0xffff)
                     {
-                        sdio->RecvPKT(&buffer[PACKET_INITIAL_FETCH_SIZE], pktLen - PACKET_INITIAL_FETCH_SIZE, sdio);
-                    }
-
-                    if ((pkt->c_ChannelFlag & 15) == SDPCM_GLOM_CHANNEL)
-                    {
-                        if (pkt->c_ChannelFlag & 0x80)
+                        // Until now we have fetched PACKET_INITIAL_FETCH_SIZE bytes only. If packet length is larger, fetch 
+                        // the rest now
+                        if (pktLen > PACKET_INITIAL_FETCH_SIZE)
                         {
-                            // Announcment of large frame
+                            sdio->RecvPKT(&buffer[PACKET_INITIAL_FETCH_SIZE], pktLen - PACKET_INITIAL_FETCH_SIZE, sdio);
                         }
-                        else
+
+                        if ((pkt->c_ChannelFlag & 15) == SDPCM_GLOM_CHANNEL)
                         {
-                            ULONG pos = pkt->c_DataOffset;
-
-                            while(pos < pktLen)
+                            if (pkt->c_ChannelFlag & 0x80)
                             {
-                                struct Packet *epkt = (APTR)&buffer[pos];
+                                // Announcment of large frame
+                            }
+                            else
+                            {
+                                ULONG pos = pkt->c_DataOffset;
 
-                                ULONG processed = ProcessPacket(sdio, epkt);
+                                while(pos < pktLen)
+                                {
+                                    struct Packet *epkt = (APTR)&buffer[pos];
 
-                                if (processed == 0)
-                                {
-                                    D(bug("[WiFi] Last glom element\n"));
-                                    break;
-                                }
-                                else if (processed == 0xffffffff)
-                                {
-                                    D(bug("[WiFi] Frame error\n"));
-                                    break;
-                                }
-                                else
-                                {
-                                    pos += processed;
-                                    pos = (pos + 3) & ~3;
+                                    ULONG processed = ProcessPacket(sdio, epkt);
+
+                                    if (processed == 0)
+                                    {
+                                        D(bug("[WiFi] Last glom element\n"));
+                                        break;
+                                    }
+                                    else if (processed == 0xffffffff)
+                                    {
+                                        D(bug("[WiFi] Frame error\n"));
+                                        break;
+                                    }
+                                    else
+                                    {
+                                        pos += processed;
+                                        pos = (pos + 3) & ~3;
+                                    }
                                 }
                             }
                         }
+                        else
+                        {
+                            ProcessPacket(sdio, pkt);
+                        }
+
+                        // Mark that we have the transfer, we will wait for next one a bit shorter
+                        gotTransfer = 1;
                     }
                     else
                     {
-                        ProcessPacket(sdio, pkt);
+                        D(bug("[WiFi.RECV] Garbage received. Data:\n"));
+                        for (int i=0; i < 256; i++)
+                        {
+                            if (i % 16 == 0)
+                                bug("[WiFi]  ");
+                            bug(" %02lx", buffer[i]);
+                            if (i % 16 == 15)
+                                bug("\n");
+                        }
                     }
 
-                    // Mark that we have the transfer, we will wait for next one a bit shorter
-                    gotTransfer = 1;
-                }
-                else
-                {
-                    D(bug("[WiFi.RECV] Garbage received. Data:\n"));
-                    for (int i=0; i < 256; i++)
-                    {
-                        if (i % 16 == 0)
-                            bug("[WiFi]  ");
-                        bug(" %02lx", buffer[i]);
-                        if (i % 16 == 15)
-                            bug("\n");
-                    }
+                    if (++burst >= 64)
+                        break;
+                    sdio->RecvPKT(buffer, PACKET_INITIAL_FETCH_SIZE, sdio);
+                    if (LE16(pkt->p_Length) == 0)
+                        break;
                 }
             }
         }
