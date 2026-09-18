@@ -20,6 +20,7 @@
 #include "wifipi.h"
 #include "packet.h"
 #include "brcm_wifi.h"
+#include <aminetxduo/anxs2ext.h>
 
 #ifndef	PAD
 #define	_PADLINE(line)	pad ## line
@@ -1234,6 +1235,104 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
     sdio->s_ReceiverTask = NULL;
 }
 
+/*
+ * The two halves of AmiNetXDuo's single-copy receive (aminetxduo/anxs2ext.h).
+ *
+ * CopySumLongwords: copy `length` bytes and return the ones-complement sum of
+ * the longwords copied, carries folded end-around, the tail zero-padded --
+ * the contract of the stack's n68k_copy_sum_longwords().  Longword loads
+ * from word-aligned addresses: this device runs on a 68040-class core or the
+ * JIT, never on a 68000.
+ *
+ * VerifyIPv4: what that sum is worth once the headers are in cache -- the
+ * IPv4 header checksum and the TCP or UDP checksum, both answered from the
+ * sum and some forty adds, so the opener can skip its own walk.  Refused, so
+ * VERIFIED is never set on a frame it does not describe: anything but IPv4
+ * with a twenty-byte header, a fragment, a total length that is not the whole
+ * payload (Ethernet padding is summed and is not the datagram's), a protocol
+ * other than TCP or UDP, a UDP checksum of zero.  The same rules as the
+ * stack's own netdev_rx_verify4().
+ */
+static ULONG CopySumLongwords(UBYTE *to, const UBYTE *from, ULONG length)
+{
+    ULONG acc = 0;
+    ULONG longs = length >> 2;
+    ULONG tail = length & 3;
+    const ULONG *s = (const ULONG *)from;
+    ULONG *d = (ULONG *)to;
+
+    while (longs--)
+    {
+        ULONG w = *s++;
+        *d++ = w;
+        acc += w;
+        if (acc < w) acc++;
+    }
+    if (tail)
+    {
+        const UBYTE *sb = (const UBYTE *)s;
+        UBYTE *db = (UBYTE *)d;
+        ULONG w = 0;
+        for (ULONG i = 0; i < tail; i++)
+        {
+            db[i] = sb[i];
+            w |= (ULONG)sb[i] << (24 - 8 * i);
+        }
+        acc += w;
+        if (acc < w) acc++;
+    }
+    return acc;
+}
+
+static inline UWORD Be16(const UBYTE *p) { return *(const UWORD *)p; }
+
+static inline UWORD Fold16(ULONG acc)
+{
+    acc = (acc & 0xffffUL) + (acc >> 16);
+    acc = (acc & 0xffffUL) + (acc >> 16);
+    return (UWORD)acc;
+}
+
+static BOOL VerifyIPv4(const UBYTE *ip, ULONG plen, ULONG sum)
+{
+    UWORD total, tlen;
+    UBYTE proto;
+    ULONG acc = 0;
+
+    if (ip[0] != 0x45)
+        return FALSE;                       /* not IPv4, or options */
+    total = Be16(ip + 2);
+    if (total != plen || total < 20)
+        return FALSE;                       /* padded, truncated, or short */
+    if ((ip[6] & 0x3f) != 0 || ip[7] != 0)
+        return FALSE;                       /* MF, or a fragment offset */
+    proto = ip[9];
+    if (proto != 6 && proto != 17)
+        return FALSE;
+    for (int i = 0; i < 20; i += 2)
+        acc += Be16(ip + i);
+    if (Fold16(acc) != 0xffffu)
+        return FALSE;
+    tlen = (UWORD)(total - 20);
+    if (proto == 17)
+    {
+        if (tlen < 8 || Be16(ip + 24) != tlen)
+            return FALSE;
+        if (Be16(ip + 26) == 0)             /* IPv4 UDP checksum absent */
+            return FALSE;
+    }
+    else if (tlen < 20)
+        return FALSE;
+    acc  = Fold16(sum);
+    acc += Be16(ip + 12);
+    acc += Be16(ip + 14);
+    acc += Be16(ip + 16);
+    acc += Be16(ip + 18);
+    acc += proto;
+    acc += tlen;
+    return Fold16(acc) == 0xffffu;
+}
+
 void CopyPacket(struct IOSana2Req *io, UBYTE *packet, ULONG packetLength)
 {
     struct WiFiUnit *unit = (struct WiFiUnit *)io->ios2_Req.io_Unit;
@@ -1291,6 +1390,41 @@ void CopyPacket(struct IOSana2Req *io, UBYTE *packet, ULONG packetLength)
         if (!CallHookPkt(opener->o_FilterHook, io, copyData))
         {
             packetFiltered = TRUE;
+        }
+    }
+
+    /*
+     * AmiNetXDuo's single-copy receive: a cooked CMD_READ of an opener that
+     * offered the pair, no filter hook (it would have to see the frame
+     * first).  The opener says where the payload goes, the copy from the
+     * SDIO buffer sums it on the way, the header is written in front when
+     * asked for, and the checksums are checked from that sum before the
+     * read is replied.  A NULL answer is the opener declining this frame.
+     */
+    if (!packetFiltered && copyLength != 0 && io->ios2_Req.io_Command == CMD_READ &&
+        opener->o_RxDirect != NULL && opener->o_FilterHook == NULL &&
+        (io->ios2_Req.io_Flags & SANA2IOF_RAW) == 0)
+    {
+        UBYTE *dst = ((AnxdS2RxDirect)opener->o_RxDirect)(io->ios2_Data, copyLength);
+
+        if (dst != NULL)
+        {
+            ULONG sum = CopySumLongwords(dst, copyData, copyLength);
+            UBYTE flags = ANXD_S2_RXF_SUMMED;
+
+            if (opener->o_RxLinkHdr)
+                for (int i = 0; i < 14; i++) dst[i - 14] = packet[i];
+            if ((opener->o_RxFlags & ANXD_S2_RXF_VERIFIED) && VerifyIPv4(dst, copyLength, sum))
+                flags |= ANXD_S2_RXF_VERIFIED;
+
+            io->ios2_DataLength = copyLength;
+            ((AnxdS2RxFilled)opener->o_RxFilled)(io->ios2_Data, copyLength, sum, flags);
+
+            Disable();
+            Remove((struct Node *)io);
+            Enable();
+            ReplyMsg((struct Message *)io);
+            return;
         }
     }
 

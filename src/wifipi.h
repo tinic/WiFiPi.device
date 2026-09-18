@@ -181,6 +181,14 @@ struct Opener
     struct Hook *       o_FilterHook;
     BOOL              (*o_RXFunc)(REGARG(APTR, "a0"), REGARG(APTR, "a1"), REGARG(ULONG, "d0"));
     BOOL              (*o_TXFunc)(REGARG(APTR, "a0"), REGARG(APTR, "a1"), REGARG(ULONG, "d0"));
+
+    /* AmiNetXDuo's single-copy receive (include/aminetxduo/anxs2ext.h): the
+       frame goes from the SDIO buffer straight into the opener's packet,
+       summed on the way; NULL pair = the S2_CopyToBuff path above. */
+    APTR                o_RxDirect;         // AnxdS2RxDirect
+    APTR                o_RxFilled;         // AnxdS2RxFilled
+    BOOL                o_RxLinkHdr;        // write the 14-byte header in front of the payload
+    UBYTE               o_RxFlags;          // ANXD_S2_RXF_* beyond SUMMED the opener asked for
 };
 
 /* Standard interface flags (netdevice->flags). */
