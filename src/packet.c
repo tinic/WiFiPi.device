@@ -342,15 +342,20 @@ int SetWPAVersion(struct SDIO *sdio, struct WiFiNetwork *network, ULONG wpa_vers
 #define POLL_STACKSIZE          (8192 / sizeof(ULONG))
 #define POLL_PRIORITY           -128
 #define POLL_GRACE_US           10000
+/* A write queued while the poller watches goes out this long after it was
+   queued -- long enough for the stack's burst of writes to become one glom,
+   not the up-to-a-tick a lone reply used to wait */
+#define POLL_WRITE_US           200
 
 #define PACKET_WAIT_DELAY_MIN   1000
 /*
  * The idle back-off used to reach 100 ms, and the first frame after a quiet
  * second waited for it: ping at 1 s intervals averaged 51 ms (max 169) against
- * 6.9 ms at 20 ms intervals, A1200 + PiStorm32 Lite, 2026-09-18.  8 ms caps
- * that at the cost of 125 empty looks a second when idle.
+ * 6.9 ms at 20 ms intervals, A1200 + PiStorm32 Lite, 2026-09-18.  A look costs
+ * ~45 us (a 16-byte header read and the timer interrupt); 2 ms is 500 looks a
+ * second when idle, 2% of the CPU, and at most 2 ms on the first frame.
  */
-#define PACKET_WAIT_DELAY_MAX   8000
+#define PACKET_WAIT_DELAY_MAX   2000
 
 #define PACKET_INITIAL_FETCH_SIZE   16
 
@@ -867,10 +872,28 @@ static void PacketPoller(struct SDIO *sdio)
             break;
 
         ULONG since = PollClock(WiFiBase);
+        ULONG queued = 0;       /* when the first waiting write was seen, 0 = none */
         for (;;)
         {
-            if (sdio_card_asserting(sdio))
+            BOOL send = FALSE;
+
+            if (!IsMsgPortEmpty(sdio->s_SenderPort) && sdio->s_MaxTXSeq != sdio->s_TXSeq)
             {
+                ULONG now = PollClock(WiFiBase);
+
+                if (queued == 0)
+                    queued = now ? now : 1;
+                else if ((ULONG)(now - queued) >= POLL_WRITE_US)
+                    send = TRUE;
+            }
+            else
+                queued = 0;
+
+            if (sdio_card_asserting(sdio) || send)
+            {
+                if (send)
+                    sdio->s_StatPollSends++;
+                queued = 0;
                 sdio->s_StatPollHits++;
                 /* asleep BEFORE the Signal: the receiver outranks this task
                    and may run to its PokePoller before the next line here */

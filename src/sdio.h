@@ -305,6 +305,7 @@ struct SDIO {
     ULONG               s_StatIRQLine;      // the GIC number the server is on, 0 = polling only
     ULONG               s_StatPollHits;     // times the poller saw the card's line up
     ULONG               s_StatPollSleeps;   // times the poller's grace ran out
+    ULONG               s_StatPollSends;    // times the poller woke the receiver for a waiting write
     ULONG               s_StatIntStatus;    // the card's last non-zero intstatus, as cleared
     ULONG               s_StatMailboxes;    // host mailbox interrupts acknowledged
     ULONG               s_StatMailboxData;  // the last tohostmailboxdata
