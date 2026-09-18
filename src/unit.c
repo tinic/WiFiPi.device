@@ -241,7 +241,7 @@ void StartUnitTask(struct WiFiUnit *unit)
     struct Task *task;
     struct MemList *ml;
     ULONG *stack;
-    static const char task_name[] = "WiFiPi Unit";
+    static const char task_name[] = WIFIPI_TASK_UNIT;
 
     D(bug("[WiFi] StartUnitTask\n"));
 

@@ -31,6 +31,22 @@
 #define WIFIPI_DEVICE_NAME "wifipi.device"
 #endif
 
+/* The four tasks the device runs, as a task list shows them.  A build that
+   ships the device under another name (AmiNetXDuo's anxwifipi.device) sets
+   these beside WIFIPI_DEVICE_NAME so its tasks carry its own prefix. */
+#ifndef WIFIPI_TASK_UNIT
+#define WIFIPI_TASK_UNIT     "WiFiPi Unit"
+#endif
+#ifndef WIFIPI_TASK_POLLER
+#define WIFIPI_TASK_POLLER   "WiFiPi Poller"
+#endif
+#ifndef WIFIPI_TASK_SCANNER
+#define WIFIPI_TASK_SCANNER  "WiFiPi Network Scanner"
+#endif
+#ifndef WIFIPI_TASK_RECEIVER
+#define WIFIPI_TASK_RECEIVER "WiFiPi Packet Receiver"
+#endif
+
 struct WiFiUnit;
 
 struct NetworkConfig {

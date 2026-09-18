@@ -927,7 +927,7 @@ static void StartPoller(struct SDIO *sdio)
     struct Task *task = AllocMem(sizeof(struct Task), MEMF_PUBLIC | MEMF_CLEAR);
     struct MemList *ml = AllocMem(sizeof(struct MemList) + sizeof(struct MemEntry), MEMF_PUBLIC | MEMF_CLEAR);
     ULONG *stack = AllocMem(POLL_STACKSIZE * sizeof(ULONG), MEMF_PUBLIC | MEMF_CLEAR);
-    static const char task_name[] = "WiFiPi Poller";
+    static const char task_name[] = WIFIPI_TASK_POLLER;
 
     if (task == NULL || ml == NULL || stack == NULL)
     {
@@ -2762,7 +2762,7 @@ static void StartScannerTask(struct SDIO *sdio)
     struct MemList *ml;
     ULONG *stack;
 
-    static const char task_name[] = "WiFiPi Network Scanner";
+    static const char task_name[] = WIFIPI_TASK_SCANNER;
     D(bug("[WiFi] Starting network scanner\n"));
 
     // Get all memory we need for the receiver task
@@ -2809,7 +2809,7 @@ void StartPacketReceiver(struct SDIO *sdio)
     struct Task *task;
     struct MemList *ml;
     ULONG *stack;
-    static const char task_name[] = "WiFiPi Packet Receiver";
+    static const char task_name[] = WIFIPI_TASK_RECEIVER;
 
     D(bug("[WiFi] Starting packet receiver task\n"));
 
