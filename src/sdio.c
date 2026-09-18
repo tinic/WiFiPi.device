@@ -889,7 +889,7 @@ BOOL sdio_int_attach(struct SDIO *sdio)
 
     sdio->s_Interrupt.is_Node.ln_Type = NT_INTERRUPT;
     sdio->s_Interrupt.is_Node.ln_Pri  = 0;
-    sdio->s_Interrupt.is_Node.ln_Name = (char *)"wifipi.device";
+    sdio->s_Interrupt.is_Node.ln_Name = (char *)WIFIPI_DEVICE_NAME;
     sdio->s_Interrupt.is_Data         = sdio;
     sdio->s_Interrupt.is_Code         = (void (*)())sdio_int_server;
     /*

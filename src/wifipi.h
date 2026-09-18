@@ -20,9 +20,16 @@
 #define STR(s) #s
 #define XSTR(s) STR(s)
 
+#ifndef WIFIPI_VERSION
 #define WIFIPI_VERSION  0
+#endif
+#ifndef WIFIPI_REVISION
 #define WIFIPI_REVISION 1
+#endif
 #define WIFIPI_PRIORITY -100
+#ifndef WIFIPI_DEVICE_NAME
+#define WIFIPI_DEVICE_NAME "wifipi.device"
+#endif
 
 struct WiFiUnit;
 

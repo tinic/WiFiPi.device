@@ -28,6 +28,21 @@
 #define D(x) x
 
 extern const char deviceEnd;
+/*
+ * The first bytes of the first code hunk: "moveq #-1,d0 / rts", so that a
+ * device file typed at a Shell returns instead of running whatever function
+ * the compiler placed first.  A C function is not enough under -flto -- the
+ * link-time compiler orders functions as it likes and put putch() here; a
+ * top-level asm from the first object on the link line stays put.  The link
+ * names __start as the entry (-Wl,-e,__start) and tools/check-image.sh reads
+ * the bytes.
+ */
+asm("    .text                   \n"
+    "    .globl __start          \n"
+    "__start:                    \n"
+    "    moveq  #-1,%d0          \n"
+    "    rts                     \n");
+
 extern const char deviceName[];
 extern const char deviceIdString[];
 extern const uint32_t InitTable[];
@@ -45,8 +60,21 @@ const struct Resident RomTag __attribute__((used)) = {
     (APTR)InitTable,
 };
 
-const char deviceName[] = "wifipi.device";
-const char deviceIdString[] = VERSION_STRING;
+/*
+ * The name and the version string come from the build: WIFIPI_DEVICE_NAME
+ * defaults to wifipi.device; a tree that carries this driver under another
+ * name (AmiNetXDuo's anxwifipi.device) defines it, and may hand over its own
+ * version header -- WIFIPI_VERSION_HEADER, whose TOOL_VERSTAG(name) makes the
+ * $VER string -- instead of VERSION_STRING.
+ */
+#ifdef WIFIPI_VERSION_HEADER
+#include WIFIPI_VERSION_HEADER
+#define WIFIPI_VERSTRING TOOL_VERSTAG(WIFIPI_DEVICE_NAME)
+#else
+#define WIFIPI_VERSTRING VERSION_STRING
+#endif
+const char deviceName[] = WIFIPI_DEVICE_NAME;
+const char deviceIdString[] = WIFIPI_VERSTRING;
 
 static uint32_t WiFi_ExtFunc()
 {

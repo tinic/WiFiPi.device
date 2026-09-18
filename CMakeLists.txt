@@ -9,8 +9,7 @@ if(NOT TARGET devicetree)
 endif()
 
 add_executable(wifipi.device
-    src/start.c
-    src/device.c
+    src/device.c        # keep first: the entry stub and the ROMTag
     src/init.c
     src/mbox.c
     src/sdio.c
@@ -27,7 +26,7 @@ target_include_directories(wifipi.device PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/inc
 # libc for the memset/memcpy calls GCC would otherwise invent; the loops stay loops.
 target_compile_options(wifipi.device PRIVATE -Os -m68040 -Wall -Wextra -Werror -fomit-frame-pointer
     -ffreestanding -fno-builtin -fno-tree-loop-distribute-patterns
-    -flto -fno-fat-lto-objects)
+    -flto)
 target_compile_definitions(wifipi.device PRIVATE VERSION_STRING="${VERSTRING}")
 # -Wl,-u,_RomTag: nothing in the image references the ROMTag (exec finds it by
 # scanning for RTC_MATCHWORD), so under LTO the linker plugin sees it, the init
@@ -42,7 +41,7 @@ target_link_options(wifipi.device PRIVATE -s -ffreestanding -nostdlib -nostartfi
     -Wl,-u,_RomTag -Wl,-Map,${CMAKE_CURRENT_BINARY_DIR}/wifipi.device.map)
 add_custom_command(TARGET wifipi.device POST_BUILD
     COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/check-image.sh
-            $<TARGET_FILE:wifipi.device> ${CMAKE_CURRENT_BINARY_DIR}/wifipi.device.map
+            $<TARGET_FILE:wifipi.device> ${CMAKE_CURRENT_BINARY_DIR}/wifipi.device.map wifipi.device
     COMMENT "Checking the image survived LTO whole")
 target_link_libraries(wifipi.device devicetree amiga)
 

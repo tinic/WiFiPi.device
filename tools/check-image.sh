@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# check-image.sh <wifipi.device> <link map>
+# check-image.sh <wifipi.device> <link map> [<device name>]
 #
 # What -flto can do to an AmigaOS device without failing the link: nothing in
 # the image references the ROMTag (exec finds it by scanning for RTC_MATCHWORD),
@@ -14,7 +14,7 @@
 # archive took part in the link (a late-invented memcpy would have come from
 # one).
 set -eu
-img=$1; map=$2
+img=$1; map=$2; name=${3:-wifipi.device}
 fail() { echo "check-image: FAIL $*" >&2; exit 1; }
 [ -s "$img" ] || fail "no image"
 [ -s "$map" ] || fail "no map"
@@ -23,10 +23,11 @@ romtag=$(grep -E '[[:space:]]_?RomTag$' "$map" | awk '{print $1}' | head -1)
 if grep -qE '(libc|libgcc|libnix)\.a' "$map"; then
     fail "a libc/libgcc archive is in the link: a late-invented call was resolved from it"
 fi
-python3 - "$img" "$romtag" <<'PY' || exit 1
+python3 - "$img" "$romtag" "$name" <<'PY' || exit 1
 import struct, sys
 d = open(sys.argv[1], 'rb').read()
 off = int(sys.argv[2], 16)
+name = sys.argv[3].encode() + b'\0'
 # walk the hunk file to the first HUNK_CODE's data
 p = 0
 def u32(i): return struct.unpack('>I', d[i:i+4])[0]
@@ -46,15 +47,18 @@ while p < len(d):
     if t == 0x3EB: p += 8 + u32(p + 4) * 4; continue   # HUNK_BSS (size only)
     print("check-image: FAIL unexpected hunk %#x before the code" % t); sys.exit(1)
 if code is None: print("check-image: FAIL no HUNK_CODE"); sys.exit(1)
+# the entry stub: a device file typed at a Shell must return, not run putch()
+if code[:4] != b'\x70\xff\x4e\x75':
+    print("check-image: FAIL the first code hunk does not begin with moveq #-1,d0 / rts (found %s)" % code[:4].hex()); sys.exit(1)
 if off + 26 > len(code): print("check-image: FAIL RomTag offset %#x outside the code hunk (%#x)" % (off, len(code))); sys.exit(1)
 rt = struct.unpack('>HIIBBBbIII', code[off:off+26])
-match, self_, endskip, flags, ver, ntype, pri, name, idstr, init = rt
+match, self_, endskip, flags, ver, ntype, pri, name_off, idstr, init = rt
 if match != 0x4AFC: print("check-image: FAIL no RTC_MATCHWORD at %#x (found %#06x)" % (off, match)); sys.exit(1)
 if self_ != off: print("check-image: FAIL rt_MatchTag %#x does not point at the ROMTag %#x" % (self_, off)); sys.exit(1)
 if ntype != 3: print("check-image: FAIL rt_Type %d is not NT_DEVICE" % ntype); sys.exit(1)
 if not (flags & 0x80): print("check-image: FAIL RTF_AUTOINIT missing from rt_Flags %#x" % flags); sys.exit(1)
-if not (0 < name < len(code)) or code[name:name+14] != b'wifipi.device\0':
-    print("check-image: FAIL rt_Name %#x does not reach \"wifipi.device\"" % name); sys.exit(1)
+if not (0 < name_off < len(code)) or code[name_off:name_off+len(name)] != name:
+    print("check-image: FAIL rt_Name %#x does not reach \"%s\"" % (name_off, name[:-1].decode())); sys.exit(1)
 if not (0 < init < len(code)): print("check-image: FAIL rt_Init %#x outside the code hunk" % init); sys.exit(1)
 if not (0 < endskip <= len(code)): print("check-image: FAIL rt_EndSkip %#x outside the code hunk" % endskip); sys.exit(1)
 # RTF_AUTOINIT: rt_Init -> {size, vectors, structinit, initfunc}; the vectors must be in the hunk
