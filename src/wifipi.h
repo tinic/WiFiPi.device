@@ -61,7 +61,21 @@ struct WiFiBase
     UBYTE *             w_NetworkConfigVar;
     ULONG               w_NetworkConfigLength;
     struct NetworkConfig    w_NetworkConfig;
+
+    /*
+     * Where this device's code is, for a sampling profiler: AmiNetXDuo's
+     * Profile scans a library base for this record (magic 'PSG1', the size,
+     * the base, the seglist as LoadSeg returned it, a sum that makes the five
+     * longwords zero) and names samples in the driver by function from the
+     * link map.  Five longwords nobody else reads.
+     */
+    ULONG               w_ProfMagic;
+    ULONG               w_ProfSize;
+    ULONG               w_ProfLibBase;
+    ULONG               w_ProfSegList;
+    ULONG               w_ProfSum;
 };
+#define WIFIPI_PROF_SEGTAG_MAGIC 0x50534731UL   /* 'PSG1' */
 
 struct WiFiNetwork {
     struct MinNode      wn_Node;

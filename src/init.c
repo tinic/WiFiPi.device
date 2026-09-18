@@ -682,6 +682,12 @@ struct WiFiBase * WiFi_Init(REGARG(struct WiFiBase *base, "d0"), REGARG(BPTR seg
 
     WiFiBase->w_SegList = seglist;
     WiFiBase->w_SysBase = SysBase;
+    WiFiBase->w_ProfMagic   = WIFIPI_PROF_SEGTAG_MAGIC;
+    WiFiBase->w_ProfSize    = 5 * sizeof(ULONG);
+    WiFiBase->w_ProfLibBase = (ULONG)WiFiBase;
+    WiFiBase->w_ProfSegList = (ULONG)seglist;
+    WiFiBase->w_ProfSum     = 0UL - (WiFiBase->w_ProfMagic + WiFiBase->w_ProfSize +
+                                     WiFiBase->w_ProfLibBase + WiFiBase->w_ProfSegList);
     WiFiBase->w_UtilityBase = OpenLibrary((CONST_STRPTR)"utility.library", 0);
     WiFiBase->w_Device.dd_Library.lib_Revision = WIFIPI_REVISION;
     
