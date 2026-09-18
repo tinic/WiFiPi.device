@@ -16,9 +16,23 @@
 
 #define D(x) x
 
+/*
+ * Wait for a controller condition, `tout` microseconds at most.  It used to
+ * look every 10 us -- delay_us(10) between checks -- and a CMD52 that the
+ * bus finishes in 3 us was reported 10 us later; a 1500-byte frame paid it
+ * at the command and again per 512-byte block.  Profiled 2026-09-18 on an
+ * A1200 + PiStorm32 Lite receiving at 31 Mbit/s: 23.5% of the CPU was in
+ * delay_us.  Now the condition is read every time round (a 20 ns register
+ * read) and the clock only decides the timeout.
+ */
+static inline ULONG sdio_now(void)
+{
+    return LE32(*(volatile ULONG *)0xf2003004);
+}
+
 #define TIMEOUT_WAIT(check_func, tout) \
-    do { ULONG cnt = (tout) / 10; if (cnt == 0) cnt = 1; while(cnt != 0) { if (check_func) break; \
-    cnt = cnt - 1; delay_us(10, sdio->s_WiFiBase); }  } while(0)
+    do { ULONG _t0 = sdio_now(); \
+         while (!(check_func)) { if ((ULONG)(sdio_now() - _t0) > (ULONG)(tout)) break; } } while(0)
 
 void delay_us(ULONG us, struct WiFiBase *WiFiBase)
 {
@@ -129,8 +143,7 @@ void cmd_int(ULONG cmd, ULONG arg, ULONG timeout, struct SDIO *sdio)
     sdio->s_LastCMDSuccess = 0;
 
     // Check Command Inhibit
-    while(rd32(sdio->s_SDIO, EMMC_STATUS) & 0x1)
-        delay_us(10, sdio->s_WiFiBase);
+    TIMEOUT_WAIT((rd32(sdio->s_SDIO, EMMC_STATUS) & 0x1) == 0, timeout);
 
     // Is the command with busy?
     if((cmd & SD_CMD_RSPNS_TYPE_MASK) == SD_CMD_RSPNS_TYPE_48B)
@@ -143,8 +156,7 @@ void cmd_int(ULONG cmd, ULONG arg, ULONG timeout, struct SDIO *sdio)
             // Not an abort command
 
             // Wait for the data line to be free
-            while(rd32(sdio->s_SDIO, EMMC_STATUS) & 0x2)
-                delay_us(10, sdio->s_WiFiBase);
+            TIMEOUT_WAIT((rd32(sdio->s_SDIO, EMMC_STATUS) & 0x2) == 0, timeout);
         }
     }
 
