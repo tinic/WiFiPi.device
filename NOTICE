@@ -1,0 +1,19 @@
+WiFiPi.device -- SANA-II driver for the Broadcom/Cypress SDIO WLAN of the
+Raspberry Pi under Emu68.
+
+Copyright (c) 2019-2021 Michal Schulz <michal.schulz@gmx.de>
+Copyright (c) 2026 Tinic Uro (the gcc16 branch: build, receiver, SANA-II extensions)
+
+This Source Code Form is subject to the terms of the Mozilla Public License,
+v. 2.0 (LICENSE).  The upstream repository carries no LICENSE file of its own;
+the terms follow from the author's other work it belongs to and is distributed
+with (Emu68, Emu68-tools, gic400.library, devicetree.resource: all MPL-2.0)
+and from src/mbox.c, the one file he stamped.
+
+Parts under their own terms, unchanged:
+  src/zw_regs.h                       Apache-2.0, Jeremy P Bentham (ZeroWi)
+  include/brcm*.h, include/d11.h      ISC, Broadcom Corporation (via Linux/OpenBSD)
+  include/bwfm*.h, if_bwfm_sdio.h     ISC, Patrick Wildt (OpenBSD)
+  include/aminetxduo/anxs2ext.h       MIT, AmiNetXDuo
+  firmware/                           Broadcom/Cypress binaries, linux-firmware
+                                      LICENCE.broadcom_bcm43xx terms; not ours
