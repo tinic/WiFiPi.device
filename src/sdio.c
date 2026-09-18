@@ -234,13 +234,14 @@ void cmd_int(ULONG cmd, ULONG arg, ULONG timeout, struct SDIO *sdio)
                 const ULONG word_count = sdio->s_BlockSize / 4;
                 ULONG cnt = (word_count + 7) / 8;
                 switch (word_count % 8) {
-                    case 0: do {    *(volatile ULONG *)((ULONG)sdio->s_SDIO + EMMC_DATA) = *cur_buf_addr++;
-                    case 7:         *(volatile ULONG *)((ULONG)sdio->s_SDIO + EMMC_DATA) = *cur_buf_addr++;
-                    case 6:         *(volatile ULONG *)((ULONG)sdio->s_SDIO + EMMC_DATA) = *cur_buf_addr++;
-                    case 5:         *(volatile ULONG *)((ULONG)sdio->s_SDIO + EMMC_DATA) = *cur_buf_addr++;
-                    case 4:         *(volatile ULONG *)((ULONG)sdio->s_SDIO + EMMC_DATA) = *cur_buf_addr++;
-                    case 3:         *(volatile ULONG *)((ULONG)sdio->s_SDIO + EMMC_DATA) = *cur_buf_addr++;
-                    case 2:         *(volatile ULONG *)((ULONG)sdio->s_SDIO + EMMC_DATA) = *cur_buf_addr++;
+                    /* Duff's device: every case falls into the next by design. */
+                    case 0: do {    *(volatile ULONG *)((ULONG)sdio->s_SDIO + EMMC_DATA) = *cur_buf_addr++; /* FALLTHROUGH */
+                    case 7:         *(volatile ULONG *)((ULONG)sdio->s_SDIO + EMMC_DATA) = *cur_buf_addr++; /* FALLTHROUGH */
+                    case 6:         *(volatile ULONG *)((ULONG)sdio->s_SDIO + EMMC_DATA) = *cur_buf_addr++; /* FALLTHROUGH */
+                    case 5:         *(volatile ULONG *)((ULONG)sdio->s_SDIO + EMMC_DATA) = *cur_buf_addr++; /* FALLTHROUGH */
+                    case 4:         *(volatile ULONG *)((ULONG)sdio->s_SDIO + EMMC_DATA) = *cur_buf_addr++; /* FALLTHROUGH */
+                    case 3:         *(volatile ULONG *)((ULONG)sdio->s_SDIO + EMMC_DATA) = *cur_buf_addr++; /* FALLTHROUGH */
+                    case 2:         *(volatile ULONG *)((ULONG)sdio->s_SDIO + EMMC_DATA) = *cur_buf_addr++; /* FALLTHROUGH */
                     case 1:         *(volatile ULONG *)((ULONG)sdio->s_SDIO + EMMC_DATA) = *cur_buf_addr++;
                     } while (--cnt > 0);
                 }
@@ -250,13 +251,14 @@ void cmd_int(ULONG cmd, ULONG arg, ULONG timeout, struct SDIO *sdio)
                 const ULONG word_count = sdio->s_BlockSize / 4;
                 ULONG cnt = (word_count + 7) / 8;
                 switch (word_count % 8) {
-                    case 0: do {    *cur_buf_addr++ = *(volatile ULONG *)((ULONG)sdio->s_SDIO + EMMC_DATA);
-                    case 7:         *cur_buf_addr++ = *(volatile ULONG *)((ULONG)sdio->s_SDIO + EMMC_DATA);
-                    case 6:         *cur_buf_addr++ = *(volatile ULONG *)((ULONG)sdio->s_SDIO + EMMC_DATA);
-                    case 5:         *cur_buf_addr++ = *(volatile ULONG *)((ULONG)sdio->s_SDIO + EMMC_DATA);
-                    case 4:         *cur_buf_addr++ = *(volatile ULONG *)((ULONG)sdio->s_SDIO + EMMC_DATA);
-                    case 3:         *cur_buf_addr++ = *(volatile ULONG *)((ULONG)sdio->s_SDIO + EMMC_DATA);
-                    case 2:         *cur_buf_addr++ = *(volatile ULONG *)((ULONG)sdio->s_SDIO + EMMC_DATA);
+                    /* Duff's device: every case falls into the next by design. */
+                    case 0: do {    *cur_buf_addr++ = *(volatile ULONG *)((ULONG)sdio->s_SDIO + EMMC_DATA); /* FALLTHROUGH */
+                    case 7:         *cur_buf_addr++ = *(volatile ULONG *)((ULONG)sdio->s_SDIO + EMMC_DATA); /* FALLTHROUGH */
+                    case 6:         *cur_buf_addr++ = *(volatile ULONG *)((ULONG)sdio->s_SDIO + EMMC_DATA); /* FALLTHROUGH */
+                    case 5:         *cur_buf_addr++ = *(volatile ULONG *)((ULONG)sdio->s_SDIO + EMMC_DATA); /* FALLTHROUGH */
+                    case 4:         *cur_buf_addr++ = *(volatile ULONG *)((ULONG)sdio->s_SDIO + EMMC_DATA); /* FALLTHROUGH */
+                    case 3:         *cur_buf_addr++ = *(volatile ULONG *)((ULONG)sdio->s_SDIO + EMMC_DATA); /* FALLTHROUGH */
+                    case 2:         *cur_buf_addr++ = *(volatile ULONG *)((ULONG)sdio->s_SDIO + EMMC_DATA); /* FALLTHROUGH */
                     case 1:         *cur_buf_addr++ = *(volatile ULONG *)((ULONG)sdio->s_SDIO + EMMC_DATA);
                     } while (--cnt > 0);
                 }

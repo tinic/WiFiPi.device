@@ -1732,6 +1732,7 @@ void HandleRequest(struct IOSana2Req *io)
                 io->ios2_DstAddr[3] = 0xff;
                 io->ios2_DstAddr[4] = 0xff;
                 io->ios2_DstAddr[5] = 0xff;
+                /* FALLTHROUGH */
             case S2_MULTICAST: /* Fallthrough */
             case CMD_WRITE:
                 complete = Do_CMD_WRITE(io);
