@@ -298,7 +298,7 @@ static const UWORD WiFi_SupportedCommands[] = {
     // S2_TRACKTYPE,
     // S2_UNTRACKTYPE,
     // S2_GETTYPESTATS,
-//    S2_GETSPECIALSTATS, <-- not used yet!
+    S2_GETSPECIALSTATS,
     S2_GETGLOBALSTATS,
     S2_ONEVENT,
     S2_READORPHAN,
@@ -1363,6 +1363,35 @@ static int Do_S2_GETNETWORKS(struct IOSana2Req *io)
     return 0;
 }
 
+/* The receiver task's counters (struct SDIO s_Stat*), one record each */
+static int Do_S2_GETSPECIALSTATS(struct IOSana2Req *io)
+{
+    struct WiFiUnit *unit = (struct WiFiUnit *)io->ios2_Req.io_Unit;
+    struct WiFiBase *WiFiBase = unit->wu_Base;
+    struct SDIO *sdio = WiFiBase->w_SDIO;
+    struct Sana2SpecialStatHeader *hdr = io->ios2_StatData;
+    struct Sana2SpecialStatRecord *rec = (struct Sana2SpecialStatRecord *)(hdr + 1);
+    static const char * const names[] = {
+        "receiver wake-ups", "wake-ups with no frame", "frames received", "wake-ups with a burst",
+        "longest burst", "frames sent", "wake-ups stalled on TX credit"
+    };
+    const ULONG *counters = &sdio->s_StatWakes;
+    ULONG n = sizeof(names) / sizeof(names[0]);
+    ULONG i;
+
+    if (n > hdr->RecordCountMax)
+        n = hdr->RecordCountMax;
+    for (i = 0; i < n; i++)
+    {
+        rec[i].Type = (S2WireType_Ethernet << 16) | (i + 1);
+        rec[i].Count = counters[i];
+        rec[i].String = (const TEXT *)names[i];
+    }
+    hdr->RecordCountSupplied = n;
+    io->ios2_Req.io_Error = 0;
+    return 1;
+}
+
 int Do_S2_DEVICEQUERY(struct IOSana2Req *io)
 {
     struct WiFiUnit *unit = (struct WiFiUnit *)io->ios2_Req.io_Unit;
@@ -1661,6 +1690,10 @@ void HandleRequest(struct IOSana2Req *io)
                 CopyMem(&unit->wu_Stats, io->ios2_StatData, sizeof(struct Sana2DeviceStats));
                 io->ios2_Req.io_Error = 0;
                 complete = 1;
+                break;
+
+            case S2_GETSPECIALSTATS:
+                complete = Do_S2_GETSPECIALSTATS(io);
                 break;
 
             case S2_GETNETWORKS:

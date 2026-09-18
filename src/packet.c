@@ -918,7 +918,12 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
             maxCount = sdio->s_MaxTXSeq - sdio->s_TXSeq;
             
             /* Make sure we have place in TX */
-            if (maxCount)
+            if (maxCount == 0)
+            {
+                if (!IsMsgPortEmpty(sender))
+                    sdio->s_StatTXStalls++;
+            }
+            else
             {
                 // Drain outgoing packet requests
                 while ((msg = (struct IOSana2Req *)GetMsg(sender)) != NULL)
@@ -927,6 +932,7 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
 
                     // Put the packet into an array. It will be used later to construct Glom frame
                     ioList[ioCount++] = msg;
+                    sdio->s_StatTXFrames++;
 
                     if (--maxCount == 0)
                     {
@@ -1001,6 +1007,9 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
 
             /* Update gotTransfer flag if it wasn't set already */
             gotTransfer = LE16(pkt->p_Length) != 0;
+            sdio->s_StatWakes++;
+            if (!gotTransfer)
+                sdio->s_StatEmpty++;
 
             if (sigSet & (1 << port->mp_SigBit))
             {
@@ -1123,6 +1132,11 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
                     if (LE16(pkt->p_Length) == 0)
                         break;
                 }
+                sdio->s_StatRXFrames += burst;
+                if (burst > 1)
+                    sdio->s_StatBursts++;
+                if (burst > sdio->s_StatMaxBurst)
+                    sdio->s_StatMaxBurst = burst;
             }
         }
 

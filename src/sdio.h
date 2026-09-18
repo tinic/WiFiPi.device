@@ -292,6 +292,15 @@ struct SDIO {
     ULONG               s_HostINTMask;
     APTR                s_Buffer;
 
+    /* Receiver task counters, read back through S2_GETSPECIALSTATS */
+    ULONG               s_StatWakes;        // receiver wake-ups (timer tick or control message)
+    ULONG               s_StatEmpty;        // wake-ups whose header read found no frame
+    ULONG               s_StatRXFrames;     // SDPCM frames taken from the chip
+    ULONG               s_StatBursts;       // wake-ups that took more than one frame
+    ULONG               s_StatMaxBurst;     // most frames taken in one wake-up
+    ULONG               s_StatTXFrames;     // SANA-II writes pushed to the chip
+    ULONG               s_StatTXStalls;     // wake-ups with writes waiting and no TX credit
+
     APTR                s_TXBuffer;
     APTR                s_RXBuffer;
 
