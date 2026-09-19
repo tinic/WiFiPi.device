@@ -633,31 +633,53 @@ static int Do_S2_SETOPTIONS(struct IOSana2Req *io)
         }
     }
 
-    /* Set ExtJoinParams now */
-    _bzero(&unit->wu_JoinParams, sizeof(struct ExtJoinParams));
-    
-    /* Get SSID */
+    /*
+     * ONLY THE TAGS GIVEN CHANGE ANYTHING, and only a call that names a
+     * network is a join -- the contract prism2.device keeps (its SetOptions
+     * is a switch over the tags present, and it reconfigures only when one
+     * of them asks for it).  This used to zero the join parameters, take a
+     * missing S2INFO_BSSID as "broadcast", take a missing S2INFO_WPAInfo as
+     * "no encryption" and issue a join on EVERY call.  WirelessManager 1.5
+     * (prism2v2) makes a second S2_SETOPTIONS after the association, with
+     * none of the three: the firmware was told to join an empty SSID with
+     * wpa_auth disabled, S2_GETNETWORKINFO answered ff:ff:ff:ff:ff:ff, the
+     * supplicant derived its PTK from that, and every join ended in
+     * "Authentication with ff:ff:ff:ff:ff:ff timed out" (A1200, 2026-09-19).
+     * WirelessManager 1.3 makes one call and never saw it.
+     */
+    if (FindTagItem(S2INFO_SSID, io->ios2_Data) == NULL &&
+        FindTagItem(S2INFO_BSSID, io->ios2_Data) == NULL &&
+        FindTagItem(S2INFO_WPAInfo, io->ios2_Data) == NULL)
+    {
+        D(bug("[WiFi.0] S2_SETOPTIONS names no network, nothing to join\n"));
+        return 1;
+    }
+
+    /* Get SSID; a new SSID with no BSSID beside it is a join by name */
     if ((ti = FindTagItem(S2INFO_SSID, io->ios2_Data)))
     {
         STRPTR ssid = (STRPTR)ti->ti_Data;
         ULONG len = _strlen(ssid);
+        if (len > sizeof(unit->wu_JoinParams.ej_SSID.ssid_Value))
+            len = sizeof(unit->wu_JoinParams.ej_SSID.ssid_Value);
+        _bzero(&unit->wu_JoinParams.ej_SSID, sizeof(unit->wu_JoinParams.ej_SSID));
         unit->wu_JoinParams.ej_SSID.ssid_Length = LE32(len);
         CopyMem(ssid, &unit->wu_JoinParams.ej_SSID.ssid_Value, len);
+        if (FindTagItem(S2INFO_BSSID, io->ios2_Data) == NULL)
+        {
+            unit->wu_JoinParams.ej_Assoc.ap_BSSID[0] = 0xff;
+            unit->wu_JoinParams.ej_Assoc.ap_BSSID[1] = 0xff;
+            unit->wu_JoinParams.ej_Assoc.ap_BSSID[2] = 0xff;
+            unit->wu_JoinParams.ej_Assoc.ap_BSSID[3] = 0xff;
+            unit->wu_JoinParams.ej_Assoc.ap_BSSID[4] = 0xff;
+            unit->wu_JoinParams.ej_Assoc.ap_BSSID[5] = 0xff;
+        }
     }
 
-    /* Get BSSID or put broadcast BSSID */
+    /* Get BSSID */
     if ((ti = FindTagItem(S2INFO_BSSID, io->ios2_Data)))
     {
         CopyMem((APTR)ti->ti_Data, &unit->wu_JoinParams.ej_Assoc.ap_BSSID, 6);
-    }
-    else
-    {
-        unit->wu_JoinParams.ej_Assoc.ap_BSSID[0] = 0xff;
-        unit->wu_JoinParams.ej_Assoc.ap_BSSID[1] = 0xff;
-        unit->wu_JoinParams.ej_Assoc.ap_BSSID[2] = 0xff;
-        unit->wu_JoinParams.ej_Assoc.ap_BSSID[3] = 0xff;
-        unit->wu_JoinParams.ej_Assoc.ap_BSSID[4] = 0xff;
-        unit->wu_JoinParams.ej_Assoc.ap_BSSID[5] = 0xff;
     }
 
     /* TODO: Fill chan spec! */
@@ -900,8 +922,10 @@ static int Do_S2_SETOPTIONS(struct IOSana2Req *io)
         unit->wu_WPAInfo = AllocVecPooled(WiFiBase->w_MemPool, ie_b[1] + 2);
         CopyMem(ie_b, unit->wu_WPAInfo, ie_b[1] + 2);
     }
-    else
+    else if (FindTagItem(S2INFO_SSID, io->ios2_Data) != NULL)
     {
+        /* A network named without a WPA IE is an open one.  A call that
+           only moves the BSSID keeps the encryption it has. */
         PacketSetVarInt(WiFiBase->w_SDIO, "auth", 0);
         PacketSetVarInt(WiFiBase->w_SDIO, "wsec", 0);
         PacketSetVarInt(WiFiBase->w_SDIO, "wpa_auth", WPA_AUTH_DISABLED);
