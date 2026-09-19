@@ -356,6 +356,20 @@ int SetWPAVersion(struct SDIO *sdio, struct WiFiNetwork *network, ULONG wpa_vers
  * second when idle, 2% of the CPU, and at most 2 ms on the first frame.
  */
 #define PACKET_WAIT_DELAY_MAX   2000
+/*
+ * A tick is not 45 us on Emu68: timer.device's MICROHZ unit programs a CIA
+ * for every request and takes an interrupt for every expiry, and the CIA is
+ * emulated chipset -- 179 us a tick measured (A1200 + PiStorm32 Lite,
+ * 2026-09-19, sampled at 1 kHz), 500 ticks a second was 9.8% of the machine
+ * with nothing on the air.  After PACKET_QUIET_US with no frame for this
+ * station and nothing sent, the tick slows to PACKET_WAIT_DELAY_IDLE: the
+ * first frame of the next exchange waits up to 20 ms, everything after it
+ * runs at the fast tick and the poller again.  Broadcast and multicast from
+ * the rest of the LAN (ARP, mDNS, a frame or two a second here) is not
+ * traffic for this purpose, or an idle LAN would never let the tick rest.
+ */
+#define PACKET_WAIT_DELAY_IDLE  20000
+#define PACKET_QUIET_US         2000000
 
 #define PACKET_INITIAL_FETCH_SIZE   16
 
@@ -1074,11 +1088,15 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
 
     for (int i=0; i < PACKET_INITIAL_FETCH_SIZE; i++) buffer[i] = 0;
 
+    /* when this station last sent or was sent to; the tick slows after PACKET_QUIET_US */
+    ULONG lastTraffic = WiFiBase->w_SysTimer ? PollClock(WiFiBase) : 0;
+
     // Loop forever
     while(1)
     {
         UBYTE gotTransfer = 0;
         UBYTE sendTransfer = 0;
+        sdio->s_RxUnicast = 0;
 
         ULONG sigSet = Wait(SIGBREAKF_CTRL_C | 
                             (1 << port->mp_SigBit) |
@@ -1098,6 +1116,8 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
 
                 // Send out the control packet
                 sdio->SendPKT((APTR)&msg->pm_PacketHeader[0], LE16(msg->pm_PacketHeader[0].p_Length), sdio);
+                /* its answer is wanted at the fast tick, not the idle one */
+                sendTransfer = TRUE;
             }
         }
 
@@ -1228,6 +1248,18 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
                 {
                     waitDelay = PACKET_WAIT_DELAY_MIN;
                 }
+                else if (WiFiBase->w_SysTimer != NULL &&
+                         (ULONG)(PollClock(WiFiBase) - lastTraffic) > PACKET_QUIET_US)
+                {
+                    waitDelay = PACKET_WAIT_DELAY_IDLE;
+                    waitDelayTimeout = 1;
+                }
+                else if (waitDelay > PACKET_WAIT_DELAY_MAX)
+                {
+                    /* traffic came back under the poller: the fast tick again */
+                    waitDelay = PACKET_WAIT_DELAY_MAX;
+                    waitDelayTimeout = 1;
+                }
                 else
                 {
                     if (waitDelayTimeout)
@@ -1357,7 +1389,14 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
                 pollEmpty = (!gotTransfer && sdio_card_asserting(sdio)) ? pollEmpty + 1 : 0;
             if (pollEmpty >= 16)
                 pollDead = TRUE;
-            if (!pollDead && (gotTransfer || sendTransfer || (sigSet & pollMask)))
+            /* a frame for this station or one sent is traffic; a broadcast
+               the LAN made is not, and does not start the poller either */
+            if (sdio->s_RxUnicast || sendTransfer)
+            {
+                if (WiFiBase->w_SysTimer != NULL)
+                    lastTraffic = PollClock(WiFiBase);
+            }
+            if (!pollDead && (sdio->s_RxUnicast || sendTransfer || (sigSet & pollMask)))
                 PokePoller(sdio);
 
             /*
@@ -1663,6 +1702,10 @@ void ProcessDataPacket(struct SDIO *sdio, UBYTE *packet, ULONG packetLength)
     // Get destination address and check if it is a multicast
     uint64_t destAddr = ((uint64_t)*(UWORD*)&packet[0] << 32) |
                         *(ULONG*)&packet[2];
+
+    /* the receiver's tick and poller run fast for frames addressed to us */
+    if ((packet[0] & 0x01) == 0)
+        sdio->s_RxUnicast = 1;
 #if 1
     if (packetType == 0x888e)
     {

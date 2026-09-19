@@ -322,6 +322,7 @@ struct SDIO {
     ULONG               s_PollWake;         // the poller's own signal, raised by the receiver
     BYTE                s_PollSignal;       // receiver task's signal the poller raises, -1 = none
     volatile UBYTE      s_PollAsleep;       // the poller is in Wait(); a Signal is needed to resume it
+    UBYTE               s_RxUnicast;        // this wake-up read a frame addressed to this station
 
     APTR                s_TXBuffer;
     APTR                s_RXBuffer;
