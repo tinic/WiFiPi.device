@@ -1239,10 +1239,23 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
         // All are great occasions to test if some data is pending
         if (sigSet & ((1 << port->mp_SigBit) | (1 << ctrl->mp_SigBit) | irqMask | pollMask))
         {
+            BOOL timerEvent = (sigSet & (1 << port->mp_SigBit)) ? TRUE : FALSE;
+            BOOL timerReady = FALSE;
+
             if (sigSet & (1 << ctrl->mp_SigBit))
             {
-                AbortIO(&cur->tr_node);
-                WaitIO(&cur->tr_node);
+                /* A control request wants its answer looked for now, so take
+                   the timer back first.  This wake need not also carry the
+                   timer signal: in that ordinary case the old code aborted
+                   the only fallback poll and never submitted another one.
+                   A board without a usable interrupt/poller then stopped
+                   receiving after its first firmware command. */
+                if (!timerEvent)
+                {
+                    AbortIO(&cur->tr_node);
+                    WaitIO(&cur->tr_node);
+                    timerReady = TRUE;
+                }
             }
 
             /*
@@ -1264,14 +1277,21 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
             if (!gotTransfer)
                 sdio->s_StatEmpty++;
 
-            if (sigSet & (1 << port->mp_SigBit))
+            if (timerEvent)
             {
                 // Check if IO really completed. If yes, remove it from the queue
                 if (CheckIO(&cur->tr_node))
                 {
                     WaitIO(&cur->tr_node);
+                    timerReady = TRUE;
                 }
-            
+            }
+
+            /* A completed tick and a timer deliberately aborted for a
+               control request both need a successor.  Only a stale port
+               signal with the request still active leaves timerReady false. */
+            if (timerReady)
+            {
                 /* A frame in or out, or a write still waiting for TX credit:
                    the 2 ms tick for the next few ticks -- credits come back in
                    the header of the next frame read, and a 10 ms tick between
