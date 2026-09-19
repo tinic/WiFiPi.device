@@ -347,7 +347,7 @@ int SetWPAVersion(struct SDIO *sdio, struct WiFiNetwork *network, ULONG wpa_vers
    not the up-to-a-tick a lone reply used to wait */
 #define POLL_WRITE_US           200
 
-#define PACKET_WAIT_DELAY_MIN   1000
+#define PACKET_WAIT_DELAY_MIN   2000
 /*
  * The idle back-off used to reach 100 ms, and the first frame after a quiet
  * second waited for it: ping at 1 s intervals averaged 51 ms (max 169) against
@@ -355,21 +355,33 @@ int SetWPAVersion(struct SDIO *sdio, struct WiFiNetwork *network, ULONG wpa_vers
  * ~45 us (a 16-byte header read and the timer interrupt); 2 ms is 500 looks a
  * second when idle, 2% of the CPU, and at most 2 ms on the first frame.
  */
-#define PACKET_WAIT_DELAY_MAX   2000
+#define PACKET_WAIT_DELAY_MAX   10000
 /*
- * A tick is not 45 us on Emu68: timer.device's MICROHZ unit programs a CIA
- * for every request and takes an interrupt for every expiry, and the CIA is
- * emulated chipset -- 179 us a tick measured (A1200 + PiStorm32 Lite,
- * 2026-09-19, sampled at 1 kHz), 500 ticks a second was 9.8% of the machine
- * with nothing on the air.  After PACKET_QUIET_US with no frame for this
- * station and nothing sent, the tick slows to PACKET_WAIT_DELAY_IDLE: the
- * first frame of the next exchange waits up to 20 ms, everything after it
- * runs at the fast tick and the poller again.  Broadcast and multicast from
- * the rest of the LAN (ARP, mDNS, a frame or two a second here) is not
- * traffic for this purpose, or an idle LAN would never let the tick rest.
+ * A tick is not 45 us on Emu68.  Measured on an A1200 + PiStorm32 Lite,
+ * sampled at 1 kHz (2026-09-19): 155-220 us a tick WHICHEVER timer.device
+ * unit fires it -- about 40% inside timer.device, 22% in Exec's wake and
+ * dispatch, 20% the driver's own look (a 16-byte header read), the rest
+ * whatever interrupt server runs meanwhile.  Every Disable/Enable and every
+ * interrupt entry is a trap into Emu68 at some 5 us, and a tick is a dozen
+ * of them; the CIA is not the cost, the round trip is.  So the count is
+ * what is spent: 500 ticks a second was 9.8% of the machine with nothing
+ * on the air, and the 2 s of fast ticks after every exchange still showed
+ * as 6% blips.
+ *
+ * Three ticks.  A frame in or out, or a write waiting for TX credit, is
+ * followed by PACKET_WAIT_DELAY_MIN ticks (2 ms, five of them: TX credits
+ * ride the header of the next frame read, and a 10 ms tick between reads
+ * halved TX); while an exchange is recent (PACKET_QUIET_US) a MICROHZ tick
+ * of PACKET_WAIT_DELAY_MAX, 100 a second, ~2% for that second and up to
+ * 10 ms on the first frame after the poller's 10 ms watch; after that a
+ * VBLANK tick of PACKET_WAIT_DELAY_IDLE, which rides the vertical-blank
+ * interrupt the machine takes anyway, up to 20 ms on the first frame of
+ * the next exchange, 0.7% of the machine.  Broadcast and multicast from
+ * the rest of the LAN (ARP, mDNS, a frame or two a second here) is not an
+ * exchange, or an idle LAN would never let the tick rest.
  */
 #define PACKET_WAIT_DELAY_IDLE  20000
-#define PACKET_QUIET_US         2000000
+#define PACKET_QUIET_US         1000000
 
 #define PACKET_INITIAL_FETCH_SIZE   16
 
@@ -1035,6 +1047,21 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
         return;
     }
 
+    /* The idle tick's request: the VBLANK unit, same port.  One of the two
+       is outstanding at any time, `cur` says which. */
+    struct timerequest *trv = (struct timerequest *)CreateIORequest(port, sizeof(struct timerequest));
+    if (trv == NULL || OpenDevice((CONST_STRPTR)"timer.device", UNIT_VBLANK, &trv->tr_node, 0))
+    {
+        D(bug("[WiFi.RECV] Failed to open timer.device VBLANK\n"));
+        if (trv != NULL) DeleteIORequest(&trv->tr_node);
+        CloseDevice(&tr->tr_node);
+        DeleteIORequest(&tr->tr_node);
+        DeleteMsgPort(port);
+        Signal(caller, SIGBREAKF_CTRL_C);
+        return;
+    }
+    struct timerequest *cur = tr;
+
     // Set up receiver task pointer in SDIO
     sdio->s_ReceiverTask = FindTask(NULL);
 
@@ -1077,10 +1104,11 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
     // Signal caller that we are done with setup
     Signal(caller, SIGBREAKF_CTRL_C);
 
-    tr->tr_node.io_Command = TR_ADDREQUEST;
-    tr->tr_time.tv_sec = waitDelay / 1000000;
-    tr->tr_time.tv_micro = waitDelay % 1000000;
-    SendIO(&tr->tr_node);
+    cur = (waitDelay >= PACKET_WAIT_DELAY_IDLE) ? trv : tr;
+    cur->tr_node.io_Command = TR_ADDREQUEST;
+    cur->tr_time.tv_sec = waitDelay / 1000000;
+    cur->tr_time.tv_micro = waitDelay % 1000000;
+    SendIO(&cur->tr_node);
 
     // Clear PACKET_INITIAL_FETCH_SIZE bytes of RX buffer
     UBYTE *buffer = sdio->s_RXBuffer;
@@ -1213,8 +1241,8 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
         {
             if (sigSet & (1 << ctrl->mp_SigBit))
             {
-                AbortIO(&tr->tr_node);
-                WaitIO(&tr->tr_node);
+                AbortIO(&cur->tr_node);
+                WaitIO(&cur->tr_node);
             }
 
             /*
@@ -1239,14 +1267,19 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
             if (sigSet & (1 << port->mp_SigBit))
             {
                 // Check if IO really completed. If yes, remove it from the queue
-                if (CheckIO(&tr->tr_node))
+                if (CheckIO(&cur->tr_node))
                 {
-                    WaitIO(&tr->tr_node);
+                    WaitIO(&cur->tr_node);
                 }
             
-                if (gotTransfer || sendTransfer)
+                /* A frame in or out, or a write still waiting for TX credit:
+                   the 2 ms tick for the next few ticks -- credits come back in
+                   the header of the next frame read, and a 10 ms tick between
+                   reads halved TX (61 -> 29 Mbit/s, 2026-09-19). */
+                if (gotTransfer || sendTransfer || !IsMsgPortEmpty(sender))
                 {
                     waitDelay = PACKET_WAIT_DELAY_MIN;
+                    waitDelayTimeout = PACKET_WAIT_DELAY_MAX / PACKET_WAIT_DELAY_MIN;
                 }
                 else if (WiFiBase->w_SysTimer != NULL &&
                          (ULONG)(PollClock(WiFiBase) - lastTraffic) > PACKET_QUIET_US)
@@ -1274,11 +1307,12 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
                     }
                 }
 
-                // Fire new IORequest
-                tr->tr_node.io_Command = TR_ADDREQUEST;
-                tr->tr_time.tv_sec = waitDelay / 1000000;
-                tr->tr_time.tv_micro = waitDelay % 1000000;
-                SendIO(&tr->tr_node);
+                // Fire new IORequest: the VBLANK one for the idle tick
+                cur = (waitDelay >= PACKET_WAIT_DELAY_IDLE) ? trv : tr;
+                cur->tr_node.io_Command = TR_ADDREQUEST;
+                cur->tr_time.tv_sec = waitDelay / 1000000;
+                cur->tr_time.tv_micro = waitDelay % 1000000;
+                SendIO(&cur->tr_node);
             }
 
             if (gotTransfer)
@@ -1439,8 +1473,8 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
         {
             D(bug("[WiFi.RECV] Quiting receiver loop\n"));
             // Abort timer IO
-            AbortIO(&tr->tr_node);
-            WaitIO(&tr->tr_node);
+            AbortIO(&cur->tr_node);
+            WaitIO(&cur->tr_node);
             break;
         }
     }
@@ -1463,6 +1497,8 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
         FreeSignal(sdio->s_IRQSignal);
         sdio->s_IRQSignal = -1;
     }
+    CloseDevice(&trv->tr_node);
+    DeleteIORequest(&trv->tr_node);
     CloseDevice(&tr->tr_node);
     DeleteIORequest(&tr->tr_node);
     DeleteMsgPort(port);
