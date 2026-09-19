@@ -1205,7 +1205,12 @@ static void UpdateMCastList(struct WiFiUnit *unit)
         }
     }
 
-    PacketSetVar(sdio, "mcast_list", list, totalCount * 6 + 4);
+    int err = PacketSetVar(sdio, "mcast_list", list, totalCount * 6 + 4);
+
+    /* brcmfmac's rule: a list the firmware refuses (more groups than its
+       filter holds) falls back to every multicast frame; the range list
+       above still narrows that to what the stack asked for. */
+    PacketSetVarInt(sdio, "allmulti", (err != 0 && totalCount != 0) ? 1 : 0);
 
     FreeVecPooled(WiFiBase->w_MemPool, list);
 }
