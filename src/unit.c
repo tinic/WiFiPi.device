@@ -1308,7 +1308,7 @@ static int Do_S2_DELMULTICASTADDRESSES(struct IOSana2Req *io)
     u.u8[6] = io->ios2_SrcAddr[4];
     u.u8[7] = io->ios2_SrcAddr[5];
     lower_bound = u.u64;
-    if (io->ios2_Req.io_Command == S2_ADDMULTICASTADDRESS)
+    if (io->ios2_Req.io_Command == S2_DELMULTICASTADDRESS)
     {
         upper_bound = lower_bound;
     }
