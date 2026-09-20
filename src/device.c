@@ -268,37 +268,39 @@ void WiFi_Open(REGARG(struct IOSana2Req * io, "a1"), REGARG(LONG unitNumber, "d0
 */
         opener->o_FilterHook = (APTR)GetTagData(S2_PacketFilter, 0, tags);
 
-        /*
-         * AmiNetXDuo's private receive tags.  The direct pair is taken as
-         * offered; RX_LINK_HDR and RX_FLAGS point at a BOOL and a UBYTE the
-         * opener reads back to learn what was agreed: LINK_HDR set TRUE,
-         * FLAGS replaced by the intersection with what this device does
-         * (SUMMED always, VERIFIED on request, never CONTINUES).  TX_CSUM is
-         * left alone -- the frame is pulled by S2_CopyFromBuff, there is no
-         * pass to sum it in -- and the opener reads ASKED back.
-         */
-        opener->o_RxDirect = (APTR)GetTagData(ANXD_S2_RX_DIRECT, 0, tags);
-        opener->o_RxFilled = (APTR)GetTagData(ANXD_S2_RX_FILLED, 0, tags);
-        if (opener->o_RxDirect != NULL && opener->o_RxFilled != NULL)
+        /* AmiNetXDuo's private direct-receive path is one versioned TAG_USER
+           record.  Unknown versions and short records remain untouched, just
+           like an ordinary SANA-II driver that does not know the extension. */
         {
-            BOOL *linkHdr = (BOOL *)GetTagData(ANXD_S2_RX_LINK_HDR, 0, tags);
-            UBYTE *flags = (UBYTE *)GetTagData(ANXD_S2_RX_FLAGS, 0, tags);
+            AnxdS2Extension *ext = (AnxdS2Extension *)
+                GetTagData(ANXD_S2_EXTENSION, 0, tags);
 
-            if (linkHdr != NULL)
+            if (ext != NULL && ext->Version == ANXD_S2_ABI_VERSION &&
+                ext->Size >= (UWORD)sizeof(*ext))
             {
-                *linkHdr = TRUE;
-                opener->o_RxLinkHdr = TRUE;
+                ULONG accepted = 0;
+
+                ext->Accepted = 0;
+                if ((ext->Request & ANXD_S2F_RX_DIRECT) != 0 &&
+                    ext->RxDirect != NULL && ext->RxFilled != NULL)
+                {
+                    opener->o_RxDirect = (APTR)ext->RxDirect;
+                    opener->o_RxFilled = (APTR)ext->RxFilled;
+                    accepted |= ANXD_S2F_RX_DIRECT;
+
+                    if ((ext->Request & ANXD_S2F_RX_LINK_HDR) != 0)
+                    {
+                        opener->o_RxLinkHdr = TRUE;
+                        accepted |= ANXD_S2F_RX_LINK_HDR;
+                    }
+                    if ((ext->Request & ANXD_S2F_RX_VERIFIED) != 0)
+                    {
+                        opener->o_RxFlags = ANXD_S2_RXF_VERIFIED;
+                        accepted |= ANXD_S2F_RX_VERIFIED;
+                    }
+                }
+                ext->Accepted = accepted;
             }
-            if (flags != NULL)
-            {
-                UBYTE want = *flags ? *flags : (UBYTE)(ANXD_S2_RXF_SUMMED | ANXD_S2_RXF_VERIFIED);
-                opener->o_RxFlags = (UBYTE)(want & ANXD_S2_RXF_VERIFIED);
-                *flags = (UBYTE)(ANXD_S2_RXF_SUMMED | opener->o_RxFlags);
-            }
-        }
-        else
-        {
-            opener->o_RxDirect = opener->o_RxFilled = NULL;
         }
         
         Disable();
