@@ -1107,6 +1107,8 @@ static int Do_CMD_FLUSH(struct IOSana2Req *io)
 
 static int Do_NSCMD_DEVICEQUERY(struct IOSana2Req *io)
 {
+    struct WiFiUnit *unit = (struct WiFiUnit *)io->ios2_Req.io_Unit;
+    struct ExecBase *SysBase = unit->wu_Base->w_SysBase;   /* for D(bug()) */
     struct IOStdReq *std = (struct IOStdReq *)io;
     struct NSDeviceQueryResult *dq = NULL;
     int full = io->ios2_Req.io_Message.mn_Length >= sizeof(struct IOSana2Req);
