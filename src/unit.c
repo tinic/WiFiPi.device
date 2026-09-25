@@ -1105,23 +1105,63 @@ static int Do_CMD_FLUSH(struct IOSana2Req *io)
     return 1;
 }
 
-static int Do_NSCMD_DEVICEQUERY(struct IOStdReq *io)
+static int Do_NSCMD_DEVICEQUERY(struct IOSana2Req *io)
 {
-    struct WiFiUnit *unit = (struct WiFiUnit *)io->io_Unit;
-    struct ExecBase *SysBase = unit->wu_Base->w_SysBase;
-
-    struct NSDeviceQueryResult *dq;
-    dq = io->io_Data;
+    struct IOStdReq *std = (struct IOStdReq *)io;
+    struct NSDeviceQueryResult *dq = NULL;
+    int full = io->ios2_Req.io_Message.mn_Length >= sizeof(struct IOSana2Req);
+    int sana = 0;
 
     D(bug("[WiFi.0] NSCMD_DEVICEQUERY\n"));
 
-    /* Fill out structure */
+    /*
+     * Two forms, and the request's size alone decides which -- never a
+     * guess, never written blind.  A full IOSana2Req (mn_Length) is answered
+     * in the SANA-II form only: buffer in ios2_Data, size in ios2_DataLength,
+     * what mcastfilter sends.  In such a request io_Data/io_Length are
+     * ios2_SrcAddr[0..3] and ios2_PacketType, so a reused request's stale MAC
+     * would be taken for a buffer; no bound tells the two apart, and io_Data
+     * is never read.  A short request is an IOStdReq: the NewStyle form only.
+     * A caller wanting that form from an 88-byte allocation sets mn_Length
+     * to sizeof(struct IOStdReq).
+     */
+    if (full)
+    {
+        if (io->ios2_Data != NULL &&
+            io->ios2_DataLength >= sizeof(struct NSDeviceQueryResult))
+        {
+            dq = io->ios2_Data;
+            sana = 1;
+        }
+    }
+    else if (std->io_Data != NULL &&
+             std->io_Length >= sizeof(struct NSDeviceQueryResult))
+    {
+        dq = std->io_Data;
+    }
+
+    if (dq == NULL)
+    {
+        std->io_Actual = 0;
+        std->io_Error = IOERR_BADLENGTH;
+        return 1;
+    }
+
+    /* Fill out structure.  SizeAvailable is what was filled, 16 bytes; it
+       used to add sizeof(APTR) for bytes that were never written. */
+    dq->nsdqr_DevQueryFormat = 0;
+    dq->nsdqr_SizeAvailable = sizeof(struct NSDeviceQueryResult);
     dq->nsdqr_DeviceType = NSDEVTYPE_SANA2;
     dq->nsdqr_DeviceSubType = 0;
     dq->nsdqr_SupportedCommands = (UWORD*)WiFi_SupportedCommands;
-    io->io_Actual = sizeof(struct NSDeviceQueryResult) + sizeof(APTR);
-    dq->nsdqr_SizeAvailable = io->io_Actual;
-    io->io_Error = 0;
+    if (sana)
+    {
+        io->ios2_DataLength = sizeof(struct NSDeviceQueryResult);
+        io->ios2_WireError = 0;
+    }
+    else
+        std->io_Actual = sizeof(struct NSDeviceQueryResult);
+    std->io_Error = 0;
 
     return 1;
 }
@@ -1701,7 +1741,7 @@ void HandleRequest(struct IOSana2Req *io)
         switch (io->ios2_Req.io_Command)
         {
             case NSCMD_DEVICEQUERY:
-                complete = Do_NSCMD_DEVICEQUERY((struct IOStdReq *)io);
+                complete = Do_NSCMD_DEVICEQUERY(io);
                 break;
 
             case S2_DEVICEQUERY:
