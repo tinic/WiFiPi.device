@@ -76,6 +76,7 @@ typedef struct { UBYTE req[sizeof(struct IOSana2Req)]; UBYTE tail[TAIL]; } Frame
 
 static struct WiFiBase fbase;
 static struct WiFiUnit funit;
+static struct SDIO fsdio;
 
 static struct IOSana2Req *frame(Frame *f, UWORD mn_length)
 {
@@ -98,14 +99,18 @@ static int beyond_intact(const Frame *f, UWORD mn_length)
 int main(void)
 {
     static struct NSDeviceQueryResult ans;
-    static Frame f, g;
+    static Frame f, g, read_frame, ctl_frame;
     struct IOSana2Req *io;
+    struct IOSana2Req *read_io, *ctl_io;
     struct IOStdReq *std;
+    struct Opener *opener;
+    struct MsgPort *read_reply;
     ULONG low0, lib0, unit0;
     const UWORD SHORT = sizeof(struct IOStdReq), FULL = sizeof(struct IOSana2Req);
 
     fbase.w_SysBase = SysBase;
     fbase.w_Unit = &funit;
+    fbase.w_SDIO = &fsdio;
     fbase.w_UtilityBase = OpenLibrary((CONST_STRPTR)"utility.library", 37);
     funit.wu_Base = &fbase;
     funit.wu_Flags = IFF_STARTED;               /* no StartUnit(): no hardware */
@@ -216,6 +221,75 @@ int main(void)
     WiFi_Close(io);
     expect_eq(fbase.w_Device.dd_Library.lib_OpenCnt, lib0, "full Close balances the device count");
     expect_eq(funit.wu_Unit.unit_OpenCnt, unit0, "full Close balances the unit count");
+
+    PutStr("step 9 flush and offline return queued reads\n");
+    funit.wu_ScanQueue = CreateMsgPort();
+    fsdio.s_SenderPort = CreateMsgPort();
+    read_reply = CreateMsgPort();
+    expect(funit.wu_ScanQueue != NULL && fsdio.s_SenderPort != NULL &&
+           read_reply != NULL, "fake ports allocated");
+    if (funit.wu_ScanQueue != NULL && fsdio.s_SenderPort != NULL &&
+        read_reply != NULL)
+    {
+        io = frame(&g, FULL);
+        WiFi_Open(io, 0, 0);
+        expect_eq(io->ios2_Req.io_Error, 0, "full Open for read lifecycle");
+        opener = io->ios2_BufferManagement;
+        funit.wu_Flags |= IFF_ONLINE;
+
+        read_io = frame(&read_frame, FULL);
+        read_io->ios2_Req.io_Unit = &funit.wu_Unit;
+        read_io->ios2_Req.io_Message.mn_ReplyPort = read_reply;
+        read_io->ios2_BufferManagement = opener;
+        read_io->ios2_Req.io_Command = CMD_READ;
+        read_io->ios2_Req.io_Flags = IOF_QUICK;
+        WiFi_BeginIO(read_io);
+        expect((read_io->ios2_Req.io_Flags & IOF_QUICK) == 0,
+               "queued CMD_READ becomes asynchronous");
+
+        ctl_io = frame(&ctl_frame, FULL);
+        ctl_io->ios2_Req.io_Unit = &funit.wu_Unit;
+        ctl_io->ios2_Req.io_Command = CMD_FLUSH;
+        ctl_io->ios2_Req.io_Flags = IOF_QUICK;
+        WiFi_BeginIO(ctl_io);
+        expect((struct IOSana2Req *)GetMsg(read_reply) == read_io,
+               "CMD_FLUSH returns an ordinary queued read");
+        expect_eq(read_io->ios2_Req.io_Error, IOERR_ABORTED,
+                  "flushed read reports aborted");
+
+        read_io = frame(&read_frame, FULL);
+        read_io->ios2_Req.io_Unit = &funit.wu_Unit;
+        read_io->ios2_Req.io_Message.mn_ReplyPort = read_reply;
+        read_io->ios2_BufferManagement = opener;
+        read_io->ios2_Req.io_Command = CMD_READ;
+        read_io->ios2_Req.io_Flags = IOF_QUICK;
+        WiFi_BeginIO(read_io);
+
+        ctl_io = frame(&ctl_frame, FULL);
+        ctl_io->ios2_Req.io_Unit = &funit.wu_Unit;
+        ctl_io->ios2_Req.io_Command = S2_OFFLINE;
+        ctl_io->ios2_Req.io_Flags = IOF_QUICK;
+        WiFi_BeginIO(ctl_io);
+        expect((struct IOSana2Req *)GetMsg(read_reply) == read_io,
+               "S2_OFFLINE returns an ordinary queued read");
+        expect_eq(read_io->ios2_Req.io_Error, S2ERR_OUTOFSERVICE,
+                  "offline read reports out of service");
+        expect_eq(read_io->ios2_WireError, S2WERR_UNIT_OFFLINE,
+                  "offline read reports unit offline");
+
+        read_io = frame(&read_frame, FULL);
+        read_io->ios2_Req.io_Unit = &funit.wu_Unit;
+        read_io->ios2_BufferManagement = opener;
+        read_io->ios2_Req.io_Command = CMD_READ;
+        read_io->ios2_Req.io_Flags = IOF_QUICK;
+        WiFi_BeginIO(read_io);
+        expect_eq(read_io->ios2_Req.io_Error, S2ERR_OUTOFSERVICE,
+                  "offline unit rejects a new read synchronously");
+        WiFi_Close(io);
+    }
+    if (read_reply != NULL) DeleteMsgPort(read_reply);
+    if (fsdio.s_SenderPort != NULL) DeleteMsgPort(fsdio.s_SenderPort);
+    if (funit.wu_ScanQueue != NULL) DeleteMsgPort(funit.wu_ScanQueue);
 
     expect(lowsum() == low0, "low memory [0, 0x400) unchanged across the run");
 
