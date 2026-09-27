@@ -1,0 +1,43 @@
+# WirelessManager 1.3 (28.8.2013), wpa_supplicant v0.7.3: every SANA-II request it makes.
+# Binary: C:WirelessManager sha256 9d2e45a8b00d7990abadf3591b0b9b20de92e6988ad899f5ec89165dc86c7efe
+#   (Aminet driver/net/prism2v2; byte-identical to the A1200's). bin = file offset of its io_Command store.
+# Source: AROS master workbench/network/WirelessManager/src/drivers/driver_sana2.c (Cafferkey 2010-2013);
+#   the source is not tied to the binary by a tag, but its 21 io_Command stores map 1:1 onto the binary's, in order.
+# IOSana2Req offsets: io_Command 28, io_Flags 30, io_Error 31, ios2_WireError/io_Actual 32,
+#   ios2_PacketType/io_Length 36, ios2_SrcAddr 40 (io_Data 40..43), ios2_DstAddr 56, ios2_DataLength 72,
+#   ios2_Data 76, ios2_StatData 80, ios2_BufferManagement 84; sizeof 88.
+# req: M = drv->request, CreateIORequest(port, 88) = MEMF_CLEAR, OpenDevice'd once, reused for every DoIO below.
+#   E = EAPOL read, AllocVec(88+1500, CLEAR) then CopyMem(M, 88): inherits EVERY M field at copy time.
+#   R = MLME read x MLME_REQ_COUNT, same copy rule.  V = event request, AllocVec(88, CLEAR) + copy of M.
+#   T = WM's timer.device request (eloop), not sent to this driver.
+# order	command	value	bin	src	req	mode	fields set by WM (rest inherited)	buffer (size, lifetime)	consumed on return
+1	NSCMD_DEVICEQUERY	0x4000	0x29b58	979	M	DoIO	io_Command; io_Data=&device_info	stack 16 B preset {0,16,0,0} (bin 0x299ee), WM init frame	io_Error; SupportedCommands[] to 0 (S2_GETNETWORKS -> hard_mac)
+2	S2_GETSTATIONADDRESS	10	0x29bb2	994	M	DoIO	io_Command	-	io_Error; ios2_DstAddr[6]
+3	S2_CONFIGINTERFACE	11	0x29be6	1002	M	DoIO	io_Command; ios2_SrcAddr=that address	-	io_Error; ios2_WireError (S2WERR_IS_CONFIGURED)
+4	S2_ONLINE	25	0x29c16	1007	M	DoIO	io_Command (only if 3 failed IS_CONFIGURED)	-	none
+5	CMD_READ	2	0x29c3c	1018	E	SendIO, requeued	io_Command; ios2_PacketType=0x888e; ios2_Data=E+88	1500 B after E, until deinit AbortIO	io_Error; ios2_SrcAddr; ios2_Data/DataLength (via BufferManagement hooks)
+6	S2_READMGMT	0xc015	0x29ca6	1039	R	SendIO, requeued	io_Command; ios2_DataLength=1500; ios2_Data=R+88	1500 B after R, until deinit (soft-MAC only)	io_Error; ios2_Data; ios2_DataLength
+7	S2_ONEVENT	23	0x29d12	1062	V	SendIO, requeued	io_Command; ios2_WireError=mask (hard: CONNECT|DISCONNECT|OFFLINE; soft: OFFLINE)	-	io_Error; ios2_WireError
+8	S2_ONEVENT (requeue)	23	0x2988a	867	V	SendIO	io_Command; ios2_WireError=mask	-	as 7
+9	S2_GETNETWORKINFO (on event)	0xc014	0x29766	808	V	DoIO	io_Command; ios2_Data=pool	exec pool, freed after	io_Error; ios2_StatData (tag list)
+10	S2_GETNETWORKINFO	0xc014	0x28924	141	M	DoIO	io_Command; ios2_Data=pool	exec pool	io_Error; ios2_StatData (BSSID)
+11	S2_GETNETWORKS	0xc011	0x28ab2	205	M	SendIO	io_Command; ios2_Data=pool; ios2_StatData=tags (SSID)	exec pool, freed in get_scan_results	io_Error; ios2_StatData; ios2_DataLength (count)
+12	S2_SETKEY	0xc013	0x28dce	359	M	DoIO	io_Command; ios2_WireError=key index; ios2_PacketType=cipher; ios2_DataLength=key len; ios2_Data=key; ios2_StatData=seq; ios2_DstAddr=addr or 0	caller's key/seq, call duration	io_Error
+13	S2_SETOPTIONS (associate)	0xc012	0x28fc0	434	M	DoIO	io_Command; ios2_Data=tag list	stack tag list	io_Error
+14	S2_GETCRYPTTYPES	0xc018	0x2902a	459	M	DoIO	io_Command; ios2_Data=pool	exec pool	io_Error; ios2_StatData; ios2_DataLength
+15	CMD_WRITE (EAPOL)	3	0x29102	513	M	DoIO	io_Command; io_Flags=0; ios2_DstAddr; ios2_PacketType=proto; ios2_DataLength; ios2_Data	caller's frame	io_Error
+16	S2_SETOPTIONS (channel)	0xc012	0x293f4	651	M	DoIO	io_Command; ios2_Data=tag list	stack	io_Error
+17	S2_SETOPTIONS (ssid)	0xc012	0x29488	670	M	DoIO	io_Command; ios2_Data=tag list	stack	io_Error
+18	S2_SETOPTIONS (bssid)	0xc012	0x294e4	686	M	DoIO	io_Command; ios2_Data=tag list	stack	io_Error
+19	S2_SETOPTIONS (associd)	0xc012	0x2954c	703	M	DoIO	io_Command; ios2_Data=tag list	stack	io_Error
+20	S2_SETOPTIONS (capabilities)	0xc012	0x295a0	717	M	DoIO	io_Command; ios2_Data=tag list	stack	io_Error
+21	S2_WRITEMGMT	0xc016	0x29604	730	M	DoIO	io_Command; io_Flags=0; ios2_DataLength; ios2_Data	caller's frame	io_Error
+22	TR_ADDREQUEST (timer.device, not this driver)	9	0x4cd8	-	T	-	io_Command; tr_time cleared	global timerequest	-
+23	TR_ADDREQUEST (timer.device, not this driver)	9	0x5162	-	T	-	io_Command; tr_time from the frame at -16(a5)	global timerequest	-
+# Deinit: AbortIO E, each R, V, M; CloseDevice(M).
+# Rows 22-23: value 9 is also S2_DEVICEQUERY, so they are listed to show the two stores are timer.device's
+#   (movea.l $58,a0 -> a timerequest; tr_time written at offset 32), not a SANA-II device query.
+# NSCMD_DEVICEQUERY expected outcomes (release gate for beta7):
+#   WM form (row 1: full 88-byte request, first command after Open, io_Length/PacketType 0, io_Data = 16 B preset {0,16}) -> io_Error 0, 16 B header filled, SupportedCommands set.
+#   Same 88-byte request after S2_CONFIGINTERFACE (SrcAddr = station address, so io_Data = its first 4 bytes), PacketType 0 -> must NOT write through io_Data. UNRESOLVED: no bit pattern alone distinguishes it from row 1 (HOLD, codex 08:05).
+#   SANA-II form (ios2_Data non-NULL, ios2_DataLength >= 16) -> writes ios2_Data only.  Short IOStdReq (mn_Length 48) -> io_Data, as beta4.
