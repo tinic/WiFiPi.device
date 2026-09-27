@@ -209,7 +209,9 @@ static void run(const char *name, UBYTE count, const UWORD *dl, UBYTE seq0)
 
 int main(void)
 {
-    static const UWORD one5[] = { 5 }, one2[] = { 2 };
+    /* frame length = data + 38: residues 0, 1, 2, 3 mod 4; 40 bytes of data
+       is the 78-byte TCP ACK frame the A1200 sent (hw 78, not 80) */
+    static const UWORD one2[] = { 2 }, one3[] = { 3 }, ack[] = { 40 }, one5[] = { 5 };
     static const UWORD two[] = { 3, 4 }, three[] = { 2, 3, 5 }, four[] = { 2, 3, 4, 5 };
     static const UWORD aligned[] = { 218, 218 };        /* 2 x 256 = 512 */
     static const UWORD aligned2[] = { 474, 474, 474, 474 }; /* 4 x 512 */
@@ -243,8 +245,10 @@ int main(void)
         for (j = 0; j < MAXDATA; j++) payload[i][j] = (UBYTE)(i * 31 + j * 7 + 1);
     for (i = 0; i < MAXF; i++) big[i] = MAXDATA;
 
-    run("1 frame, residue 3", 1, one5, 7);
     run("1 frame, residue 0", 1, one2, 7);
+    run("1 frame, residue 1", 1, one3, 7);
+    run("1 frame, residue 2: the 78-byte TCP ACK", 1, ack, 7);
+    run("1 frame, residue 3", 1, one5, 7);
     run("2 frames", 2, two, 7);
     run("3 frames", 3, three, 254);         /* sequence wraps */
     run("4 frames, all residues", 4, four, 0);
