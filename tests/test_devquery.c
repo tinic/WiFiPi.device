@@ -449,6 +449,41 @@ int main(void)
         expect(req_guards(&r, FULL) && req_guards(&r3, FULL), "k request guards intact");
     }
 
+    PutStr("l short first command on the opening request\n");
+    {
+        UWORD n0 = funit.wu_FreshOpenReqs;
+        static const UWORD first_cmd[2] = { NSCMD_DEVICEQUERY, S2_GETSTATIONADDRESS };
+        int i;
+
+        for (i = 0; i < 2; i++)
+        {
+            io = open_full(&r, NULL);
+            std = (struct IOStdReq *)io;
+            io->ios2_Req.io_Message.mn_Length = SHORT;
+            buf_init(&buf);
+            if (first_cmd[i] == NSCMD_DEVICEQUERY)
+            {
+                std->io_Length = 16;
+                query(io, &buf.info);
+                expect_eq(std->io_Error, 0, "l short query answered");
+            }
+            else
+            {
+                getstation(io);
+                expect_eq(std->io_Error, IOERR_BADLENGTH, "l short S2 command refused");
+            }
+            expect_eq(funit.wu_FreshOpenReqs, n0, "l short first command consumes");
+            io->ios2_Req.io_Message.mn_Length = FULL;
+            buf_init(&decoy);
+            query(io, &decoy.info);
+            expect_eq(std->io_Error, IOERR_BADLENGTH, "l later full legacy query refused");
+            expect(buf_untouched(&decoy), "l decoy untouched");
+            WiFi_Close(io);
+            expect_eq(funit.wu_FreshOpenReqs, n0, "l Close used: no change");
+            expect(req_guards(&r, FULL), "l request guards intact");
+        }
+    }
+
     PutStr("f short IOStdReq\n");
     io = req_init(&r2, SHORT);
     std = (struct IOStdReq *)io;

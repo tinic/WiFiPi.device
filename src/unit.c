@@ -1820,12 +1820,12 @@ static int Do_S2_OFFLINE(struct IOSana2Req *io)
 
 /*
  * If io is the request an opener was opened with and has had no command yet,
- * mark it used; TRUE when it was fresh and its io_Data differs from the Open
- * snapshot.  The opener is found on wu_Openers by identity, not through
- * ios2_BufferManagement (a clone carries the same cookie); nothing the
- * request points to is dereferenced.
+ * mark it used; TRUE when it was fresh, full-sized now and its io_Data
+ * differs from the Open snapshot.  The opener is found on wu_Openers by
+ * identity, not through ios2_BufferManagement (a clone carries the same
+ * cookie); a short io is not read at all, nothing it points to ever is.
  */
-static BOOL UseOpenReq(struct WiFiUnit *unit, struct IOSana2Req *io)
+static BOOL UseOpenReq(struct WiFiUnit *unit, struct IOSana2Req *io, BOOL full)
 {
     struct ExecBase *SysBase = unit->wu_Base->w_SysBase;
     struct Opener *opener;
@@ -1838,7 +1838,8 @@ static BOOL UseOpenReq(struct WiFiUnit *unit, struct IOSana2Req *io)
         {
             if (!opener->o_OpenReqUsed)
             {
-                fresh = ((struct IOStdReq *)io)->io_Data != opener->o_OpenIoData;
+                fresh = full &&
+                    ((struct IOStdReq *)io)->io_Data != opener->o_OpenIoData;
                 opener->o_OpenReqUsed = TRUE;
                 unit->wu_FreshOpenReqs--;
             }
@@ -1857,28 +1858,27 @@ void HandleRequest(struct IOSana2Req *io)
     struct ExecBase *SysBase = WiFiBase->w_SysBase;
 
     ULONG complete = 0;
+    BOOL full = io->ios2_Req.io_Message.mn_Length >= sizeof(struct IOSana2Req);
+    BOOL fresh = FALSE;
+
+    /* Any command on the request that opened uses up its legacy
+       NSCMD_DEVICEQUERY form, a query or a refused short command included,
+       answered or not.  Done before dispatch: a queued request is not ours
+       to touch after. */
+    if (unit->wu_FreshOpenReqs != 0)
+        fresh = UseOpenReq(unit, io, full);
 
     /*
         Only NSCMD_DEVICEQUERY can use standard sized request. All other must be of 
         size IOSana2Req
     */
-    if (io->ios2_Req.io_Message.mn_Length < sizeof(struct IOSana2Req) &&
-        io->ios2_Req.io_Command != NSCMD_DEVICEQUERY)
+    if (!full && io->ios2_Req.io_Command != NSCMD_DEVICEQUERY)
     {
         io->ios2_Req.io_Error = IOERR_BADLENGTH;
         complete = 1;
     }
     else
     {
-        BOOL fresh = FALSE;
-
-        /* Any command on the request that opened uses up its legacy
-           NSCMD_DEVICEQUERY form, a query included, answered or not.  Done
-           before dispatch: a queued request is not ours to touch after. */
-        if (unit->wu_FreshOpenReqs != 0 &&
-            io->ios2_Req.io_Message.mn_Length >= sizeof(struct IOSana2Req))
-            fresh = UseOpenReq(unit, io);
-
         io->ios2_Req.io_Error = 0;
 
         switch (io->ios2_Req.io_Command)
