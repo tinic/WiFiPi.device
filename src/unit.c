@@ -1520,7 +1520,7 @@ static int Do_S2_CONFIGINTERFACE(struct IOSana2Req *io)
 
         /* Get HW addr back */
         if (!CtrlLost(err))
-            err = PacketGetVar(sdio, "cur_etheraddr", unit->wu_EtherAddr, 6);
+            err = PacketGetVarMin(sdio, "cur_etheraddr", unit->wu_EtherAddr, 6, 6);
         if (CtrlLost(err))
         {
             io->ios2_Req.io_Error = S2ERR_OUTOFSERVICE;

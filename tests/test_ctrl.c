@@ -309,14 +309,20 @@ int main(void)
     mode = M_SHORT; v = 0x5a5a5a5a;
     err = PacketCmdIntGet(&fsdio, 6, &v);
     expect_eq(err, PACKET_CTRL_SHORT, "2 of 4 bytes: short");
+    expect_eq(v, 0x5a5a5a5a, "short IntGet leaves the caller's value whole, not half-written");
     {
         static UBYTE buf[8];
         for (i = 0; i < 8; i++) buf[i] = 0xa5;
         err = PacketGetVar(&fsdio, "x", buf, 8);
-        expect_eq(err, PACKET_CTRL_SHORT, "GetVar short");
+        expect_eq(err, 0, "GetVar: a shorter well-formed reply is success (capacity)");
         expect(buf[0] == 0x44 && buf[1] == 0x33, "the bytes that came are copied");
         ok = 1; for (i = 2; i < 8; i++) if (buf[i] != 0) ok = 0;
         expect(ok, "the rest is zeroed, not stale");
+        for (i = 0; i < 8; i++) buf[i] = 0xa5;
+        err = PacketGetVarMin(&fsdio, "x", buf, 8, 6);
+        expect_eq(err, PACKET_CTRL_SHORT, "GetVarMin: below the required size is short");
+        ok = 1; for (i = 2; i < 8; i++) if (buf[i] != 0) ok = 0;
+        expect(ok, "and still zeroed, not stale");
     }
     mode = M_TRUNC; v = 0x5a5a5a5a;
     err = PacketCmdIntGet(&fsdio, 7, &v);

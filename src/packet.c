@@ -2832,6 +2832,7 @@ int PacketCmdIntGet(struct SDIO *sdio, ULONG cmd, ULONG *cmdValue)
 
     if (cmdValue != NULL)
     {
+        ULONG scratch = 0;
         struct ExecBase *SysBase = sdio->s_SysBase;
         UBYTE *pkt;
         struct MsgPort *port;
@@ -2848,7 +2849,11 @@ int PacketCmdIntGet(struct SDIO *sdio, ULONG cmd, ULONG *cmdValue)
             return PACKET_CTRL_NORES;
         pkt = (APTR)&mpkt->pm_PacketHeader[0];
 
-        mpkt->pm_RecvBuffer = cmdValue;
+        /* The reply lands in scratch, and reaches *cmdValue only whole: a
+           short reply must not leave a half-written value behind.  On the
+           stack is safe -- a request given up on has pm_RecvBuffer cleared
+           under Forbid before this function returns. */
+        mpkt->pm_RecvBuffer = &scratch;
         mpkt->pm_RecvSize = 4;
         
         struct PacketHeaderHW *hw = (APTR)&pkt[0];
@@ -2892,14 +2897,18 @@ int PacketCmdIntGet(struct SDIO *sdio, ULONG cmd, ULONG *cmdValue)
         if (error_code == 0 && copied < 4)
             error_code = PACKET_CTRL_SHORT;
         if (error_code == 0)
-            *cmdValue = LE32(*cmdValue);
+            *cmdValue = LE32(scratch);
         D(bug("[WiFi] PacketCmdIntGet ended with %08lx\n", error_code));
     }
 
     return error_code;
 }
 
-int PacketGetVar(struct SDIO *sdio, char *varName, void *getBuffer, int getSize)
+/* getSize is the buffer's capacity: a well-formed reply may be shorter ('ver',
+   'counters'), is copied as far as it goes and the rest zeroed -- success, as
+   brcmf_proto_bcdc_query_dcmd() does.  A caller that needs an exact size
+   (cur_etheraddr: 6) says so in minSize and gets PACKET_CTRL_SHORT below it. */
+int PacketGetVarMin(struct SDIO *sdio, char *varName, void *getBuffer, int getSize, int minSize)
 {
     struct ExecBase *SysBase = sdio->s_SysBase;
     UBYTE *pkt;
@@ -2969,19 +2978,24 @@ int PacketGetVar(struct SDIO *sdio, char *varName, void *getBuffer, int getSize)
     ULONG copied;
 
     error_code = CtrlTransact(sdio, mpkt, port, &timer, &copied);
-    /* A short answer leaves no stale bytes behind: the rest is zeroed, and
-       the caller is told it did not get what it asked for. */
+    /* No stale bytes behind a shorter answer: the rest is zeroed */
     if (error_code == 0 && copied < (ULONG)getSize)
     {
         UBYTE *out = getBuffer;
         ULONG i;
         for (i = copied; i < (ULONG)getSize; i++)
             out[i] = 0;
-        error_code = PACKET_CTRL_SHORT;
+        if (copied < (ULONG)minSize)
+            error_code = PACKET_CTRL_SHORT;
     }
     D(bug("[WiFi] PacketGetVar ended with %08lx\n", error_code));
 
     return error_code;
+}
+
+int PacketGetVar(struct SDIO *sdio, char *varName, void *getBuffer, int getSize)
+{
+    return PacketGetVarMin(sdio, varName, getBuffer, getSize, 0);
 }
 
 #define MAX_CHUNK_LEN			1400
