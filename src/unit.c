@@ -1,4 +1,5 @@
 #include <clib/alib_protos.h>
+#include <stddef.h>
 #include <exec/resident.h>
 #include <exec/nodes.h>
 #include <exec/devices.h>
@@ -1409,6 +1410,11 @@ static int Do_S2_GETNETWORKS(struct IOSana2Req *io)
 static ULONG le32at(const UBYTE *p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((ULONG)p[3] << 24); }
 static UWORD le16at(const UBYTE *p) { return p[0] | (p[1] << 8); }
 
+/* The records are the ULONG run from s_StatWakes; the firmware block starts
+   after the driver's own 64 (the gate in Do_S2_GETSPECIALSTATS). */
+_Static_assert((offsetof(struct SDIO, s_StatFwRoute) - offsetof(struct SDIO, s_StatWakes)) / sizeof(ULONG) == 64,
+               "the driver's own counters are 64 records");
+
 static void FwCountersSnapshot(struct WiFiUnit *unit)
 {
     struct WiFiBase *WiFiBase = unit->wu_Base;
@@ -1539,7 +1545,7 @@ static int Do_S2_GETSPECIALSTATS(struct IOSana2Req *io)
     };
     const ULONG *counters = &sdio->s_StatWakes;
     ULONG n = sizeof(names) / sizeof(names[0]);
-    ULONG firstFw = &sdio->s_StatFwRoute - &sdio->s_StatWakes;
+    const ULONG firstFw = (offsetof(struct SDIO, s_StatFwRoute) - offsetof(struct SDIO, s_StatWakes)) / sizeof(ULONG);
     ULONG i;
 
     /* Only a caller asking past the driver's own counters gets a firmware
