@@ -2250,14 +2250,16 @@ void PacketDump(struct SDIO *sdio, APTR data, char *src)
     if (dataLength % 16 != 0) bug("\n");
 }
 
-static int int_strlen(const char *c)
+/* Bytes of the BCDC payload a control frame may carry after its 16-byte
+   header, and the size of a name with its NUL if the whole of it fits in
+   that, else -1: the scan stops at the limit (#89). */
+#define CTRL_PAYLOAD_MAX (PACKET_CTRL_MAX_MSG - sizeof(struct PacketCmd))
+static int ctrl_namesize(const char *c)
 {
-    int len = 0;
-    if (!c) return 0;
-
-    while(*c++) len++;
-
-    return len;
+    ULONG len = 0;
+    if (!c) return 1;
+    while (len < CTRL_PAYLOAD_MAX && c[len]) len++;
+    return len < CTRL_PAYLOAD_MAX ? (int)len + 1 : -1;
 }
 
 /*
@@ -2634,13 +2636,18 @@ int PacketSetVar(struct SDIO *sdio, char *varName, const void *setBuffer, int se
     struct MsgPort *port;
     struct CtrlTimer timer;
     struct PacketMessage *mpkt;
-    ULONG totalLen = sizeof(struct Packet) + sizeof(struct PacketCmd) + sizeof(struct PacketMessage) + setSize;
     ULONG error_code = 0;
+    int varSize = ctrl_namesize(varName);
+
+    /* A SET goes out whole or not at all: Linux caps what it sends at
+       PACKET_CTRL_MAX_MSG, which for a SET would cut the data (#89). */
+    if (varSize < 0 || setSize < 0 || (ULONG)setSize > CTRL_PAYLOAD_MAX - (ULONG)varSize)
+        return PACKET_CTRL_TOOBIG;
+
+    ULONG totalLen = sizeof(struct Packet) + sizeof(struct PacketCmd) + sizeof(struct PacketMessage) + setSize;
 
     if (glom)
         totalLen += 8;
-
-    int varSize = int_strlen(varName) + 1;
 
     totalLen += varSize;
 
@@ -2700,12 +2707,19 @@ void PacketSetVarAsync(struct SDIO *sdio, char *varName, const void *setBuffer, 
     BOOL glom = sdio->s_GlomEnabled;
     struct ExecBase *SysBase = sdio->s_SysBase;
     UBYTE *pkt;
+    int varSize = ctrl_namesize(varName);
+
+    /* whole or not at all, as PacketSetVar (#89) */
+    if (varSize < 0 || setSize < 0 || (ULONG)setSize > CTRL_PAYLOAD_MAX - (ULONG)varSize)
+    {
+        D(bug("[WiFi] PacketSetVarAsync: does not fit a control frame\n"));
+        return;
+    }
+
     ULONG totalLen = sizeof(struct Packet) + sizeof(struct PacketCmd) + setSize;
 
     if (glom)
         totalLen += 8;
-
-    int varSize = int_strlen(varName) + 1;
 
     totalLen += varSize;
 
@@ -2990,12 +3004,19 @@ int PacketGetVarMin(struct SDIO *sdio, char *varName, void *getBuffer, int getSi
     if (glom)
         totalLen += 8;
 
-    int varSize = int_strlen(varName) + 1;
+    int varSize = ctrl_namesize(varName);
 
-    if (varSize > getSize)
-        totalLen += varSize;
-    else
-        totalLen += getSize;
+    if (varSize < 0 || getSize < 0)
+        return PACKET_CTRL_TOOBIG;
+
+    /* The command advertises the whole output size (c_Length = max), but
+       only the first CTRL_PAYLOAD_MAX bytes go out, as Linux bcdc does: a
+       'counters' GET of 2048 sends 1518 BCDC bytes, not 2064 (#89).  The
+       name always fits; the rest sent is the zeroed buffer. */
+    ULONG max = varSize > getSize ? (ULONG)varSize : (ULONG)getSize;
+    ULONG txData = max > CTRL_PAYLOAD_MAX ? CTRL_PAYLOAD_MAX : max;
+
+    totalLen += txData;
 
     mpkt = CtrlBegin(sdio, &timer, &port, totalLen);
     if (mpkt == NULL)
@@ -3012,10 +3033,7 @@ int PacketGetVarMin(struct SDIO *sdio, char *varName, void *getBuffer, int getSi
 
     mpkt->pm_PacketData = c;
 
-    UWORD max = varSize;
-    if (getSize > max) max = getSize;
-
-    UWORD totLen = sizeof(struct Packet) + sizeof(struct PacketCmd) + max;
+    UWORD totLen = sizeof(struct Packet) + sizeof(struct PacketCmd) + txData;
     
     if (glom)
     {
