@@ -213,7 +213,8 @@ struct PacketMessage {
     ULONG           pm_AllocSize;   // the whole block, for whoever frees it
     ULONG           pm_Copied;      // bytes of the reply copied to pm_RecvBuffer
     UBYTE           pm_Abandoned;   // the caller gave up: the receiver frees the block (#93)
-    UBYTE           pm_Pad[3];
+    UBYTE           pm_SeqOff;      // c_Seq's offset in the packet: 4, or 12 when built glommed (#96)
+    UBYTE           pm_Pad[2];
     struct Packet   pm_PacketHeader[];
 };
 
@@ -2477,12 +2478,19 @@ void PacketCtrlQueue(struct SDIO *sdio, struct Message *msg)
         AddTail((struct List *)sdio->s_CtrlWaitList, &m->pm_Message.mn_Node);
     Permit();
 
-    /* Sent even if its caller gave up: its TX sequence number is already
-       spent, and a gap would leave the firmware waiting for it.  Only its
-       reply is not waited for -- nothing on the list will match it. */
-    sdio->SendPKT((APTR)&m->pm_PacketHeader[0], LE16(m->pm_PacketHeader[0].p_Length), sdio);
+    /* Given up on before it was sent: it has no sequence number yet, so it
+       is simply dropped (#96). */
     if (abandoned)
+    {
         FreeMem(m, m->pm_AllocSize);
+        return;
+    }
+
+    /* Numbered here, as it goes out, by the only task that numbers frames:
+       data gloms and the scan requests are numbered by this task at send
+       too, so the numbers leave in order (brcmf_sdio_tx_ctrlframe). */
+    ((UBYTE *)&m->pm_PacketHeader[0])[m->pm_SeqOff] = sdio->s_TXSeq++;
+    sdio->SendPKT((APTR)&m->pm_PacketHeader[0], LE16(m->pm_PacketHeader[0].p_Length), sdio);
 }
 
 /* A control reply from the firmware.  Abandoned requests met on the way are
@@ -2635,7 +2643,8 @@ int PacketSetVar(struct SDIO *sdio, char *varName, const void *setBuffer, int se
     sw->c_DataOffset = sizeof(struct Packet);
     if (sdio->s_GlomEnabled) sw->c_DataOffset += sizeof(struct GlomHeader);
     sw->c_FlowControl = 0;
-    sw->c_Seq = sdio->s_TXSeq++;
+    /* the receiver numbers it when it sends it (#96) */
+    mpkt->pm_SeqOff = sdio->s_GlomEnabled ? 12 : 4;
 
     c->c_Command = LE32(BRCMF_C_SET_VAR); 
     c->c_Length = LE32(varSize + setSize);
@@ -2763,7 +2772,8 @@ int PacketCmdInt(struct SDIO *sdio, ULONG cmd, ULONG cmdValue)
     sw->c_DataOffset = sizeof(struct Packet);
     if (sdio->s_GlomEnabled) sw->c_DataOffset += sizeof(struct GlomHeader);
     sw->c_FlowControl = 0;
-    sw->c_Seq = sdio->s_TXSeq++;
+    /* the receiver numbers it when it sends it (#96) */
+    mpkt->pm_SeqOff = sdio->s_GlomEnabled ? 12 : 4;
 
     c->c_Command = LE32(cmd);
     c->c_Length = LE32(4);
@@ -2885,7 +2895,8 @@ int PacketCmdIntGet(struct SDIO *sdio, ULONG cmd, ULONG *cmdValue)
         sw->c_DataOffset = sizeof(struct Packet);
         if (sdio->s_GlomEnabled) sw->c_DataOffset += sizeof(struct GlomHeader);
         sw->c_FlowControl = 0;
-        sw->c_Seq = sdio->s_TXSeq++;
+        /* the receiver numbers it when it sends it (#96) */
+        mpkt->pm_SeqOff = sdio->s_GlomEnabled ? 12 : 4;
 
         c->c_Command = LE32(cmd);
         c->c_Length = LE32(4);
@@ -2968,7 +2979,8 @@ int PacketGetVarMin(struct SDIO *sdio, char *varName, void *getBuffer, int getSi
     sw->c_DataOffset = sizeof(struct Packet);
     if (sdio->s_GlomEnabled) sw->c_DataOffset += sizeof(struct GlomHeader);
     sw->c_FlowControl = 0;
-    sw->c_Seq = sdio->s_TXSeq++;
+    /* the receiver numbers it when it sends it (#96) */
+    mpkt->pm_SeqOff = sdio->s_GlomEnabled ? 12 : 4;
 
     c->c_Command = LE32(262);
     c->c_Length = LE32(max);
