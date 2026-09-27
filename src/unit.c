@@ -1497,8 +1497,8 @@ static int Do_S2_GETNETWORKS(struct IOSana2Req *io)
 /*
  * The firmware's own wl_cnt counters, read when a caller asks for more
  * records than the driver's own counters -- a dedicated reader, run before
- * and after a measurement, never inside it (#89).  The 'counters'
- * iovar first (what bcmdhd and WHD read), else WLC_GET_D11CNTS (ioctl 89).
+ * and after a measurement, never inside it (#89).  Only the 'counters'
+ * iovar (what bcmdhd and WHD read); no WLC_GET_D11CNTS fallback.
  * Version and length are reported as read.  Fields are decoded only where
  * the layout is known: version 30 and up is XTLV, and the WLC block (id
  * 0x100) is taken at WHD's wl_cnt_wlc_t offsets; versions 6-11 are the
