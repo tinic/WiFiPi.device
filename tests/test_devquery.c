@@ -20,6 +20,8 @@
  *   h  a second legacy query after an answered one: refused
  *   i  a rejected first legacy query, then a corrected one: refused
  *   j  the queued (unit-task) path: first query answered, second refused
+ *   k  wu_FreshOpenReqs: +1 per Open, -1 at the first command, -1 at Close
+ *      only if unused; two openers closed in both orders
  *
  * Every buffer and every request sits between 16-byte canaries; the stale
  * io_Data is made to point at a guarded decoy, so a write through it is seen.
@@ -193,7 +195,7 @@ static void getstation(struct IOSana2Req *io)
 
 int main(void)
 {
-    static Req r, r2, rc;
+    static Req r, r2, rc, r3;
     static Buf buf, buf2, decoy;
     static struct timerequest tr;
     struct IOSana2Req *io, *clone;
@@ -395,6 +397,57 @@ int main(void)
     expect(buf_untouched(&buf2), "j buffer untouched");
     InitSemaphore(&funit.wu_Lock);
     WiFi_Close(io);
+
+    PutStr("k fresh open-request accounting\n");
+    {
+        UWORD n0 = funit.wu_FreshOpenReqs;
+        struct IOSana2Req *io2;
+
+        /* every earlier case closed what it opened: an underflow shows here */
+        expect_eq(n0, 0, "k0 no fresh open requests before k");
+
+        io = open_full(&r, NULL);
+        expect_eq(funit.wu_FreshOpenReqs, n0 + 1, "k1 Open: +1");
+        WiFi_Close(io);
+        expect_eq(funit.wu_FreshOpenReqs, n0, "k1 Close unused: back");
+
+        io = open_full(&r, NULL);
+        buf_init(&buf);
+        query(io, &buf.info);
+        expect_eq(((struct IOStdReq *)io)->io_Error, 0, "k2 WM query answered");
+        expect_eq(funit.wu_FreshOpenReqs, n0, "k2 first command (query): -1");
+        getstation(io);
+        expect_eq(funit.wu_FreshOpenReqs, n0, "k2 second command: no change");
+        WiFi_Close(io);
+        expect_eq(funit.wu_FreshOpenReqs, n0, "k2 Close used (query): no change");
+
+        io = open_full(&r, NULL);
+        getstation(io);
+        expect_eq(funit.wu_FreshOpenReqs, n0, "k2 first command (S2_GETSTATIONADDRESS): -1");
+        WiFi_Close(io);
+        expect_eq(funit.wu_FreshOpenReqs, n0, "k2 Close used (getstation): no change");
+
+        /* two openers, one used; closed used first, then unused first */
+        io = open_full(&r, NULL);
+        io2 = open_full(&r3, NULL);
+        expect_eq(funit.wu_FreshOpenReqs, n0 + 2, "k3 two Opens: +2");
+        getstation(io);
+        expect_eq(funit.wu_FreshOpenReqs, n0 + 1, "k3 one used: +1");
+        WiFi_Close(io);
+        expect_eq(funit.wu_FreshOpenReqs, n0 + 1, "k3 Close used first: +1");
+        WiFi_Close(io2);
+        expect_eq(funit.wu_FreshOpenReqs, n0, "k3 then Close unused: back");
+
+        io = open_full(&r, NULL);
+        io2 = open_full(&r3, NULL);
+        getstation(io);
+        expect_eq(funit.wu_FreshOpenReqs, n0 + 1, "k3' one used: +1");
+        WiFi_Close(io2);
+        expect_eq(funit.wu_FreshOpenReqs, n0, "k3' Close unused first: back");
+        WiFi_Close(io);
+        expect_eq(funit.wu_FreshOpenReqs, n0, "k3' then Close used: no change");
+        expect(req_guards(&r, FULL) && req_guards(&r3, FULL), "k request guards intact");
+    }
 
     PutStr("f short IOStdReq\n");
     io = req_init(&r2, SHORT);
