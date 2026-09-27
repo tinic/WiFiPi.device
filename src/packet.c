@@ -2306,6 +2306,9 @@ static UWORD NextCmdID(struct SDIO *sdio)
     return id;
 }
 
+_Static_assert(sizeof(struct PacketMessage) % 4 == 0,
+               "the packet after the message header starts 4-aligned (#97)");
+
 struct CtrlTimer {
     struct MsgPort *        ct_Port;
     struct timerequest *    ct_Req;
@@ -2367,6 +2370,11 @@ static struct PacketMessage *CtrlBegin(struct SDIO *sdio, struct CtrlTimer *t, s
         CtrlTimerClose(sdio, t);
         return NULL;
     }
+    /* sdio_sendpkt() sends the packet rounded up to 4 bytes: the block covers
+       that, zeroed, so the padding comes from our own memory (#97).  The
+       message header is a multiple of 4, so rounding the whole rounds the
+       packet part. */
+    totalLen = (totalLen + 3) & ~3;
     mpkt = AllocMem(totalLen, MEMF_PUBLIC | MEMF_CLEAR);
     if (mpkt == NULL)
     {
@@ -2697,7 +2705,9 @@ void PacketSetVarAsync(struct SDIO *sdio, char *varName, const void *setBuffer, 
 
     totalLen += varSize;
 
-    pkt = AllocPooledClear(WiFiBase->w_MemPool, totalLen);
+    /* the frame is sent rounded up to 4 bytes: allocate (zeroed) that far (#97) */
+    ULONG allocLen = (totalLen + 3) & ~3;
+    pkt = AllocPooledClear(WiFiBase->w_MemPool, allocLen);
 
     struct PacketHeaderHW *hw = (APTR)&pkt[0];
     struct GlomHeader *gl = (APTR)&pkt[4];
@@ -2734,7 +2744,7 @@ void PacketSetVarAsync(struct SDIO *sdio, char *varName, const void *setBuffer, 
     // Async - fire the packet and forget
     sdio->SendPKT(pkt, totalLen, sdio);
 
-    FreePooled(WiFiBase->w_MemPool, pkt, totalLen);
+    FreePooled(WiFiBase->w_MemPool, pkt, allocLen);
 }
 
 int PacketSetVarInt(struct SDIO *sdio, char *varName, ULONG varValue)
@@ -2827,7 +2837,9 @@ void PacketCmdIntAsync(struct SDIO *sdio, ULONG cmd, ULONG cmdValue)
     if (glom)
         totalLen += 8;
 
-    pkt = AllocPooledClear(WiFiBase->w_MemPool, totalLen);
+    /* the frame is sent rounded up to 4 bytes: allocate (zeroed) that far (#97) */
+    ULONG allocLen = (totalLen + 3) & ~3;
+    pkt = AllocPooledClear(WiFiBase->w_MemPool, allocLen);
     
     struct PacketHeaderHW *hw = (APTR)&pkt[0];
     struct GlomHeader *gl = (APTR)&pkt[4];
@@ -2864,7 +2876,7 @@ void PacketCmdIntAsync(struct SDIO *sdio, ULONG cmd, ULONG cmdValue)
     // Fire packet and forget it
     sdio->SendPKT(pkt, totalLen, sdio);
 
-    FreePooled(WiFiBase->w_MemPool, pkt, totalLen);
+    FreePooled(WiFiBase->w_MemPool, pkt, allocLen);
 }
 
 int PacketCmdIntGet(struct SDIO *sdio, ULONG cmd, ULONG *cmdValue)

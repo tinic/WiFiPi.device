@@ -116,6 +116,7 @@ static volatile ULONG sentCmd[64];
 static volatile int holdPort, modeCount, upSeen;
 static volatile int seqCheck, seqHave, seqBad, seqFrames;
 static volatile UBYTE seqLast, seqSeen[16], rawAt4, rawAt12;
+static volatile int padCheck, padFrames, padBad, allocPad, padMods, asyncLen;
 static volatile int sendBlockIntact;
 #define CMD_SWEEP       1
 #define CMD_LATE        2
@@ -124,6 +125,7 @@ static volatile int sendBlockIntact;
 #define CMD_PICK        5       /* take what waits on the port now */
 #define CMD_REVERSE     6       /* answer the two held requests, newest first */
 #define CMD_ASYNC       7       /* the scan path: a fire-and-forget control from the receiver */
+#define CMD_ASYNCVAR    8       /* the scan path's SetVar, with an asyncLen-byte payload */
 static volatile int helperCmd;
 
 static void fake_sendpkt(UBYTE *pkt, ULONG length, struct SDIO *sdio)
@@ -138,6 +140,20 @@ static void fake_sendpkt(UBYTE *pkt, ULONG length, struct SDIO *sdio)
     (void)length; (void)sdio;
     rawAt4 = pkt[4];
     rawAt12 = pkt[12];
+    if (padCheck)
+    {
+        /* the send reads up to 3 bytes past the frame: they are the block's
+           own, zeroed, and for a synchronous request the block (pm_AllocSize,
+           12 bytes before pm_PacketHeader) covers them (#97) */
+        ULONG len = pkt[0] | (pkt[1] << 8), padded = (len + 3) & ~3, i;
+        padFrames++;
+        padMods |= 1 << (len & 3);
+        for (i = len; i < padded; i++)
+            if (pkt[i] != 0)
+                padBad++;
+        if (padCheck == 1 && *(ULONG *)(pkt - 12) < 44 + padded)
+            allocPad++;
+    }
     lastCmd = *(ULONG *)(c + 0);                    /* raw LE, compared raw */
     lastID = *(UWORD *)(c + 10);
     lastVal = *(ULONG *)(c + 16);
@@ -211,6 +227,7 @@ static void helper(void)
             else if (c == CMD_LATE) reply(sdio, 0, 0, 4, 12 + 16 + 4);
             else if (c == CMD_SHUTDOWN) PacketCtrlShutdown(sdio, port);
             else if (c == CMD_ASYNC) PacketCmdIntAsync(sdio, 300, 0);
+            else if (c == CMD_ASYNCVAR) { static UBYTE pl[8]; PacketSetVarAsync(sdio, "a", pl, asyncLen); }
             else if (c == CMD_REVERSE)
             {
                 int n = sends;
@@ -579,6 +596,29 @@ int main(void)
         expect(err == 0 && fsdio.s_TXSeq == 21, "a control frame took 20");
         expect_eq(PacketTxCredit(&fsdio), 0, "closed window plus control: still no data credit");
         fsdio.s_MaxTXSeq = 0; fsdio.s_TXSeq = 0;
+    }
+
+    PutStr("step 10i sent lengths rounded up to 4 stay inside zeroed storage (#97)\n");
+    {
+        /* name "a" is 2 bytes: a set of n bytes is a 12+16+2+n packet */
+        static const int n[3] = { 3, 0, 1 };      /* 33, 30, 31: mod 4 = 1, 2, 3 */
+        static UBYTE pl[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+        mode = M_ECHO;
+        padFrames = padBad = allocPad = padMods = 0;
+        for (k = 0; k < 3; k++)
+        {
+            padCheck = 1;                   /* synchronous: block size checked too */
+            err = PacketSetVar(&fsdio, "a", pl, n[k]);
+            padCheck = 2;                   /* scan path: padding checked */
+            asyncLen = n[k];
+            helper_cmd(CMD_ASYNCVAR);
+            padCheck = 0;
+            expect_eq(err, 0, "set answered");
+        }
+        expect_eq(padFrames, 6, "three synchronous and three scan-path frames");
+        expect_eq(padMods, 0xe, "lengths 1, 2 and 3 past a multiple of 4");
+        expect_eq(padBad, 0, "padding bytes are zero");
+        expect_eq(allocPad, 0, "and inside the block allocated");
     }
 
     PutStr("step 11 GETSIGNALQUALITY timeout, then a read gets through\n");
