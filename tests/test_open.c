@@ -7,8 +7,9 @@
  * Covered: a lost and a short address reply fail the open with nothing
  * changed; a whole reply opens, and Close balances; a retry after a failure;
  * exclusive against shared on a running unit (no restart, nothing touched);
- * limited opens; an open started and then refused as busy; and a second open
- * arriving while the first waits inside StartUnit.
+ * limited opens; an open started and then refused as busy; a second open
+ * arriving while the first waits inside StartUnit; and a first open whose
+ * reply is lost or short while a second one starts the unit.
  */
 #include <exec/exec.h>
 #include <exec/io.h>
@@ -78,12 +79,12 @@ static struct IOSana2Req *frame(Frame *f, UWORD mn_length)
 /* ------------------------------------------------------------------ */
 /* The helper: the receiver's control half                            */
 
-enum { M_NOREPLY, M_SHORT4, M_WHOLE, M_DELAY };
+enum { M_NOREPLY, M_SHORT4, M_WHOLE, M_DELAY, M_FIRST_LOST, M_FIRST_SHORT };
 static struct MsgPort * volatile ctrlPort;
 static struct Task *mainTask;
 static struct Task * volatile helperTask;
-static volatile int mode, delayTicks, sends, helperCmd;
-static volatile UWORD lastID;
+static volatile int mode, delayTicks, sends, helperCmd, nth;
+static volatile UWORD lastID, firstID;
 static volatile ULONG lastCmd;
 #define CMD_SWEEP 1
 #define CMD_QUIT  2
@@ -139,6 +140,18 @@ static void helper(void)
                 case M_SHORT4: reply(sdio, 4); break;
                 case M_WHOLE:  reply(sdio, 6); break;
                 case M_DELAY:  Delay(delayTicks); reply(sdio, 6); break;
+                /* the first get is held; the second is answered whole, then
+                   the first is lost (its deadline passes) or answered short */
+                case M_FIRST_LOST:
+                    if (nth++ != 0) reply(sdio, 6);
+                    break;
+                case M_FIRST_SHORT:
+                    if (nth++ == 0) { firstID = lastID; break; }
+                    reply(sdio, 6);
+                    Delay(25);                  /* the second open finishes */
+                    lastID = firstID;
+                    reply(sdio, 4);
+                    break;
                 default: break;
             }
         }
@@ -375,6 +388,42 @@ int main(void)
     }
     else
         expect(0, "opener X started");
+
+    {
+        static const int m8[2] = { M_FIRST_LOST, M_FIRST_SHORT };
+        int i;
+        for (i = 0; i < 2; i++)
+        {
+            PutStr(i == 0 ? "step 8 first reply lost, a second open starts the unit meanwhile\n"
+                          : "step 8b first reply short, a second open starts the unit meanwhile\n");
+            reset_unit();
+            mode = m8[i]; nth = 0;
+            SetSignal(0, SIGBREAKF_CTRL_D);
+            if (CreateNewProcTags(NP_Entry, (ULONG)openerX, NP_Name, (ULONG)"opener-X", NP_Priority, 0, TAG_DONE) != NULL)
+            {
+                Delay(10);                      /* X waits on the held get */
+                io = frame(&f1, FULL);
+                WiFi_Open(io, 0, 0);            /* shared; answered whole */
+                expect_eq(io->ios2_Req.io_Error, 0, "8 the second open succeeds");
+                expect((funit.wu_Flags & IFF_STARTED) != 0, "8 it started the unit");
+                Wait(SIGBREAKF_CTRL_D);
+                expect_eq(errX, 0, "8 the first open goes on to a started unit");
+                expect(((struct IOSana2Req *)&fx)->ios2_Req.io_Unit == &funit.wu_Unit,
+                       "8 first open has its unit");
+                expect_eq(funit.wu_Unit.unit_OpenCnt, 2, "8 two unit openers");
+                expect_eq(fbase.w_Device.dd_Library.lib_OpenCnt, 2, "8 two device openers");
+                expect_eq(openers(), 2, "8 two openers on the list");
+                expect(memcmp(funit.wu_OrigEtherAddr, mac, 6) == 0, "8 permanent address from the whole reply");
+                WiFi_Close((struct IOSana2Req *)&fx);
+                WiFi_Close(io);
+                expect(funit.wu_Unit.unit_OpenCnt == 0 && openers() == 0 &&
+                       fbase.w_Device.dd_Library.lib_OpenCnt == 0, "8 balanced");
+            }
+            else
+                expect(0, "opener X started");
+            helper_cmd(CMD_SWEEP);
+        }
+    }
 
     helper_cmd(CMD_QUIT);
     PutStr(failures ? "RESULT FAIL " : "RESULT PASS "); num(checks); PutStr(" checks, "); num(failures); PutStr(" failures\n");
