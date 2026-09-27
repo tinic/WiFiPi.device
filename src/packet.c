@@ -821,6 +821,22 @@ ULONG ProcessPacket(struct SDIO *sdio, struct Packet *pkt)
 int SendGlomDataPacket(struct SDIO *sdio, struct IOSana2Req **ioList, UBYTE count);
 
 /*
+ * Frames per TX superframe (AmiNetXDuo #89).  With three or more subframes in
+ * one CMD53, the first of two same-flow pure TCP ACKs at the head of the
+ * superframe was accepted by the bus and never transmitted: 21/21 in a traced
+ * run, while identically framed 12-byte UDP pairs in the same run lost 0/153.
+ * At two, the same workload lost 0.40% of ACKs instead of 2.94%, with the same
+ * receive throughput.  Only the flush point changes: credit, sequence numbers
+ * and the subframe build are as before.  Overridable, 1..32, at compile time.
+ */
+#ifndef WIFIPI_TX_MAX_GLOM
+#define WIFIPI_TX_MAX_GLOM 2
+#endif
+#if WIFIPI_TX_MAX_GLOM < 1 || WIFIPI_TX_MAX_GLOM > 32
+#error WIFIPI_TX_MAX_GLOM must be 1..32 (ioList holds 32)
+#endif
+
+/*
  * THE POLLER.  On Emu68 every interrupt costs ~20 us of exception entry
  * and the WLAN host's line is not to be had anyway (it is the SD card's,
  * see sdio_int_attach); a timer tick sees a frame up to a millisecond late.
@@ -1162,7 +1178,7 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
 
                     // Glom full? Push out large frame
                     // But not yet, for now just send them all out, one after another
-                    if (ioCount == 32)
+                    if (ioCount == WIFIPI_TX_MAX_GLOM)
                     {
                         //D(bug("[WiFi] Glom frame would do, there are %ld entries in queue\n", ioCount));
                         /*
