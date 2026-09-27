@@ -6,10 +6,15 @@
  * S2_GETSPECIALSTATS reads the firmware's wl_cnt counters only for a caller
  * asking past the driver's own records (#89).  AmiNetXDuo's RX reader asks
  * for 24 records and NetDevStats for 64, repeatedly and on an online unit:
- * those must never queue a firmware command.  A firmware command here goes
- * to s_ReceiverPort and waits for a reply nobody sends, so a gate that let
- * one through hangs the run instead of passing it (331410c, ungated, never
- * reaches step 2).
+ * those must never queue a firmware command.  In steps 1-2 nobody answers
+ * s_ReceiverPort, so a gate that let one through would time out there.
+ *
+ * Steps 3-5 put a receiver behind the port (PacketCtrlQueue/Complete, as in
+ * test_ctrl): the full reader's 'counters' GET goes out capped at 1518 BCDC
+ * bytes; a v30 (XTLV, block 0x100) and a legacy v10 answer are decoded; no
+ * answer at all ends in PACKET_CTRL_TIMEOUT after the 2.5 s deadline with
+ * every firmware record unavailable, and the unit answers the stack's
+ * queries afterwards.
  */
 #include <exec/exec.h>
 #include <exec/io.h>
@@ -22,6 +27,8 @@
 #include <string.h>
 
 #include "../src/wifipi.h"
+#include "../src/packet.h"
+#include <dos/dostags.h>
 
 void  WiFi_Open(REGARG(struct IOSana2Req *io, "a1"), REGARG(LONG unitNumber, "d0"), REGARG(ULONG flags, "d1"));
 ULONG WiFi_Close(REGARG(struct IOSana2Req *io, "a1"));
@@ -86,6 +93,81 @@ static struct IOSana2Req *frame(Frame *f, UWORD mn_length)
     io->ios2_Req.io_Message.mn_Length = mn_length;
     io->ios2_Req.io_Device = (struct Device *)&fbase;
     return io;
+}
+
+/* ------------------------------------------------------------------ */
+/* A receiver behind s_ReceiverPort, answering 'counters'              */
+
+enum { R_V30, R_V10, R_NONE };
+static volatile int rmode, rquit, rsends;
+static volatile ULONG rHw;
+static struct MinList waitList;
+static struct Task *mainTask;
+static struct Task * volatile rtask;
+static struct MsgPort * volatile rport;
+static UBYTE sentHdr[32];
+static UBYTE reply[12 + 16 + 2048];
+
+static void fake_sendpkt(UBYTE *pkt, ULONG length, struct SDIO *sdio)
+{
+    ULONG i;
+    (void)length; (void)sdio;
+    rHw = pkt[0] | (pkt[1] << 8);
+    for (i = 0; i < sizeof(sentHdr); i++) sentHdr[i] = pkt[i];
+    rsends++;
+}
+
+static void put32(UBYTE *p, ULONG v) { p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24; }
+static void put16(UBYTE *p, UWORD v) { p[0] = v; p[1] = v >> 8; }
+
+static void answer(void)
+{
+    int glom = (sentHdr[7] != 12 && sentHdr[15] == 20);
+    UBYTE *sc = sentHdr + (glom ? 20 : 12), *c = reply + 12, *d = c + 16;
+    ULONG i, len = 2048;
+    for (i = 0; i < sizeof(reply); i++) reply[i] = 0;
+    reply[7] = 12;
+    for (i = 0; i < 12; i++) c[i] = sc[i];
+    put32(c + 4, len);
+    if (rmode == R_V30)
+    {
+        put16(d, 30); put16(d + 2, 8 + 228);
+        put16(d + 4, 0x55); put16(d + 6, 0);                /* an unrelated XTLV, empty */
+        put16(d + 8, 0x100); put16(d + 10, 228);            /* wl_cnt_wlc_t */
+        put32(d + 12 + 0, 111); put32(d + 12 + 8, 222); put32(d + 12 + 12, 333);
+        put32(d + 12 + 28, 444); put32(d + 12 + 200, 555); put32(d + 12 + 204, 666);
+        put32(d + 12 + 224, 777);
+    }
+    else
+    {
+        put16(d, 10); put16(d + 2, 200);
+        put32(d + 4, 1111); put32(d + 12, 2222); put32(d + 16, 3333); put32(d + 32, 4444);
+    }
+    PacketCtrlComplete(&fsdio, (struct Packet *)reply, 12 + 16 + len);
+}
+
+static void receiver(void)
+{
+    struct MsgPort *port = CreateMsgPort();
+    struct Message *m;
+    rport = port;
+    rtask = FindTask(NULL);
+    Signal(mainTask, SIGBREAKF_CTRL_E);
+    while (!rquit)
+    {
+        Wait((1UL << port->mp_SigBit) | SIGBREAKF_CTRL_F);
+        PacketCtrlSweep(&fsdio);
+        while ((m = GetMsg(port)) != NULL)
+        {
+            PacketCtrlQueue(&fsdio, m);
+            if (rmode != R_NONE) answer();
+        }
+    }
+    PacketCtrlShutdown(&fsdio, port);
+    DeleteMsgPort(port);
+    Forbid();
+    rtask = NULL;
+    Signal(mainTask, SIGBREAKF_CTRL_E);
 }
 
 static struct Sana2SpecialStatRecord *stats(struct IOSana2Req *io, ULONG max, ULONG *supplied)
@@ -172,6 +254,79 @@ int main(void)
     expect_eq(r[64].Count, 0, "offline: route 0, no firmware read");
     expect(named(&r[202], "fw raw +1fc"), "record 202 is the last raw word");
     expect((struct Message *)GetMsg(fsdio.s_ReceiverPort) == NULL, "still no firmware command queued");
+
+    /* the receiver takes the port over from here */
+    mainTask = FindTask(NULL);
+    waitList.mlh_Head = (struct MinNode *)&waitList.mlh_Tail;
+    waitList.mlh_Tail = NULL;
+    waitList.mlh_TailPred = (struct MinNode *)&waitList.mlh_Head;
+    fsdio.s_CtrlWaitList = &waitList;
+    fsdio.SendPKT = fake_sendpkt;
+    fsdio.s_MaxTXSeq = 0x40;
+    SetSignal(0, SIGBREAKF_CTRL_E);
+    if (CreateNewProcTags(NP_Entry, (ULONG)receiver, NP_Name, (ULONG)"stats-receiver", NP_Priority, 5, TAG_DONE) == NULL)
+    {
+        PutStr("RESULT FAIL no receiver\n");
+        return 20;
+    }
+    Wait(SIGBREAKF_CTRL_E);
+    fsdio.s_ReceiverPort = (struct MsgPort *)rport;
+    funit.wu_Flags |= IFF_ONLINE;
+
+    PutStr("step 3 full reader online, v30 answer\n");
+    rmode = R_V30; rsends = 0;
+    r = stats(io, 256, &supplied);
+    expect_eq(io->ios2_Req.io_Error, 0, "v30: query answered");
+    expect_eq(rsends, 1, "v30: one 'counters' GET sent");
+    expect_eq(rHw, 12 + 1518, "v30: GET capped at 1518 BCDC bytes");
+    expect_eq(r[64].Count, 1, "v30: route 1");
+    expect_eq(r[65].Count, 0, "v30: no error");
+    expect_eq(r[66].Count, 30, "v30: version");
+    expect_eq(r[68].Count, 111, "v30: txframe");
+    expect_eq(r[69].Count, 222, "v30: txretrans");
+    expect_eq(r[70].Count, 333, "v30: txerror");
+    expect_eq(r[71].Count, 444, "v30: txnobuf");
+    expect_eq(r[72].Count, 555, "v30: txfail");
+    expect_eq(r[73].Count, 666, "v30: txretry");
+    expect_eq(r[74].Count, 777, "v30: txnoack");
+
+    PutStr("step 4 legacy v10 answer\n");
+    rmode = R_V10;
+    r = stats(io, 256, &supplied);
+    expect_eq(r[66].Count, 10, "v10: version");
+    expect_eq(r[68].Count, 1111, "v10: txframe");
+    expect_eq(r[71].Count, 4444, "v10: txnobuf");
+    expect_eq(r[72].Count, (LONG)0xffffffff, "v10: txfail unavailable");
+
+    PutStr("step 5 no answer: bounded, then the unit still answers\n");
+    rmode = R_NONE;
+    {
+        struct DateStamp a, b;
+        LONG ticks;
+        DateStamp(&a);
+        r = stats(io, 256, &supplied);
+        DateStamp(&b);
+        ticks = (b.ds_Minute - a.ds_Minute) * 3000 + (b.ds_Tick - a.ds_Tick);
+        expect(ticks >= 115 && ticks <= 200, "no answer: returns after the 2.5 s deadline");
+        expect_eq(io->ios2_Req.io_Error, 0, "no answer: the query itself completes");
+        expect_eq(r[64].Count, 255, "no answer: route 255");
+        expect_eq(r[65].Count, (LONG)PACKET_CTRL_TIMEOUT, "no answer: error PACKET_CTRL_TIMEOUT");
+        for (k = 68; k <= 74; k++)
+            if (r[k].Count != (LONG)0xffffffff) break;
+        expect_eq(k, 75, "no answer: every firmware record unavailable");
+    }
+    Signal((struct Task *)rtask, SIGBREAKF_CTRL_F);     /* sweep the abandoned request */
+    rsends = 0;
+    r = stats(io, 24, &supplied);
+    expect_eq(io->ios2_Req.io_Error, 0, "after the timeout: a stack query answered");
+    expect_eq(supplied, 24, "after the timeout: 24 records");
+    r = stats(io, 64, &supplied);
+    expect_eq(supplied, 64, "after the timeout: NetDevStats' 64 records");
+    expect_eq(rsends, 0, "after the timeout: still no firmware command for them");
+
+    rquit = 1;
+    Signal((struct Task *)rtask, SIGBREAKF_CTRL_F);
+    Wait(SIGBREAKF_CTRL_E);
 
     WiFi_Close(io);
     expect_eq(fbase.w_Device.dd_Library.lib_OpenCnt, lib0, "Close balances the device count");

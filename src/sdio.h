@@ -358,7 +358,7 @@ struct SDIO {
     ULONG               s_StatOrphanEAPOL;  //   EAPOL
     ULONG               s_StatOrphanOther;  //   anything else, 802.3 included
     ULONG               s_StatOrphanMcast;  //   multicast/broadcast destination, any type
-    ULONG               s_StatFwRoute;      // firmware counters: 1 'counters' iovar, 2 ioctl 89, 0 not online, 255 both refused
+    ULONG               s_StatFwRoute;      // firmware counters: 1 'counters' iovar read, 0 not online, 255 refused or no reply
     ULONG               s_StatFwError;      //   the last refusal's firmware error
     ULONG               s_StatFwVersion;    //   wl_cnt version (u16 at offset 0)
     ULONG               s_StatFwLength;     //   wl_cnt length (u16 at offset 2)
