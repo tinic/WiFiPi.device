@@ -192,7 +192,7 @@ void WiFi_Open(REGARG(struct IOSana2Req * io, "a1"), REGARG(LONG unitNumber, "d0
             /* Message smaller than regular IORequest? Too bad, break now. */
             error = IOERR_OPENFAIL;
         }
-        else
+        else if (error == 0)
         {
             /* Small IOReqest, only NSCMD command will be allowed. Check sharing now */
             if (unit->wu_Unit.unit_OpenCnt != 0 && 
@@ -205,10 +205,22 @@ void WiFi_Open(REGARG(struct IOSana2Req * io, "a1"), REGARG(LONG unitNumber, "d0
                 WiFiBase->w_Device.dd_Library.lib_Flags &= ~LIBF_DELEXP;
                 WiFiBase->w_Device.dd_Library.lib_OpenCnt++;
                 unit->wu_Unit.unit_OpenCnt++;
+                /* BeginIO and Close both start from io_Unit.  Left as the
+                   caller had it -- NULL from CreateIORequest -- the query
+                   locked a semaphore at address 0 and Close decremented an
+                   open count there: two writes into low memory. */
+                io->ios2_Req.io_Unit = &unit->wu_Unit;
                 io->ios2_Req.io_Error = 0;
                 return;
             }
         }
+
+        /* A short request that failed.  Nothing past its IOStdReq head is its
+           own: the shared exit below reads and clears ios2_BufferManagement,
+           offset 84, which here is somebody else's memory. */
+        io->ios2_Req.io_Unit = NULL;
+        io->ios2_Req.io_Error = error;
+        return;
     }
 
     io->ios2_Req.io_Unit = NULL;
@@ -326,13 +338,17 @@ ULONG WiFi_Close(REGARG(struct IOSana2Req * io, "a1"))
     struct WiFiBase *WiFiBase = (struct WiFiBase *)io->ios2_Req.io_Device;
     struct ExecBase *SysBase = WiFiBase->w_SysBase;
     struct WiFiUnit *u = (struct WiFiUnit *)io->ios2_Req.io_Unit;
-    struct Opener *opener = io->ios2_BufferManagement;
+    struct Opener *opener;
 
     D(bug("[WiFi] WiFi_Close(%08lx)\n", (ULONG)io));
 
-    /* DO most of things **only** if request is larger than IORequest */
+    /* DO most of things **only** if request is larger than IORequest.  The
+       opener cookie is read only there: in a short request offset 84 is past
+       the end. */
     if (io->ios2_Req.io_Message.mn_Length >= sizeof(struct IOSana2Req))
     {
+        opener = io->ios2_BufferManagement;
+
         /* Stop unit? */
 
         // ...
@@ -347,7 +363,8 @@ ULONG WiFi_Close(REGARG(struct IOSana2Req * io, "a1"))
         }
     }
 
-    u->wu_Unit.unit_OpenCnt--;
+    if (u != NULL)
+        u->wu_Unit.unit_OpenCnt--;
     WiFiBase->w_Device.dd_Library.lib_OpenCnt--;
 
     if (WiFiBase->w_Device.dd_Library.lib_OpenCnt == 0)
@@ -366,6 +383,16 @@ void WiFi_BeginIO(REGARG(struct IOSana2Req * io, "a1"))
     struct WiFiBase *WiFiBase = (struct WiFiBase *)io->ios2_Req.io_Device;
     struct ExecBase *SysBase = WiFiBase->w_SysBase;
     struct WiFiUnit *unit = (struct WiFiUnit *)io->ios2_Req.io_Unit;
+
+    /* A request with no unit was never opened here.  Answered, not locked:
+       &unit->wu_Lock would be a small address in low memory. */
+    if (unit == NULL || unit == (struct WiFiUnit *)-1)
+    {
+        io->ios2_Req.io_Error = IOERR_OPENFAIL;
+        if (!(io->ios2_Req.io_Flags & IOF_QUICK))
+            ReplyMsg((struct Message *)io);
+        return;
+    }
 
     // Try to do the request directly by obtaining the lock, otherwise put in unit's CMD queue
     if (AttemptSemaphore(&unit->wu_Lock))
