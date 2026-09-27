@@ -1866,6 +1866,7 @@ int SendGlomDataPacket(struct SDIO *sdio, struct IOSana2Req **ioList, UBYTE coun
 
     struct PacketHeaderHW *pktBase = sdio->s_TXBuffer;
     UBYTE *byteBuffer = sdio->s_TXBuffer;
+    struct GlomHeader *lastGh = NULL;
 
     for (UBYTE i = 0; i < count; i++)
     {
@@ -1893,6 +1894,7 @@ int SendGlomDataPacket(struct SDIO *sdio, struct IOSana2Req **ioList, UBYTE coun
         if (i == count - 1) gh->gh_LastItem = 1;
         else gh->gh_LastItem = 0;
         gh->gh_TailPad = LE16((-packetLength) & 3);
+        lastGh = gh;
 
         /* Following glom header there is PacketSW header */
         hdr->c_ChannelFlag = SDPCM_DATA_CHANNEL;
@@ -1956,6 +1958,20 @@ int SendGlomDataPacket(struct SDIO *sdio, struct IOSana2Req **ioList, UBYTE coun
 #endif
         // Increase total length by packet length (aligned)
         totalLength += (packetLength + 3) & ~3;
+    }
+
+    /* A chain of more than one frame goes out as whole F2 blocks: the last
+       frame's tail pad takes the chain up to the next 512 bytes, and the
+       first frame's length covers it, as brcmf_sdio_txpkt_prep_sg does.
+       One frame is sent as it is (#89). */
+    if (count > 1)
+    {
+        ULONG chainPad = (512 - (totalLength % 512)) % 512;
+
+        for (ULONG i = 0; i < chainPad; i++)
+            byteBuffer[totalLength + i] = 0;
+        lastGh->gh_TailPad = LE16(LE16(lastGh->gh_TailPad) + chainPad);
+        totalLength += chainPad;
     }
 
     pktBase->ph_Length = LE16(totalLength);
