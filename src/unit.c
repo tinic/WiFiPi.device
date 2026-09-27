@@ -221,10 +221,14 @@ void StartUnit(struct WiFiUnit *unit)
     }
 #endif
 
-    /* FOLLOW-UP (#93): a lost or short answer here still leaves the unit
-       STARTED with a zeroed permanent address; failing StartUnit is a wider
-       change than #93. */
-    PacketGetVarMin(WiFiBase->w_SDIO, "cur_etheraddr", unit->wu_OrigEtherAddr, 6, 6);
+    /* The permanent address is taken only whole, and a unit whose firmware
+       did not give it is not marked started: the next open tries again (#93). */
+    {
+        UBYTE addr[6];
+        if (PacketGetVarMin(WiFiBase->w_SDIO, "cur_etheraddr", addr, 6, 6) != 0)
+            return;
+        CopyMem(addr, unit->wu_OrigEtherAddr, 6);
+    }
 
     D(bug("[WiFi.0] Ethernet addr: %02lx:%02lx:%02lx:%02lx:%02lx:%02lx\n",
         unit->wu_OrigEtherAddr[0], unit->wu_OrigEtherAddr[1], unit->wu_OrigEtherAddr[2],
@@ -606,7 +610,13 @@ static int Do_S2_SETKEY(struct IOSana2Req *io)
         }
         if (sizeof(key) & 15) D(bug("\n"));
 
-        PacketSetVar(WiFiBase->w_SDIO, "wsec_key", &key, sizeof(key));
+        if (CtrlLost(PacketSetVar(WiFiBase->w_SDIO, "wsec_key", &key, sizeof(key))))
+        {
+            /* the key never reached the firmware: fail before touching wsec */
+            io->ios2_Req.io_Error = S2ERR_OUTOFSERVICE;
+            io->ios2_WireError = S2WERR_GENERIC_ERROR;
+            return 1;
+        }
         D(bug("[WiFi.0] Key set\n"));
         /* The other security bits come from the firmware's current wsec: a
            word that did not arrive whole is not OR-ed into them (#93). */

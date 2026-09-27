@@ -113,7 +113,7 @@ static volatile UWORD lastID;            /* raw, as on the wire */
 static volatile ULONG lastCmd, lastVal;
 static volatile UWORD sentID[64];
 static volatile ULONG sentCmd[64];
-static volatile int holdPort, modeCount;
+static volatile int holdPort, modeCount, upSeen;
 static volatile int sendBlockIntact;
 #define CMD_SWEEP       1
 #define CMD_LATE        2
@@ -125,10 +125,15 @@ static volatile int helperCmd;
 
 static void fake_sendpkt(UBYTE *pkt, ULONG length, struct SDIO *sdio)
 {
-    (void)length; (void)sdio;
-    lastCmd = *(ULONG *)(pkt + 12);                 /* raw LE, compared raw */
-    lastID = *(UWORD *)(pkt + 12 + 10);
-    lastVal = *(ULONG *)(pkt + 12 + 16);
+    /* the BCDC header follows the SDPCM header, and the glom header when
+       glomming is on -- bring-up switches it on halfway through */
+    UBYTE *c = pkt + 12 + (sdio->s_GlomEnabled ? 8 : 0);
+    (void)length;
+    lastCmd = *(ULONG *)(c + 0);                    /* raw LE, compared raw */
+    lastID = *(UWORD *)(c + 10);
+    lastVal = *(ULONG *)(c + 16);
+    if (lastCmd == LE32(2) && lastVal == LE32(1))
+        upSeen = 1;
     sentID[sends & 63] = lastID;
     sentCmd[sends & 63] = lastCmd;
     sends++;
@@ -551,16 +556,44 @@ int main(void)
         helper_cmd(CMD_SWEEP);
 
         PutStr("step 13c CONFIGINTERFACE: only the final UP goes unanswered\n");
-        mode = M_UPDEAD;
+        mode = M_UPDEAD; upSeen = 0;
         cio->ios2_Req.io_Command = S2_CONFIGINTERFACE;
         cio->ios2_Req.io_Flags = IOF_QUICK;
         WiFi_BeginIO(cio);
+        expect(upSeen, "bring-up got as far as the final UP");
         expect_eq(cio->ios2_Req.io_Error, S2ERR_OUTOFSERVICE, "a lost final UP fails CONFIGINTERFACE");
         expect((funit.wu_Flags & (IFF_CONFIGURED | IFF_UP | IFF_ONLINE)) == 0, "not reported up or online");
         helper_cmd(CMD_SWEEP);
 
         funit.wu_Flags |= IFF_UP | IFF_ONLINE | IFF_CONFIGURED;
         WiFi_Close(cio);
+    }
+
+    PutStr("step 13d StartUnit: the address is taken whole or not at all\n");
+    {
+        static Frame g;
+        struct IOSana2Req *sio;
+        for (i = 0; i < 6; i++) funit.wu_OrigEtherAddr[i] = 0xa5;
+        funit.wu_Flags &= ~IFF_STARTED;
+        mode = M_NOREPLY;
+        sio = frame(&g, FULL);
+        WiFi_Open(sio, 0, 0);
+        expect((funit.wu_Flags & IFF_STARTED) == 0, "lost address: unit not marked started");
+        ok = 1; for (i = 0; i < 6; i++) if (funit.wu_OrigEtherAddr[i] != 0xa5) ok = 0;
+        expect(ok, "and the permanent address not overwritten");
+        WiFi_Close(sio);
+        helper_cmd(CMD_SWEEP);
+        mode = M_SHORTN; shortN = 4;
+        sio = frame(&g, FULL);
+        WiFi_Open(sio, 0, 0);
+        expect((funit.wu_Flags & IFF_STARTED) == 0, "4 of 6 address bytes: not started either");
+        WiFi_Close(sio);
+        mode = M_UPDEAD;                    /* 8-byte answers: the whole address */
+        sio = frame(&g, FULL);
+        WiFi_Open(sio, 0, 0);
+        expect((funit.wu_Flags & IFF_STARTED) != 0, "whole address: started on the next open");
+        expect(funit.wu_OrigEtherAddr[0] == 0x44 && funit.wu_OrigEtherAddr[5] == 0x66, "with the firmware's address");
+        WiFi_Close(sio);
     }
 
     PutStr("step 12 receiver shutdown with a caller waiting\n");
