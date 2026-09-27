@@ -1505,7 +1505,12 @@ static int Do_S2_GETSPECIALSTATS(struct IOSana2Req *io)
         "receiver wake-ups", "wake-ups with no frame", "frames received", "wake-ups with a burst",
         "longest burst", "frames sent", "wake-ups stalled on TX credit", "card interrupts",
         "card interrupt line (GIC)", "poller saw the line", "poller went to sleep",
-        "poller woke for a write", "card intstatus (last)", "mailbox interrupts", "mailbox data (last)"
+        "poller woke for a write", "card intstatus (last)", "mailbox interrupts", "mailbox data (last)",
+        "rx CMD53s failed", "  at command", "  at data", "  at transfer end",
+        "headers repeating the last", "garbage headers", "glom subframe errors", "drains at the frame cap",
+        "rx sequence mismatches", "  ahead 1", "  ahead 2-7", "  ahead 8-63", "  ahead 64-191",
+        "  ahead 192-254", "  behind 1 (repeat?)", "mailbox NAK handled", "mailbox firmware halt",
+        "mailbox flow control", "flow-control mask changes", "flow-control mask (last)"
     };
     const ULONG *counters = &sdio->s_StatWakes;
     ULONG n = sizeof(names) / sizeof(names[0]);

@@ -141,6 +141,7 @@ void cmd_int(ULONG cmd, ULONG arg, ULONG timeout, struct SDIO *sdio)
     struct ExecBase *SysBase = sdio->s_SysBase;
 
     sdio->s_LastCMDSuccess = 0;
+    sdio->s_LastFailPhase = 1;
 
     // Check Command Inhibit
     TIMEOUT_WAIT((rd32(sdio->s_SDIO, EMMC_STATUS) & 0x1) == 0, timeout);
@@ -189,6 +190,7 @@ void cmd_int(ULONG cmd, ULONG arg, ULONG timeout, struct SDIO *sdio)
         sdio->s_LastInterrupt = irpts;
         return;
     }
+    sdio->s_LastFailPhase = 2;
 
     // SDCardBase->sd_Delay(10, SDCardBase);
     asm volatile("nop");
@@ -278,6 +280,7 @@ void cmd_int(ULONG cmd, ULONG arg, ULONG timeout, struct SDIO *sdio)
             cur_block++;
         }
     }
+    sdio->s_LastFailPhase = 3;
     // Wait for transfer complete (set if read/write transfer or with busy)
     if((((cmd & SD_CMD_RSPNS_TYPE_MASK) == SD_CMD_RSPNS_TYPE_48B) ||
        (cmd & SD_CMD_ISDATA)))
@@ -751,6 +754,24 @@ void sdio_sendpkt(UBYTE *pkt, ULONG length, struct SDIO *sdio)
     S_UNLOCK(sdio);
 }
 
+/*
+ * A failed CMD53 of a frame read (blocks and remainder are one each, so a
+ * frame can count twice) is only counted: nothing here tells the caller, the
+ * buffer keeps whatever it held, and the card is not told to drop the frame
+ * (brcmf_sdio_rxfail() does both).  The counters say how often that path
+ * runs before anyone changes what it does (#89).
+ */
+static void sdio_count_rx_fail(struct SDIO *sdio)
+{
+    sdio->s_StatRxCmdFail++;
+    if (sdio->s_LastFailPhase == 1)
+        sdio->s_StatRxCmdFailCmd++;
+    else if (sdio->s_LastFailPhase == 2)
+        sdio->s_StatRxCmdFailData++;
+    else
+        sdio->s_StatRxCmdFailXfer++;
+}
+
 void sdio_recvpkt(UBYTE *pkt, ULONG length, struct SDIO *sdio)
 {
     struct ExecBase *SysBase = sdio->s_SysBase;
@@ -771,6 +792,8 @@ void sdio_recvpkt(UBYTE *pkt, ULONG length, struct SDIO *sdio)
         sdio->s_BlocksToTransfer = block_count;
         cmd(IO_RW_EXTENDED | SD_DATA_READ | SD_CMD_MULTI_BLOCK | SD_CMD_BLKCNT_EN,
             ((SD_FUNC_RAD & 7) << 28) | (1 << 27) | (block_count & 0x1ff) | (0 << 26), 5000000, sdio);
+        if (FAIL(sdio))
+            sdio_count_rx_fail(sdio);
         pkt += block_count * 512;
     }
 
@@ -781,6 +804,8 @@ void sdio_recvpkt(UBYTE *pkt, ULONG length, struct SDIO *sdio)
         sdio->s_BlockSize = reminder;
         sdio->s_BlocksToTransfer = 1;
         cmd(IO_RW_EXTENDED | SD_DATA_READ, ((SD_FUNC_RAD & 7) << 28) | (reminder & 0x1ff) | (0 << 26), 5000000, sdio);
+        if (FAIL(sdio))
+            sdio_count_rx_fail(sdio);
     }
     S_UNLOCK(sdio);
 }
@@ -961,9 +986,16 @@ ULONG sdio_service_card(struct SDIO *sdio)
         /* brcmf_sdio_hostmail(): read the word, acknowledge the interrupt.
            What the word says (a NAK to handle, flow control per priority,
            firmware ready or halted) is recorded, not yet acted on. */
-        sdio->s_StatMailboxData = sdio->Read32(base + SD_REG(tohostmailboxdata), sdio);
+        ULONG hmb = sdio->Read32(base + SD_REG(tohostmailboxdata), sdio);
+        sdio->s_StatMailboxData = hmb;
         sdio->Write32(base + SD_REG(tosbmailbox), SMB_INT_ACK, sdio);
         sdio->s_StatMailboxes++;
+        if (hmb & HMB_DATA_NAKHANDLED)
+            sdio->s_StatMbNakHandled++;
+        if (hmb & HMB_DATA_FWHALT)
+            sdio->s_StatMbFwHalt++;
+        if (hmb & HMB_DATA_FC)
+            sdio->s_StatMbFC++;
     }
     S_UNLOCK(sdio);
 
