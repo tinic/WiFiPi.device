@@ -164,6 +164,7 @@ void PacketSetVarAsync(struct SDIO *sdio, char *varName, const void *setBuffer, 
 void PacketSetVarIntAsync(struct SDIO *sdio, char *varName, ULONG varValue);
 void PacketCmdIntAsync(struct SDIO *sdio, ULONG cmd, ULONG cmdValue);
 int PacketGetVar(struct SDIO *sdio, char *varName, void *getBuffer, int getSize);
+int PacketCmdGetBuf(struct SDIO *sdio, ULONG cmd, void *getBuffer, int getSize);
 void StartNetworkScan(struct IOSana2Req *io);
 int PacketUploadCLM(struct SDIO *sdio);
 int Connect(struct SDIO *sdio, struct WiFiNetwork *network);

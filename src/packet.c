@@ -750,6 +750,45 @@ void ProcessEvent(struct SDIO *sdio, struct PacketEvent *pe)
     }
 }
 
+/*
+ * TX credit, observed only (#89).  Every header this driver handles sets the
+ * window (s_MaxTXSeq), glom subframes included, and the data path takes
+ * maxCount = window - seq modulo 256 as credit.  brcmf_sdio_hdparse() takes
+ * the window only from a plain or superframe header, clamps one more than
+ * 0x40 ahead to seq + 2, and brcmf_sdio_readframes() sends only while
+ * (window - seq) & 0x80 is clear.  These count where the two would differ.
+ */
+static void TxWindowAccount(struct SDIO *sdio, UBYTE window)
+{
+    if (sdio->s_InGlomSub && window != sdio->s_MaxTXSeq)
+        sdio->s_StatWinFromSub++;
+    if ((UBYTE)(window - sdio->s_TXSeq) > 0x40)
+        sdio->s_StatWinBogus++;
+    if ((UBYTE)(window - sdio->s_MaxTXSeq) & 0x80)
+        sdio->s_StatWinBackward++;
+}
+
+static void TxGlomAccount(struct SDIO *sdio, ULONG count, BOOL overCredit)
+{
+    if (count <= 1)
+        sdio->s_StatTxGlom1++;
+    else if (count < 4)
+        sdio->s_StatTxGlom2++;
+    else if (count < 8)
+        sdio->s_StatTxGlom4++;
+    else if (count < 16)
+        sdio->s_StatTxGlom8++;
+    else
+        sdio->s_StatTxGlom16++;
+    if (overCredit)
+    {
+        sdio->s_StatTxOverCredit++;
+        sdio->s_StatOCLastSeq = sdio->s_TXSeq;
+        sdio->s_StatOCLastMax = sdio->s_MaxTXSeq;
+        sdio->s_StatOCLastCount = count;
+    }
+}
+
 ULONG ProcessPacket(struct SDIO *sdio, struct Packet *pkt)
 {
     struct ExecBase *SysBase = sdio->s_SysBase;
@@ -765,6 +804,7 @@ ULONG ProcessPacket(struct SDIO *sdio, struct Packet *pkt)
     if (pktLen != (~pktChk & 0xffff)) return 0xffffffff;
 
     /* Update max sequence number at transfer */
+    TxWindowAccount(sdio, pkt->c_MaxSeq);
     sdio->s_MaxTXSeq = pkt->c_MaxSeq;
 
     switch(pkt->c_ChannelFlag)
@@ -1215,6 +1255,12 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
                 AddTail((struct List*)&ctrlWaitList, &msg->pm_Message.mn_Node);
 
                 // Send out the control packet
+                {
+                    UBYTE ctrlSeq = ((UBYTE *)&msg->pm_PacketHeader[0])[sdio->s_GlomEnabled ? 12 : 4];
+                    UBYTE room = (UBYTE)(sdio->s_MaxTXSeq - ctrlSeq);
+                    if (room == 0 || (room & 0x80))
+                        sdio->s_StatCtrlNoCredit++;
+                }
                 sdio->SendPKT((APTR)&msg->pm_PacketHeader[0], LE16(msg->pm_PacketHeader[0].p_Length), sdio);
                 /* its answer is wanted at the fast tick, not the idle one */
                 sendTransfer = TRUE;
@@ -1230,6 +1276,7 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
             UBYTE maxCount;
 
             maxCount = sdio->s_MaxTXSeq - sdio->s_TXSeq;
+            BOOL overCredit = maxCount > 0x40;
             
             /* Make sure we have place in TX */
             if (maxCount == 0)
@@ -1266,6 +1313,7 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
                             ReplyMsg((struct Message *)ioList[i]);
                         }
                         */
+                        TxGlomAccount(sdio, ioCount, overCredit);
                         SendGlomDataPacket(sdio, ioList, ioCount);
                         ioCount = 0;
                     }
@@ -1285,6 +1333,7 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
                 {
                     //D(bug("[WiFi] Glom frame would do, there are %ld entries in queue\n", ioCount));
                     // More items? Construct glom frame
+                    TxGlomAccount(sdio, ioCount, overCredit);
                     SendGlomDataPacket(sdio, ioList, ioCount);
                     /*
                     for (ULONG i=0; i < ioCount; i++)
@@ -1446,8 +1495,10 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
                             else
                             {
                                 ULONG pos = pkt->c_DataOffset;
+                                UBYTE superWindow = pkt->c_MaxSeq;
 
                                 RxSeqAccount(sdio, pkt, RX_SEQ_SHARE);
+                                sdio->s_InGlomSub = 1;
 
                                 while(pos < pktLen)
                                 {
@@ -1473,6 +1524,9 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
                                         pos = (pos + 3) & ~3;
                                     }
                                 }
+                                sdio->s_InGlomSub = 0;
+                                if (superWindow != sdio->s_MaxTXSeq)
+                                    sdio->s_StatWinSuperDiff++;
                             }
                         }
                         else
@@ -1914,6 +1968,18 @@ void ProcessDataPacket(struct SDIO *sdio, UBYTE *packet, ULONG packetLength)
         if (orphan)
         {
             unit->wu_Stats.UnknownTypesReceived++;
+            if (packetType == 0x0800)
+                sdio->s_StatOrphanIPv4++;
+            else if (packetType == 0x0806)
+                sdio->s_StatOrphanARP++;
+            else if (packetType == 0x86dd)
+                sdio->s_StatOrphanIPv6++;
+            else if (packetType == 0x888e)
+                sdio->s_StatOrphanEAPOL++;
+            else
+                sdio->s_StatOrphanOther++;
+            if (packet[0] & 1)
+                sdio->s_StatOrphanMcast++;
 
             Disable();
             /* Go through all openers and offer orphan packet to anyone asking */
@@ -2782,6 +2848,85 @@ int PacketGetVar(struct SDIO *sdio, char *varName, void *getBuffer, int getSize)
     {
         error_code = LE32(c->c_Status);
         D(bug("[WiFi] PacketGetVar ended with error. Code: %s", (ULONG)brcmf_fil_errstr[-error_code]));
+    }
+
+    FreePooled(WiFiBase->w_MemPool, mpkt, totalLen);
+    DeleteMsgPort(port);
+
+    return error_code;
+}
+
+/* PacketGetVar's twin for a plain ioctl that answers into a buffer (#89:
+   WLC_GET_D11CNTS when the 'counters' iovar is refused). */
+int PacketCmdGetBuf(struct SDIO *sdio, ULONG cmd, void *getBuffer, int getSize)
+{
+    struct ExecBase *SysBase = sdio->s_SysBase;
+    struct WiFiBase *WiFiBase = sdio->s_WiFiBase;
+    UBYTE *pkt;
+    struct MsgPort *port = CreateMsgPort();
+    struct PacketMessage *mpkt;
+    ULONG totalLen = sizeof(struct Packet) + sizeof(struct PacketCmd) + sizeof(struct PacketMessage);
+    ULONG error_code = 0;
+
+    if (sdio->s_GlomEnabled)
+        totalLen += 8;
+
+    int varSize = 0;
+
+    totalLen += getSize;
+
+    mpkt = AllocPooledClear(WiFiBase->w_MemPool, totalLen);
+    pkt = (APTR)&mpkt->pm_PacketHeader[0];
+
+    mpkt->pm_Message.mn_ReplyPort = port;
+    mpkt->pm_Message.mn_Length = totalLen;
+    mpkt->pm_RecvBuffer = getBuffer;
+    mpkt->pm_RecvSize = getSize;
+
+    struct PacketHeaderHW *hw = (APTR)&pkt[0];
+    struct GlomHeader *gl = (APTR)&pkt[4];
+    struct PacketHeaderSW *sw = sdio->s_GlomEnabled ? (APTR)&pkt[12] : (APTR)&pkt[4];
+    struct PacketCmd *c = sdio->s_GlomEnabled ? (APTR)&pkt[20] : (APTR)&pkt[12];
+
+    mpkt->pm_PacketData = c;
+
+    UWORD max = varSize;
+    if (getSize > max) max = getSize;
+
+    UWORD totLen = sizeof(struct Packet) + sizeof(struct PacketCmd) + max;
+    
+    if (sdio->s_GlomEnabled)
+    {
+        totLen += 8;
+        gl->gh_Length = LE16(totLen - sizeof(struct PacketHeaderHW));
+        gl->gh_ReservedB = 0;
+        gl->gh_LastItem = 1;
+        gl->gh_ReservedW = 0;
+        gl->gh_TailPad = LE16((-totLen) & 3);
+    }
+
+    hw->ph_Length = LE16(totLen);
+    hw->ph_ChkSum = ~hw->ph_Length;
+    sw->c_DataOffset = sizeof(struct Packet);
+    if (sdio->s_GlomEnabled) sw->c_DataOffset += sizeof(struct GlomHeader);
+    sw->c_FlowControl = 0;
+    sw->c_Seq = sdio->s_TXSeq++;
+
+    c->c_Command = LE32(cmd);
+    c->c_Length = LE32(max);
+    c->c_Flags = LE16(0);
+    c->c_ID = LE16(++(sdio->s_CmdID));
+    c->c_Status = 0;
+
+
+    PutMsg(sdio->s_ReceiverPort, &mpkt->pm_Message);
+    WaitPort(port);
+    GetMsg(port);
+
+    if (c->c_Flags & LE16(BCDC_DCMD_ERROR))
+    {
+        error_code = LE32(c->c_Status);
+        D(bug("[WiFi] PacketCmdGetBuf ended with error. Code: %s", (ULONG)brcmf_fil_errstr[-error_code]));
     }
 
     FreePooled(WiFiBase->w_MemPool, mpkt, totalLen);

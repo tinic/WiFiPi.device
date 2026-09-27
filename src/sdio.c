@@ -719,6 +719,19 @@ static int sdio_clkctrl(UBYTE target, UBYTE pendingOK, struct SDIO *sdio)
     return 1;
 }
 
+/* A failed CMD53 of a send is only counted, like a failed read: the caller
+   is not told, and the frame is still replied to as sent (#89). */
+static void sdio_count_tx_fail(struct SDIO *sdio)
+{
+    sdio->s_StatTxCmdFail++;
+    if (sdio->s_LastFailPhase == 1)
+        sdio->s_StatTxCmdFailCmd++;
+    else if (sdio->s_LastFailPhase == 2)
+        sdio->s_StatTxCmdFailData++;
+    else
+        sdio->s_StatTxCmdFailXfer++;
+}
+
 void sdio_sendpkt(UBYTE *pkt, ULONG length, struct SDIO *sdio)
 {
     struct ExecBase *SysBase = sdio->s_SysBase;
@@ -731,6 +744,9 @@ void sdio_sendpkt(UBYTE *pkt, ULONG length, struct SDIO *sdio)
     ULONG block_count = length / 512;
     ULONG reminder = length % 512;
 
+    if (block_count && reminder)
+        sdio->s_StatTxSplit++;
+
     if (block_count)
     {
         // Send out the data
@@ -739,6 +755,12 @@ void sdio_sendpkt(UBYTE *pkt, ULONG length, struct SDIO *sdio)
         sdio->s_BlocksToTransfer = block_count;
         cmd(IO_RW_EXTENDED | SD_DATA_WRITE | SD_CMD_MULTI_BLOCK | SD_CMD_BLKCNT_EN, 0x80000000 |
             ((SD_FUNC_RAD & 7) << 28) | (1 << 27) | (block_count & 0x1ff) | (0 << 26), 5000000, sdio);
+        if (FAIL(sdio))
+        {
+            sdio_count_tx_fail(sdio);
+            if (reminder)
+                sdio->s_StatTxFailBlock++;
+        }
         pkt += block_count * 512;
     }
 
@@ -749,6 +771,12 @@ void sdio_sendpkt(UBYTE *pkt, ULONG length, struct SDIO *sdio)
         sdio->s_BlockSize = reminder;
         sdio->s_BlocksToTransfer = 1;
         cmd(IO_RW_EXTENDED | SD_DATA_WRITE, 0x80000000 | ((SD_FUNC_RAD & 7) << 28) | (reminder & 0x1ff) | (0 << 26), 5000000, sdio);
+        if (FAIL(sdio))
+        {
+            sdio_count_tx_fail(sdio);
+            if (block_count)
+                sdio->s_StatTxFailRem++;
+        }
     }
 
     S_UNLOCK(sdio);
@@ -980,6 +1008,10 @@ ULONG sdio_service_card(struct SDIO *sdio)
     {
         sdio->Write32(base + SD_REG(intstatus), ints, sdio);
         sdio->s_StatIntStatus = ints;
+        if (ints & I_WR_OOSYNC)
+            sdio->s_StatWrOOSync++;
+        if (ints & I_RD_OOSYNC)
+            sdio->s_StatRdOOSync++;
     }
     if (ints & I_HMB_HOST_INT)
     {
