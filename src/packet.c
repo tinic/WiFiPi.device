@@ -832,6 +832,20 @@ static inline ULONG PollClock(struct WiFiBase *WiFiBase)
     return rd32(WiFiBase->w_SysTimer, 4);       /* CLO, 1 MHz */
 }
 
+/*
+ * TX credit (#99): how many frames the firmware's window still admits.  The
+ * window end s_MaxTXSeq and the next number s_TXSeq are modulo 256; only a
+ * forward distance of 1..127 is credit (brcmf_sdio data_ok: nonzero, high
+ * bit clear).  0 is a closed window, and 128..255 means the next number is
+ * already past the window's end -- a closed window too, not 128..255 frames
+ * of credit.
+ */
+UBYTE PacketTxCredit(struct SDIO *sdio)
+{
+    UBYTE d = (UBYTE)(sdio->s_MaxTXSeq - sdio->s_TXSeq);
+    return (d & 0x80) ? 0 : d;
+}
+
 static void PacketPoller(struct SDIO *sdio)
 {
     struct ExecBase *SysBase = sdio->s_SysBase;
@@ -862,7 +876,7 @@ static void PacketPoller(struct SDIO *sdio)
         {
             BOOL send = FALSE;
 
-            if (!IsMsgPortEmpty(sdio->s_SenderPort) && sdio->s_MaxTXSeq != sdio->s_TXSeq)
+            if (!IsMsgPortEmpty(sdio->s_SenderPort) && PacketTxCredit(sdio) != 0)
             {
                 ULONG now = PollClock(WiFiBase);
 
@@ -1116,7 +1130,7 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
             ULONG ioCount = 0;
             UBYTE maxCount;
 
-            maxCount = sdio->s_MaxTXSeq - sdio->s_TXSeq;
+            maxCount = PacketTxCredit(sdio);
             
             /* Make sure we have place in TX */
             if (maxCount == 0)
