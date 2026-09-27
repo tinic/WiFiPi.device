@@ -1151,23 +1151,70 @@ static int Do_CMD_FLUSH(struct IOSana2Req *io)
     return 1;
 }
 
-static int Do_NSCMD_DEVICEQUERY(struct IOStdReq *io)
+/*
+ * NSCMD_DEVICEQUERY, four forms:
+ *  1. short request (an IOStdReq, limited open): answered into io_Data; a
+ *     NULL io_Data is refused.
+ *  2. full request, SANA-II form: ios2_Data with ios2_DataLength >= 16.
+ *  3. full request, legacy form (WirelessManager 1.3/1.5): ios2_Data NULL,
+ *     answered into io_Data only when the request is the one that opened,
+ *     this is its first command (fresh), and io_Data is even, non-NULL and
+ *     not the value it held at Open.  In a full request io_Data is
+ *     ios2_SrcAddr[0..3], which this driver writes (S2_GETSTATIONADDRESS,
+ *     read completion), so it is trusted only on that driver-owned
+ *     provenance: a pointer the caller stored between Open and its first
+ *     command.  A caller that stores a bad pointer there itself is not
+ *     caught.
+ *  4. anything else: IOERR_BADLENGTH, nothing read or written through any
+ *     pointer.
+ * The answer is 16 bytes.  io_Actual = 16 in the io_Data forms (the NSD
+ * rule; in a full request it is ios2_WireError, meaningless on success);
+ * the SANA-II form reports its length in ios2_DataLength.
+ */
+static int Do_NSCMD_DEVICEQUERY(struct IOSana2Req *io, BOOL fresh)
 {
-    struct WiFiUnit *unit = (struct WiFiUnit *)io->io_Unit;
-    struct ExecBase *SysBase = unit->wu_Base->w_SysBase;
-
-    struct NSDeviceQueryResult *dq;
-    dq = io->io_Data;
+    struct IOStdReq *std = (struct IOStdReq *)io;
+    /* io_Device, not io_Unit: every open sets it */
+    struct ExecBase *SysBase = ((struct WiFiBase *)io->ios2_Req.io_Device)->w_SysBase;
+    struct NSDeviceQueryResult *dq = NULL;
+    BOOL sana = FALSE;
 
     D(bug("[WiFi.0] NSCMD_DEVICEQUERY\n"));
 
-    /* Fill out structure */
+    if (io->ios2_Req.io_Message.mn_Length < sizeof(struct IOSana2Req))
+        dq = std->io_Data;
+    else if (io->ios2_Data != NULL)
+    {
+        if (io->ios2_DataLength >= sizeof(struct NSDeviceQueryResult))
+        {
+            dq = io->ios2_Data;
+            sana = TRUE;
+        }
+    }
+    else if (fresh && std->io_Data != NULL && ((ULONG)std->io_Data & 1) == 0)
+        dq = std->io_Data;
+
+    if (dq == NULL)
+    {
+        if (io->ios2_Req.io_Message.mn_Length < sizeof(struct IOSana2Req))
+            std->io_Actual = 0;
+        std->io_Error = IOERR_BADLENGTH;
+        return 1;
+    }
+
+    dq->nsdqr_DevQueryFormat = 0;
+    dq->nsdqr_SizeAvailable = sizeof(struct NSDeviceQueryResult);
     dq->nsdqr_DeviceType = NSDEVTYPE_SANA2;
     dq->nsdqr_DeviceSubType = 0;
     dq->nsdqr_SupportedCommands = (UWORD*)WiFi_SupportedCommands;
-    io->io_Actual = sizeof(struct NSDeviceQueryResult) + sizeof(APTR);
-    dq->nsdqr_SizeAvailable = io->io_Actual;
-    io->io_Error = 0;
+    if (sana)
+    {
+        io->ios2_DataLength = sizeof(struct NSDeviceQueryResult);
+        io->ios2_WireError = 0;
+    }
+    else
+        std->io_Actual = sizeof(struct NSDeviceQueryResult);
+    std->io_Error = 0;
 
     return 1;
 }
@@ -1771,6 +1818,38 @@ static int Do_S2_OFFLINE(struct IOSana2Req *io)
     return 1;
 }
 
+/*
+ * If io is the request an opener was opened with and has had no command yet,
+ * mark it used; TRUE when it was fresh and its io_Data differs from the Open
+ * snapshot.  The opener is found on wu_Openers by identity, not through
+ * ios2_BufferManagement (a clone carries the same cookie); nothing the
+ * request points to is dereferenced.
+ */
+static BOOL UseOpenReq(struct WiFiUnit *unit, struct IOSana2Req *io)
+{
+    struct ExecBase *SysBase = unit->wu_Base->w_SysBase;
+    struct Opener *opener;
+    BOOL fresh = FALSE;
+
+    Forbid();
+    ForeachNode(&unit->wu_Openers, opener)
+    {
+        if (opener->o_OpenReq == io)
+        {
+            if (!opener->o_OpenReqUsed)
+            {
+                fresh = ((struct IOStdReq *)io)->io_Data != opener->o_OpenIoData;
+                opener->o_OpenReqUsed = TRUE;
+                unit->wu_FreshOpenReqs--;
+            }
+            break;
+        }
+    }
+    Permit();
+
+    return fresh;
+}
+
 void HandleRequest(struct IOSana2Req *io)
 {
     struct WiFiUnit *unit = (struct WiFiUnit *)io->ios2_Req.io_Unit;
@@ -1791,12 +1870,21 @@ void HandleRequest(struct IOSana2Req *io)
     }
     else
     {
+        BOOL fresh = FALSE;
+
+        /* Any command on the request that opened uses up its legacy
+           NSCMD_DEVICEQUERY form, a query included, answered or not.  Done
+           before dispatch: a queued request is not ours to touch after. */
+        if (unit->wu_FreshOpenReqs != 0 &&
+            io->ios2_Req.io_Message.mn_Length >= sizeof(struct IOSana2Req))
+            fresh = UseOpenReq(unit, io);
+
         io->ios2_Req.io_Error = 0;
 
         switch (io->ios2_Req.io_Command)
         {
             case NSCMD_DEVICEQUERY:
-                complete = Do_NSCMD_DEVICEQUERY((struct IOStdReq *)io);
+                complete = Do_NSCMD_DEVICEQUERY(io, fresh);
                 break;
 
             case S2_DEVICEQUERY:

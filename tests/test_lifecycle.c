@@ -3,8 +3,8 @@
  * touched on these paths.  The driver's own WiFi_Open/WiFi_BeginIO/WiFi_Close
  * are linked in and called against a fake WiFiBase/WiFiUnit.
  *
- * Only full IOSana2Req opens are used: a short (limited-mode) open on this
- * base still takes no unit, and is not what these checks are about.
+ * Only full IOSana2Req opens are used; the short (limited-mode) open is in
+ * test_devquery.c.
  *
  * WirelessManager 1.3 (driver_sana2.c) opens with an 88-byte request from
  * CreateIORequest(sizeof(struct IOSana2Req)) and asks NSCMD_DEVICEQUERY with
