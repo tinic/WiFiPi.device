@@ -201,6 +201,7 @@ struct WiFiUnit
     UBYTE *                 wu_AssocIE;
     UWORD                   wu_AssocIELength;
     UBYTE *                 wu_WPAInfo;
+    UWORD                   wu_FreshOpenReqs;   // openers whose o_OpenReq has had no command yet
 };
 
 struct MulticastRange {
@@ -227,6 +228,13 @@ struct Opener
     APTR                o_RxFilled;         // AnxdS2RxFilled
     BOOL                o_RxLinkHdr;        // write the 14-byte header in front of the payload
     UBYTE               o_RxFlags;          // ANXD_S2_RXF_* beyond SUMMED the opener asked for
+
+    /* The legacy NSCMD_DEVICEQUERY form (io_Data in a full request, as
+       WirelessManager sends it) is taken only on the request that opened,
+       as its first command, with io_Data changed since Open. */
+    struct IOSana2Req * o_OpenReq;          // request passed to WiFi_Open
+    APTR                o_OpenIoData;       // its io_Data (ios2_SrcAddr[0..3]) at Open
+    BOOL                o_OpenReqUsed;      // a command has been sent on it
 };
 
 /* Standard interface flags (netdevice->flags). */

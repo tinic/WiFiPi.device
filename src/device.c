@@ -245,6 +245,12 @@ void WiFi_Open(REGARG(struct IOSana2Req * io, "a1"), REGARG(LONG unitNumber, "d0
 
         if (opener != NULL)
         {
+            /* Open writes neither io_Data nor ios2_SrcAddr: this is the
+               caller's value, stale MAC bytes in a reused request. */
+            opener->o_OpenReq = io;
+            opener->o_OpenIoData = ((struct IOStdReq *)io)->io_Data;
+            opener->o_OpenReqUsed = FALSE;
+
             if ((flags & SANA2OPF_MINE) == 0)
                 unit->wu_Flags |= IFF_SHARED;
             if ((flags & SANA2OPB_PROM) != 0)
@@ -319,6 +325,7 @@ void WiFi_Open(REGARG(struct IOSana2Req * io, "a1"), REGARG(LONG unitNumber, "d0
         
         Disable();
         AddTail((APTR)&unit->wu_Openers, (APTR)opener);
+        unit->wu_FreshOpenReqs++;
         Enable();
 
         /* Start unit here? */
@@ -357,6 +364,8 @@ ULONG WiFi_Close(REGARG(struct IOSana2Req * io, "a1"))
         {
             Disable();
             Remove((struct Node *)opener);
+            if (!opener->o_OpenReqUsed && u != NULL)
+                u->wu_FreshOpenReqs--;
             Enable();
 
             FreeMem(opener, sizeof(struct Opener));
@@ -423,7 +432,9 @@ LONG WiFi_AbortIO(REGARG(struct IOSana2Req *io, "a1"))
         {
             Remove(&io->ios2_Req.io_Message.mn_Node);
             io->ios2_Req.io_Error = IOERR_ABORTED;
-            io->ios2_WireError = S2WERR_GENERIC_ERROR;
+            /* In an IOStdReq that word is io_Actual, not a wire error. */
+            if (io->ios2_Req.io_Message.mn_Length >= sizeof(struct IOSana2Req))
+                io->ios2_WireError = S2WERR_GENERIC_ERROR;
             ReplyMsg(&io->ios2_Req.io_Message);
         }
         Permit();

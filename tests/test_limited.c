@@ -185,9 +185,9 @@ int main(void)
         expect_eq(std->io_Error, 0, "1 query answered");
         expect_eq(ans.nsdqr_DeviceType, NSDEVTYPE_SANA2, "1 DeviceType SANA-II");
         expect(ans.nsdqr_SupportedCommands != NULL, "1 command list present");
-        /* beta4 short form, unchanged: 16 + sizeof(APTR) */
-        expect_eq(std->io_Actual, sizeof(struct NSDeviceQueryResult) + sizeof(APTR), "1 io_Actual beta4 form");
-        expect_eq(ans.nsdqr_SizeAvailable, std->io_Actual, "1 SizeAvailable beta4 form");
+        /* the 16 bytes filled (beta4 added sizeof(APTR)) */
+        expect_eq(std->io_Actual, sizeof(struct NSDeviceQueryResult), "1 io_Actual 16");
+        expect_eq(ans.nsdqr_SizeAvailable, std->io_Actual, "1 SizeAvailable 16");
         expect(beyond_intact(&a), "1 query writes nothing past the request");
     }
     else
