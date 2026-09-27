@@ -164,6 +164,20 @@ void PacketSetVarAsync(struct SDIO *sdio, char *varName, const void *setBuffer, 
 void PacketSetVarIntAsync(struct SDIO *sdio, char *varName, ULONG varValue);
 void PacketCmdIntAsync(struct SDIO *sdio, ULONG cmd, ULONG cmdValue);
 int PacketGetVar(struct SDIO *sdio, char *varName, void *getBuffer, int getSize);
+
+/* A synchronous control request that could not be completed: no reply
+   within PACKET_CTRL_TIMEOUT_MS, or no timer/port/memory to wait with.
+   Positive, so never a firmware status (BCME codes are negative) and never 0. */
+#define PACKET_CTRL_TIMEOUT     0x7fff0001
+#define PACKET_CTRL_NORES       0x7fff0002
+#define PACKET_CTRL_SHORT       0x7fff0003  /* a get answered with fewer bytes than asked for */
+#define PACKET_CTRL_TIMEOUT_MS  2500    /* brcmfmac DCMD_RESP_TIMEOUT */
+
+struct Packet;
+void PacketCtrlQueue(struct SDIO *sdio, struct Message *msg);
+void PacketCtrlComplete(struct SDIO *sdio, struct Packet *pkt, ULONG pktLen);
+void PacketCtrlSweep(struct SDIO *sdio);
+void PacketCtrlShutdown(struct SDIO *sdio, struct MsgPort *ctrl);
 void StartNetworkScan(struct IOSana2Req *io);
 int PacketUploadCLM(struct SDIO *sdio);
 int Connect(struct SDIO *sdio, struct WiFiNetwork *network);

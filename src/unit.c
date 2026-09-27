@@ -421,6 +421,14 @@ static int Do_S2_ONEVENT(struct IOSana2Req *io)
     }
 }
 
+/* A control request that never completed: no reply in time, no resources to
+   wait with, or a short answer (#93).  Unlike a firmware status, these mean
+   the value asked for is not there. */
+static BOOL CtrlLost(ULONG err)
+{
+    return err == PACKET_CTRL_TIMEOUT || err == PACKET_CTRL_NORES || err == PACKET_CTRL_SHORT;
+}
+
 static int Do_S2_GETSIGNALQUALITY(struct IOSana2Req *io)
 {
     struct WiFiUnit *unit = (struct WiFiUnit *)io->ios2_Req.io_Unit;
@@ -446,8 +454,16 @@ static int Do_S2_GETSIGNALQUALITY(struct IOSana2Req *io)
     {
         /* Remove QUICK flag and put message on event listener list */
         struct Sana2SignalQuality *quality = io->ios2_StatData;
-        PacketCmdIntGet(WiFiBase->w_SDIO, BRCMF_C_GET_RSSI, (APTR)&quality->SignalLevel);
-        PacketCmdIntGet(WiFiBase->w_SDIO, BRCMF_C_GET_PHY_NOISE, (APTR)&quality->NoiseLevel);
+        ULONG err = PacketCmdIntGet(WiFiBase->w_SDIO, BRCMF_C_GET_RSSI, (APTR)&quality->SignalLevel);
+        if (!CtrlLost(err))
+            err = PacketCmdIntGet(WiFiBase->w_SDIO, BRCMF_C_GET_PHY_NOISE, (APTR)&quality->NoiseLevel);
+        if (CtrlLost(err))
+        {
+            /* the firmware did not answer: no reading, and the caller is told */
+            io->ios2_Req.io_Error = S2ERR_OUTOFSERVICE;
+            io->ios2_WireError = S2WERR_GENERIC_ERROR;
+            return 1;
+        }
 
         D(bug("[WiFi.0] Signal: %ld, Noise: %ld\n", quality->SignalLevel, quality->NoiseLevel));
         return 1;
@@ -1495,11 +1511,22 @@ static int Do_S2_CONFIGINTERFACE(struct IOSana2Req *io)
     }
     else
     {
-        /* Try to set HW addr */
-        PacketSetVar(sdio, "cur_etheraddr", io->ios2_SrcAddr, 6);
+        ULONG err;
+
+        /* Try to set HW addr.  The firmware may refuse it, as before; a
+           request that never completed fails the command instead of taking
+           the unit up with an address nobody confirmed (#93). */
+        err = PacketSetVar(sdio, "cur_etheraddr", io->ios2_SrcAddr, 6);
 
         /* Get HW addr back */
-        PacketGetVar(sdio, "cur_etheraddr", unit->wu_EtherAddr, 6);
+        if (!CtrlLost(err))
+            err = PacketGetVar(sdio, "cur_etheraddr", unit->wu_EtherAddr, 6);
+        if (CtrlLost(err))
+        {
+            io->ios2_Req.io_Error = S2ERR_OUTOFSERVICE;
+            io->ios2_WireError = S2WERR_GENERIC_ERROR;
+            return 1;
+        }
         D(bug("[WiFi.0] Ethernet addr set: %02lx:%02lx:%02lx:%02lx:%02lx:%02lx\n",
                     unit->wu_EtherAddr[0], unit->wu_EtherAddr[1], unit->wu_EtherAddr[2],
                     unit->wu_EtherAddr[3], unit->wu_EtherAddr[4], unit->wu_EtherAddr[5]));
