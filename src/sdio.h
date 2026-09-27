@@ -309,6 +309,27 @@ struct SDIO {
     ULONG               s_StatIntStatus;    // the card's last non-zero intstatus, as cleared
     ULONG               s_StatMailboxes;    // host mailbox interrupts acknowledged
     ULONG               s_StatMailboxData;  // the last tohostmailboxdata
+    ULONG               s_StatRxCmdFail;    // failed rx CMD53s, any phase; a frame read issues 1-2 (#89)
+    ULONG               s_StatRxCmdFailCmd; //   at command complete
+    ULONG               s_StatRxCmdFailData;//   waiting for a data block
+    ULONG               s_StatRxCmdFailXfer;//   at transfer complete
+    ULONG               s_StatRxStaleHdr;   // frame headers identical to the previous frame's
+    ULONG               s_StatRxGarbage;    // header reads whose length and checksum disagree
+    ULONG               s_StatRxGlomErr;    // glom subframes that failed their header check
+    ULONG               s_StatRxBurstCap;   // drains that reached the per-wake-up frame cap
+    ULONG               s_StatRxBadSeq;     // SDPCM rx sequence not the expected one
+    ULONG               s_StatRxSeqD1;      //   ahead by 1
+    ULONG               s_StatRxSeqD2;      //   ahead by 2-7
+    ULONG               s_StatRxSeqD8;      //   ahead by 8-63
+    ULONG               s_StatRxSeqD64;     //   ahead by 64-191
+    ULONG               s_StatRxSeqD192;    //   ahead by 192-254
+    ULONG               s_StatRxSeqBack1;   //   behind by 1: a repeat, or ambiguous
+    ULONG               s_StatMbNakHandled; // mailbox words with HMB_DATA_NAKHANDLED
+    ULONG               s_StatMbFwHalt;     // mailbox words with HMB_DATA_FWHALT
+    ULONG               s_StatMbFC;         // mailbox words with HMB_DATA_FC
+    ULONG               s_StatFCChanges;    // flow-control mask changes in frame headers
+    ULONG               s_StatFCLast;       // the last flow-control mask
+    ULONG               s_LastRxHdr[4];     // the previous frame's first 16 bytes
 
     /* The card interrupt: a server on the GIC through gic400.library */
     struct Interrupt    s_Interrupt;
@@ -330,6 +351,8 @@ struct SDIO {
     UBYTE               s_MaxTXSeq;
     UBYTE               s_TXSeq;
     UBYTE               s_RXSeq;
+    UBYTE               s_RXSeqValid;       // s_RXSeq holds the next expected rx sequence
+    UBYTE               s_LastFailPhase;    // where the last failed command stopped: 1 cmd, 2 data, 3 xfer
     UWORD               s_CmdID;
     BOOL                s_GlomEnabled;
 
