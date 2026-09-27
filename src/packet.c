@@ -1914,7 +1914,10 @@ int SendGlomDataPacket(struct SDIO *sdio, struct IOSana2Req **ioList, UBYTE coun
         gh->gh_ReservedW = 0;
         if (i == count - 1) gh->gh_LastItem = 1;
         else gh->gh_LastItem = 0;
-        gh->gh_TailPad = LE16((-packetLength) & 3);
+        /* A lone frame declares no tail pad and its own length, as Linux
+           does for a queue of one (brcmf_sdio_txpkt_prep skips _sg); the
+           1-3 bytes to the next word still go out, undeclared (#89). */
+        gh->gh_TailPad = count > 1 ? LE16((-packetLength) & 3) : 0;
         lastGh = gh;
 
         /* Following glom header there is PacketSW header */
@@ -1995,7 +1998,8 @@ int SendGlomDataPacket(struct SDIO *sdio, struct IOSana2Req **ioList, UBYTE coun
         totalLength += chainPad;
     }
 
-    pktBase->ph_Length = LE16(totalLength);
+    if (count > 1)
+        pktBase->ph_Length = LE16(totalLength);
     pktBase->ph_ChkSum = ~pktBase->ph_Length;
 #if 0
     UBYTE *bdata = (UBYTE*)pktBase;
