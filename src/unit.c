@@ -1120,9 +1120,18 @@ static int Do_CMD_FLUSH(struct IOSana2Req *io)
     }
     Enable();
 
-    /* For every opener, flush orphan and even queues */
+    /* A flush must return ordinary reads too.  Leaving them queued pins the
+       caller's IOSana2Reqs and their receive buffers past teardown. */
+    Disable();
     ForeachNode(&unit->wu_Openers, opener)
     {
+        while ((req = (struct IOSana2Req *)GetMsg(&opener->o_ReadPort)))
+        {
+            req->ios2_Req.io_Error = IOERR_ABORTED;
+            req->ios2_WireError = 0;
+            ReplyMsg((struct Message *)req);
+        }
+
         while ((req = (struct IOSana2Req *)GetMsg(&opener->o_OrphanListeners)))
         {
             req->ios2_Req.io_Error = IOERR_ABORTED;
@@ -1137,6 +1146,7 @@ static int Do_CMD_FLUSH(struct IOSana2Req *io)
             ReplyMsg((struct Message *)req);
         }
     }
+    Enable();
 
     return 1;
 }
@@ -1167,8 +1177,8 @@ static int Do_CMD_READ(struct IOSana2Req *io)
     struct WiFiUnit *unit = (struct WiFiUnit *)io->ios2_Req.io_Unit;
     struct ExecBase *SysBase = unit->wu_Base->w_SysBase;
 
-    // If interface is up, put the read request in units read queue
-    if (unit->wu_Flags & IFF_UP)
+    // An offline unit must not accept a new read after S2_OFFLINE flushed it.
+    if (unit->wu_Flags & IFF_ONLINE)
     {
         struct Opener *opener = io->ios2_BufferManagement;
         io->ios2_Req.io_Flags &= ~IOF_QUICK;
@@ -1190,8 +1200,8 @@ static int Do_S2_READORPHAN(struct IOSana2Req *io)
 
     D(bug("[WiFi.0] CMD_READORPHAN\n"));
 
-    // If interface is up, put the read request in units read queue
-    if (unit->wu_Flags & IFF_UP)
+    // An offline unit must not accept a new orphan read either.
+    if (unit->wu_Flags & IFF_ONLINE)
     {
         struct Opener *opener = io->ios2_BufferManagement;
         io->ios2_Req.io_Flags &= ~IOF_QUICK;
@@ -1212,7 +1222,7 @@ static int Do_CMD_WRITE(struct IOSana2Req *io)
     struct ExecBase *SysBase = unit->wu_Base->w_SysBase;
     struct SDIO *sdio = unit->wu_Base->w_SDIO;
 
-    if (unit->wu_Flags & IFF_UP)
+    if (unit->wu_Flags & IFF_ONLINE)
     {
         io->ios2_Req.io_Flags &= ~IOF_QUICK;
         PutMsg(sdio->s_SenderPort, (struct Message *)io);
@@ -1698,11 +1708,18 @@ static int Do_S2_OFFLINE(struct IOSana2Req *io)
     struct ExecBase *SysBase = WiFiBase->w_SysBase;
     struct SDIO *sdio = WiFiBase->w_SDIO;
     struct IOSana2Req *req;
+    struct Opener *opener;
+    UBYTE wasOnline = (unit->wu_Flags & IFF_ONLINE) != 0;
 
     D(bug("[WiFi.0] S2_OFFLINE\n"));
 
-    /* Flush network scan requests */
+    /* Stop accepting new reads before returning the old ones.  The unit lock
+       serializes BeginIO commands, and Disable excludes the packet receiver
+       while we detach requests from each opener. */
     Disable();
+    unit->wu_Flags &= ~IFF_ONLINE;
+
+    /* Flush network scan requests */
     if (unit->wu_ScanRequest != NULL)
     {
         req = unit->wu_ScanRequest;
@@ -1719,6 +1736,22 @@ static int Do_S2_OFFLINE(struct IOSana2Req *io)
         req->ios2_WireError = 0;
         ReplyMsg((struct Message *)req);
     }
+
+    ForeachNode(&unit->wu_Openers, opener)
+    {
+        while ((req = (struct IOSana2Req *)GetMsg(&opener->o_ReadPort)))
+        {
+            req->ios2_Req.io_Error = S2ERR_OUTOFSERVICE;
+            req->ios2_WireError = S2WERR_UNIT_OFFLINE;
+            ReplyMsg((struct Message *)req);
+        }
+        while ((req = (struct IOSana2Req *)GetMsg(&opener->o_OrphanListeners)))
+        {
+            req->ios2_Req.io_Error = S2ERR_OUTOFSERVICE;
+            req->ios2_WireError = S2WERR_UNIT_OFFLINE;
+            ReplyMsg((struct Message *)req);
+        }
+    }
     Enable();
 
     /* Flush and cancel all write requests */
@@ -1730,10 +1763,8 @@ static int Do_S2_OFFLINE(struct IOSana2Req *io)
     }
 
     /* If unit was ONLINE before, report offline event now */
-    if (unit->wu_Flags & IFF_ONLINE)
+    if (wasOnline)
     {
-        unit->wu_Flags &= ~IFF_ONLINE;
-
         ReportEvents(unit, S2EVENT_OFFLINE);
     }
 
