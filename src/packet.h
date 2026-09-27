@@ -178,6 +178,7 @@ int PacketGetVarMin(struct SDIO *sdio, char *varName, void *getBuffer, int getSi
 
 struct Packet;
 void PacketCtrlQueue(struct SDIO *sdio, struct Message *msg);
+UBYTE PacketTxCredit(struct SDIO *sdio);
 void PacketCtrlComplete(struct SDIO *sdio, struct Packet *pkt, ULONG pktLen);
 void PacketCtrlSweep(struct SDIO *sdio);
 void PacketCtrlShutdown(struct SDIO *sdio, struct MsgPort *ctrl);

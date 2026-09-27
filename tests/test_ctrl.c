@@ -555,6 +555,32 @@ int main(void)
     fsdio.s_GlomEnabled = 0;
     helper_cmd(CMD_SWEEP);
 
+    PutStr("step 10h TX credit: forward 1..127 only (#99)\n");
+    {
+        static const UBYTE delta[6] = { 0, 1, 64, 127, 128, 255 };
+        static const UBYTE want[6]  = { 0, 1, 64, 127, 0, 0 };
+        for (k = 0; k < 6; k++)
+        {
+            fsdio.s_TXSeq = 10;
+            fsdio.s_MaxTXSeq = (UBYTE)(10 + delta[k]);
+            expect_eq(PacketTxCredit(&fsdio), want[k], "credit for window delta 0/1/64/127/128/255");
+        }
+        fsdio.s_TXSeq = 250; fsdio.s_MaxTXSeq = 4;
+        expect_eq(PacketTxCredit(&fsdio), 10, "250 -> 4 across the wrap: 10");
+        fsdio.s_TXSeq = 4; fsdio.s_MaxTXSeq = 250;
+        expect_eq(PacketTxCredit(&fsdio), 0, "4 -> 250: behind, no credit");
+        /* a closed window, then a control frame goes out anyway (control is
+           not credit-gated): the next number is past the window's end, which
+           the old gate read as 255 frames of credit */
+        fsdio.s_TXSeq = 20; fsdio.s_MaxTXSeq = 20;
+        expect_eq(PacketTxCredit(&fsdio), 0, "closed window: no credit");
+        mode = M_ECHO;
+        err = PacketCmdIntGet(&fsdio, 18, &v);
+        expect(err == 0 && fsdio.s_TXSeq == 21, "a control frame took 20");
+        expect_eq(PacketTxCredit(&fsdio), 0, "closed window plus control: still no data credit");
+        fsdio.s_MaxTXSeq = 0; fsdio.s_TXSeq = 0;
+    }
+
     PutStr("step 11 GETSIGNALQUALITY timeout, then a read gets through\n");
     io = frame(&f, FULL);
     WiFi_Open(io, 0, 0);
