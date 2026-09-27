@@ -1393,8 +1393,9 @@ static int Do_S2_GETNETWORKS(struct IOSana2Req *io)
 }
 
 /*
- * The firmware's own wl_cnt counters, read when the stats are asked for --
- * before and after a measurement, never inside it (#89).  The 'counters'
+ * The firmware's own wl_cnt counters, read when a caller asks for more
+ * records than the driver's own counters -- a dedicated reader, run before
+ * and after a measurement, never inside it (#89).  The 'counters'
  * iovar first (what bcmdhd and WHD read), else WLC_GET_D11CNTS (ioctl 89).
  * Version and length are reported as read.  Fields are decoded only where
  * the layout is known: version 30 and up is XTLV, and the WLC block (id
@@ -1538,9 +1539,15 @@ static int Do_S2_GETSPECIALSTATS(struct IOSana2Req *io)
     };
     const ULONG *counters = &sdio->s_StatWakes;
     ULONG n = sizeof(names) / sizeof(names[0]);
+    ULONG firstFw = &sdio->s_StatFwRoute - &sdio->s_StatWakes;
     ULONG i;
 
-    FwCountersSnapshot(unit);
+    /* Only a caller asking past the driver's own counters gets a firmware
+       read.  AmiNetXDuo's RX reader refreshes its stats with this command
+       (24 records) and NetDevStats asks for 64: neither may put control
+       traffic on the bus or wait for the firmware. */
+    if (hdr->RecordCountMax > firstFw)
+        FwCountersSnapshot(unit);
 
     if (n > hdr->RecordCountMax)
         n = hdr->RecordCountMax;
