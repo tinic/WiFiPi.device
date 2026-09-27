@@ -2303,7 +2303,8 @@ static BOOL CtrlTimerOpen(struct SDIO *sdio, struct CtrlTimer *t)
     t->ct_Req = NULL;
     t->ct_Port = CreateMsgPort();
 #ifdef WIFIPI_TEST_SEAMS
-    if (wifipi_test_fail_timer && t->ct_Port != NULL)
+    /* 1: no port; 2: timer.device refuses the open */
+    if (wifipi_test_fail_timer == 1 && t->ct_Port != NULL)
     {
         DeleteMsgPort(t->ct_Port);
         t->ct_Port = NULL;
@@ -2313,6 +2314,9 @@ static BOOL CtrlTimerOpen(struct SDIO *sdio, struct CtrlTimer *t)
         return FALSE;
     t->ct_Req = (struct timerequest *)CreateIORequest(t->ct_Port, sizeof(struct timerequest));
     if (t->ct_Req != NULL &&
+#ifdef WIFIPI_TEST_SEAMS
+        wifipi_test_fail_timer != 2 &&
+#endif
         OpenDevice((CONST_STRPTR)TIMERNAME, UNIT_MICROHZ, (struct IORequest *)t->ct_Req, 0) == 0)
         return TRUE;
     if (t->ct_Req != NULL)
@@ -2473,12 +2477,12 @@ void PacketCtrlQueue(struct SDIO *sdio, struct Message *msg)
         AddTail((struct List *)sdio->s_CtrlWaitList, &m->pm_Message.mn_Node);
     Permit();
 
-    if (abandoned)
-    {
-        FreeMem(m, m->pm_AllocSize);
-        return;
-    }
+    /* Sent even if its caller gave up: its TX sequence number is already
+       spent, and a gap would leave the firmware waiting for it.  Only its
+       reply is not waited for -- nothing on the list will match it. */
     sdio->SendPKT((APTR)&m->pm_PacketHeader[0], LE16(m->pm_PacketHeader[0].p_Length), sdio);
+    if (abandoned)
+        FreeMem(m, m->pm_AllocSize);
 }
 
 /* A control reply from the firmware.  Abandoned requests met on the way are
@@ -2492,7 +2496,8 @@ void PacketCtrlComplete(struct SDIO *sdio, struct Packet *pkt, ULONG pktLen)
     struct PacketMessage *m, *next, *chain = NULL;
     ULONG avail;
 
-    if (pktLen < (ULONG)pkt->c_DataOffset + sizeof(struct PacketCmd))
+    if (pkt->c_DataOffset < sizeof(struct Packet) ||
+        pktLen < (ULONG)pkt->c_DataOffset + sizeof(struct PacketCmd))
         return;
     cmd = (APTR)&buffer[pkt->c_DataOffset];
     avail = pktLen - pkt->c_DataOffset - sizeof(struct PacketCmd);
@@ -3030,6 +3035,7 @@ int PacketUploadCLM(struct SDIO *sdio)
         };
 
         struct UploadHeader *upload = AllocPooled(WiFiBase->w_MemPool, sizeof(struct UploadHeader) + MAX_CHUNK_LEN);
+        ULONG err = 0;
 
         if (upload)
         {
@@ -3052,7 +3058,11 @@ int PacketUploadCLM(struct SDIO *sdio)
                 upload->len = LE32(transferLen);
                 upload->crc = 0;
 
-                PacketSetVar(sdio, "clmload", upload, sizeof(struct UploadHeader) + transferLen);
+                err = PacketSetVar(sdio, "clmload", upload, sizeof(struct UploadHeader) + transferLen);
+                /* a firmware that stopped answering is not asked again, chunk
+                   after chunk, 2.5 s each (#93); its refusals are ignored as before */
+                if (PACKET_CTRL_DEAD(err))
+                    break;
 
                 dataLen -= transferLen;
                 data += transferLen;
@@ -3061,6 +3071,8 @@ int PacketUploadCLM(struct SDIO *sdio)
             } while (dataLen > 0);
 
             FreePooled(WiFiBase->w_MemPool, upload, sizeof(struct UploadHeader) + MAX_CHUNK_LEN);
+            if (PACKET_CTRL_DEAD(err))
+                return err;
         }
 
         //D(bug("[WiFi] CLM upload complete. Getting status\n"));

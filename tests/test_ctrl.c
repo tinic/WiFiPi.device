@@ -100,7 +100,9 @@ extern int wifipi_test_fail_timer;
 /* ------------------------------------------------------------------ */
 /* The helper: the receiver's control half, driven by a script        */
 
-enum { M_SUCCESS, M_FWERR, M_NOREPLY, M_LATE, M_SHORT, M_TRUNC, M_DELAY, M_SENDBLOCK, M_ECHO };
+enum { M_SUCCESS, M_FWERR, M_NOREPLY, M_LATE, M_SHORT, M_TRUNC, M_DELAY, M_SENDBLOCK, M_ECHO,
+       M_HOLD, M_WRONGCMD, M_MACONLY, M_UPDEAD, M_SHORTN };
+static volatile int shortN;
 
 static struct MinList waitList;
 static struct MsgPort * volatile ctrlPort;
@@ -108,12 +110,17 @@ static struct Task *mainTask;
 static struct Task * volatile helperTask;
 static volatile int mode, delayTicks, sendBlockTicks, sends;
 static volatile UWORD lastID;            /* raw, as on the wire */
-static volatile ULONG lastCmd;
+static volatile ULONG lastCmd, lastVal;
+static volatile UWORD sentID[64];
+static volatile ULONG sentCmd[64];
+static volatile int holdPort, modeCount;
 static volatile int sendBlockIntact;
 #define CMD_SWEEP       1
 #define CMD_LATE        2
 #define CMD_SHUTDOWN    3
 #define CMD_QUIT        4
+#define CMD_PICK        5       /* take what waits on the port now */
+#define CMD_REVERSE     6       /* answer the two held requests, newest first */
 static volatile int helperCmd;
 
 static void fake_sendpkt(UBYTE *pkt, ULONG length, struct SDIO *sdio)
@@ -121,6 +128,9 @@ static void fake_sendpkt(UBYTE *pkt, ULONG length, struct SDIO *sdio)
     (void)length; (void)sdio;
     lastCmd = *(ULONG *)(pkt + 12);                 /* raw LE, compared raw */
     lastID = *(UWORD *)(pkt + 12 + 10);
+    lastVal = *(ULONG *)(pkt + 12 + 16);
+    sentID[sends & 63] = lastID;
+    sentCmd[sends & 63] = lastCmd;
     sends++;
     if (sendBlockTicks)
     {
@@ -135,18 +145,25 @@ static void fake_sendpkt(UBYTE *pkt, ULONG length, struct SDIO *sdio)
 
 static UBYTE replyFrame[128];
 
+static void replyTo(struct SDIO *sdio, UWORD id, ULONG cmd, UWORD flags, ULONG status, ULONG dataLen, ULONG pktLen);
 static void reply(struct SDIO *sdio, UWORD flags, ULONG status, ULONG dataLen, ULONG pktLen)
+{
+    replyTo(sdio, lastID, lastCmd, flags, status, dataLen, pktLen);
+}
+
+static void replyTo(struct SDIO *sdio, UWORD id, ULONG cmd, UWORD flags, ULONG status, ULONG dataLen, ULONG pktLen)
 {
     UBYTE *c = replyFrame + 12;
     int i;
     for (i = 0; i < (int)sizeof(replyFrame); i++) replyFrame[i] = 0;
     replyFrame[7] = 12;                              /* c_DataOffset */
-    *(ULONG *)(c + 0) = lastCmd;
+    *(ULONG *)(c + 0) = cmd;
     *(ULONG *)(c + 4) = LE32(dataLen);
     *(UWORD *)(c + 8) = LE16(flags);
-    *(UWORD *)(c + 10) = lastID;
+    *(UWORD *)(c + 10) = id;
     *(ULONG *)(c + 12) = LE32(status);
     c[16] = 0x44; c[17] = 0x33; c[18] = 0x22; c[19] = 0x11;   /* LE 0x11223344 */
+    c[20] = 0x55; c[21] = 0x66; c[22] = 0x77; c[23] = 0x88;
     PacketCtrlComplete(sdio, (struct Packet *)replyFrame, pktLen);
 }
 
@@ -169,14 +186,26 @@ static void helper(void)
             if (c == CMD_SWEEP) PacketCtrlSweep(sdio);
             else if (c == CMD_LATE) reply(sdio, 0, 0, 4, 12 + 16 + 4);
             else if (c == CMD_SHUTDOWN) PacketCtrlShutdown(sdio, port);
+            else if (c == CMD_REVERSE)
+            {
+                int n = sends;
+                replyTo(sdio, sentID[(n - 1) & 63], sentCmd[(n - 1) & 63], 0, 0, 4, 12 + 16 + 4);
+                replyTo(sdio, sentID[(n - 2) & 63], sentCmd[(n - 2) & 63], 0, 0, 4, 12 + 16 + 4);
+            }
+            if (c == CMD_PICK) holdPort = 0;
             Signal(mainTask, SIGBREAKF_CTRL_E);
             if (c == CMD_QUIT) break;
         }
-        while (fsdio.s_ReceiverPort != NULL && (m = GetMsg(port)) != NULL)
+        while (!holdPort && fsdio.s_ReceiverPort != NULL && (m = GetMsg(port)) != NULL)
         {
             PacketCtrlQueue(sdio, m);
+            modeCount++;
             switch (mode)
             {
+                case M_SHORTN:   reply(sdio, 0, 0, shortN, 12 + 16 + shortN); break;
+                case M_WRONGCMD: replyTo(sdio, lastID, lastCmd ^ LE32(1), 0, 0, 4, 12 + 16 + 4); break;
+                case M_MACONLY:  if (modeCount <= 2) reply(sdio, 0, 0, 8, 12 + 16 + 8); break;
+                case M_UPDEAD:   if (!(lastCmd == LE32(2) && lastVal == LE32(1))) reply(sdio, 0, 0, 8, 12 + 16 + 8); break;
                 case M_SUCCESS: case M_ECHO: reply(sdio, 0, 0, 4, 12 + 16 + 4); break;
                 case M_FWERR:   reply(sdio, 1 /* BCDC_DCMD_ERROR */, (ULONG)-23, 0, 12 + 16); break;
                 case M_SHORT:   reply(sdio, 0, 0, 2, 12 + 16 + 2); break;
@@ -203,6 +232,13 @@ static int listEmpty(void)
 {
     return waitList.mlh_TailPred == (struct MinNode *)&waitList;
 }
+
+static struct Chip fchip;
+
+/* two more callers, for two live requests at once */
+static volatile ULONG resA, valA, resB, valB;
+static void callerA(void) { ULONG v = 0; resA = PacketCmdIntGet(&fsdio, 201, &v); valA = v; Signal(mainTask, SIGBREAKF_CTRL_D); }
+static void callerB(void) { ULONG v = 0; resB = PacketCmdIntGet(&fsdio, 202, &v); valB = v; Signal(mainTask, SIGBREAKF_CTRL_C); }
 
 /* the second caller */
 static volatile ULONG secondResult, secondValue;
@@ -243,6 +279,7 @@ int main(void)
     fsdio.s_WiFiBase = &fbase;
     fsdio.s_CtrlWaitList = &waitList;
     fsdio.SendPKT = fake_sendpkt;
+    fsdio.s_Chip = &fchip;              /* no CLM: bring-up skips the upload */
 
     PutStr("wifipi.device control requests\n");
     SetSignal(0, SIGBREAKF_CTRL_E | SIGBREAKF_CTRL_D);
@@ -310,6 +347,13 @@ int main(void)
     err = PacketCmdIntGet(&fsdio, 6, &v);
     expect_eq(err, PACKET_CTRL_SHORT, "2 of 4 bytes: short");
     expect_eq(v, 0x5a5a5a5a, "short IntGet leaves the caller's value whole, not half-written");
+    for (k = 1; k <= 3; k++)
+    {
+        mode = M_SHORTN; shortN = k; v = 0x5a5a5a5a;
+        err = PacketCmdIntGet(&fsdio, 6, &v);
+        expect(err == PACKET_CTRL_SHORT && v == 0x5a5a5a5a, "1, 2 and 3-byte IntGet replies: SHORT, value whole");
+    }
+    mode = M_SHORT;                     /* 2 bytes again for the GetVar checks */
     {
         static UBYTE buf[8];
         for (i = 0; i < 8; i++) buf[i] = 0xa5;
@@ -354,6 +398,11 @@ int main(void)
     expect_eq(err, PACKET_CTRL_NORES, "no timer: NORES");
     expect_eq(sends, k, "and nothing was sent");
     expect(listEmpty(), "or queued");
+    wifipi_test_fail_timer = 2;         /* the port is there, timer.device refuses */
+    err = PacketCmdIntGet(&fsdio, 9, &v);
+    wifipi_test_fail_timer = 0;
+    expect_eq(err, PACKET_CTRL_NORES, "timer.device refusing: NORES");
+    expect_eq(sends, k, "still nothing sent");
 
     PutStr("step 9 timeout while the receiver is sending\n");
     mode = M_SENDBLOCK; sendBlockTicks = 175;   /* 3.5 s inside SendPKT */
@@ -361,10 +410,16 @@ int main(void)
     expect_eq(err, PACKET_CTRL_TIMEOUT, "times out while being sent");
     {
         /* hand freed memory of that size back to someone and scribble on it */
-        UBYTE *probe = AllocMem(12 + 16 + 4 + 64, MEMF_PUBLIC);
-        if (probe) { for (i = 0; i < 12 + 16 + 4 + 64; i++) probe[i] = 0xee; }
+        /* one probe of each size a control block can have, so a block freed
+           too early is handed out again and scribbled on */
+        static UBYTE *probes[40];
+        for (k = 0; k < 40; k++)
+        {
+            probes[k] = AllocMem(40 + 4 * k, MEMF_PUBLIC);
+            if (probes[k]) for (i = 0; i < (int)(40 + 4 * k); i++) probes[k][i] = 0xee;
+        }
         Delay(75);                              /* SendPKT returns meanwhile */
-        if (probe) FreeMem(probe, 12 + 16 + 4 + 64);
+        for (k = 0; k < 40; k++) if (probes[k]) FreeMem(probes[k], 40 + 4 * k);
     }
     expect(sendBlockIntact, "the block stayed valid until the receiver was done with it");
     helper_cmd(CMD_SWEEP);
@@ -382,6 +437,42 @@ int main(void)
     }
     else
         expect(0, "second caller started");
+
+    PutStr("step 10b two live requests, answered out of order\n");
+    mode = M_HOLD;
+    SetSignal(0, SIGBREAKF_CTRL_D | SIGBREAKF_CTRL_C);
+    if (CreateNewProcTags(NP_Entry, (ULONG)callerA, NP_Name, (ULONG)"ctrl-A", NP_Priority, 0, TAG_DONE) != NULL &&
+        CreateNewProcTags(NP_Entry, (ULONG)callerB, NP_Name, (ULONG)"ctrl-B", NP_Priority, 0, TAG_DONE) != NULL)
+    {
+        Delay(10);                              /* both are on the list now */
+        helper_cmd(CMD_REVERSE);
+        Wait(SIGBREAKF_CTRL_D);
+        Wait(SIGBREAKF_CTRL_C);
+        expect(resA == 0 && valA == 0x11223344, "request A got its own reply");
+        expect(resB == 0 && valB == 0x11223344, "request B got its own reply");
+        expect(listEmpty(), "both off the list");
+    }
+    else
+        expect(0, "callers A and B started");
+
+    PutStr("step 10c same c_ID, other command: not a match\n");
+    mode = M_WRONGCMD; v = 0x5a5a5a5a;
+    err = PacketCmdIntGet(&fsdio, 12, &v);
+    expect_eq(err, PACKET_CTRL_TIMEOUT, "a reply for another command is not taken");
+    expect_eq(v, 0x5a5a5a5a, "and copies nothing");
+    helper_cmd(CMD_SWEEP);
+    expect(listEmpty(), "swept");
+
+    PutStr("step 10d timeout while still queued on the receiver's port\n");
+    mode = M_NOREPLY; holdPort = 1;
+    k = sends;
+    err = PacketCmdIntGet(&fsdio, 13, &v);
+    expect_eq(err, PACKET_CTRL_TIMEOUT, "times out before the receiver took it");
+    expect_eq(sends, k, "not sent yet");
+    helper_cmd(CMD_PICK);
+    helper_cmd(CMD_SWEEP);                  /* wakes the loop, which picks it up */
+    expect_eq(sends, k + 1, "sent anyway: its TX seq is spent");
+    expect(listEmpty(), "and freed, not left waiting");
 
     PutStr("step 11 GETSIGNALQUALITY timeout, then a read gets through\n");
     io = frame(&f, FULL);
@@ -420,8 +511,62 @@ int main(void)
     }
     WiFi_Close(io);
 
+    PutStr("step 13 CONFIGINTERFACE: a 4-byte cur_etheraddr fails the command\n");
+    {
+        static Frame g;
+        struct IOSana2Req *cio = frame(&g, FULL);
+        UBYTE mac0[6];
+        WiFi_Open(cio, 0, 0);
+        expect_eq(cio->ios2_Req.io_Error, 0, "open for CONFIGINTERFACE");
+        funit.wu_Flags &= ~(IFF_CONFIGURED | IFF_UP | IFF_ONLINE);
+        for (i = 0; i < 6; i++) mac0[i] = funit.wu_EtherAddr[i];
+        mode = M_ECHO;                  /* the get is answered with 4 bytes, not 6 */
+        cio->ios2_Req.io_Command = S2_CONFIGINTERFACE;
+        cio->ios2_Req.io_Flags = IOF_QUICK;
+        WiFi_BeginIO(cio);
+        expect_eq(cio->ios2_Req.io_Error, S2ERR_OUTOFSERVICE, "short cur_etheraddr fails CONFIGINTERFACE");
+        expect((funit.wu_Flags & (IFF_CONFIGURED | IFF_UP | IFF_ONLINE)) == 0, "and the unit is not taken up");
+        ok = 1; for (i = 4; i < 6; i++) if (funit.wu_EtherAddr[i] != 0) ok = 0;
+        expect(ok, "the address bytes that did not come are zeroed, not stale");
+        (void)mac0;
+        funit.wu_Flags |= IFF_UP | IFF_ONLINE | IFF_CONFIGURED;
+        WiFi_Close(cio);
+    }
+
+    PutStr("step 13b CONFIGINTERFACE: firmware silent after the address step\n");
+    {
+        static Frame g;
+        struct IOSana2Req *cio = frame(&g, FULL);
+        WiFi_Open(cio, 0, 0);
+        funit.wu_Flags &= ~(IFF_CONFIGURED | IFF_UP | IFF_ONLINE);
+        mode = M_MACONLY; modeCount = 0;
+        cio->ios2_Req.io_Command = S2_CONFIGINTERFACE;
+        cio->ios2_Req.io_Flags = IOF_QUICK;
+        t0 = NOW();
+        WiFi_BeginIO(cio);
+        t1 = NOW();
+        expect_eq(cio->ios2_Req.io_Error, S2ERR_OUTOFSERVICE, "silent firmware fails CONFIGINTERFACE");
+        expect((funit.wu_Flags & (IFF_CONFIGURED | IFF_UP | IFF_ONLINE)) == 0, "unit not taken up");
+        expect(t1 - t0 <= 150, "after one wait, not one per remaining step");
+        helper_cmd(CMD_SWEEP);
+
+        PutStr("step 13c CONFIGINTERFACE: only the final UP goes unanswered\n");
+        mode = M_UPDEAD;
+        cio->ios2_Req.io_Command = S2_CONFIGINTERFACE;
+        cio->ios2_Req.io_Flags = IOF_QUICK;
+        WiFi_BeginIO(cio);
+        expect_eq(cio->ios2_Req.io_Error, S2ERR_OUTOFSERVICE, "a lost final UP fails CONFIGINTERFACE");
+        expect((funit.wu_Flags & (IFF_CONFIGURED | IFF_UP | IFF_ONLINE)) == 0, "not reported up or online");
+        helper_cmd(CMD_SWEEP);
+
+        funit.wu_Flags |= IFF_UP | IFF_ONLINE | IFF_CONFIGURED;
+        WiFi_Close(cio);
+    }
+
     PutStr("step 12 receiver shutdown with a caller waiting\n");
     mode = M_NOREPLY;
+    err = PacketCmdIntGet(&fsdio, 14, &v);  /* leaves an abandoned entry, unswept */
+    expect(err == PACKET_CTRL_TIMEOUT && !listEmpty(), "an abandoned entry waits for the shutdown");
     {
         /* the second task waits; the receiver shuts down under it */
         secondResult = 0xffffffff;
@@ -436,6 +581,7 @@ int main(void)
             expect(t1 - t0 < 25, "at once, not at its deadline");
         }
         expect(fsdio.s_ReceiverPort == NULL && fsdio.s_CtrlWaitList == NULL, "receiver pointers cleared");
+        expect(listEmpty(), "abandoned and live entries all gone");
         err = PacketCmdIntGet(&fsdio, 11, &v);
         expect_eq(err, PACKET_CTRL_NORES, "after shutdown a request fails closed");
     }

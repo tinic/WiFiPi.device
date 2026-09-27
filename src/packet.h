@@ -173,6 +173,8 @@ int PacketGetVarMin(struct SDIO *sdio, char *varName, void *getBuffer, int getSi
 #define PACKET_CTRL_NORES       0x7fff0002
 #define PACKET_CTRL_SHORT       0x7fff0003  /* a get answered with fewer bytes than asked for */
 #define PACKET_CTRL_TIMEOUT_MS  2500    /* brcmfmac DCMD_RESP_TIMEOUT */
+/* The firmware did not answer at all (as opposed to answering an error) */
+#define PACKET_CTRL_DEAD(e)     ((ULONG)(e) == PACKET_CTRL_TIMEOUT || (ULONG)(e) == PACKET_CTRL_NORES)
 
 struct Packet;
 void PacketCtrlQueue(struct SDIO *sdio, struct Message *msg);

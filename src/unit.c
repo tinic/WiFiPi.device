@@ -221,7 +221,10 @@ void StartUnit(struct WiFiUnit *unit)
     }
 #endif
 
-    PacketGetVar(WiFiBase->w_SDIO, "cur_etheraddr", unit->wu_OrigEtherAddr, 6);
+    /* FOLLOW-UP (#93): a lost or short answer here still leaves the unit
+       STARTED with a zeroed permanent address; failing StartUnit is a wider
+       change than #93. */
+    PacketGetVarMin(WiFiBase->w_SDIO, "cur_etheraddr", unit->wu_OrigEtherAddr, 6, 6);
 
     D(bug("[WiFi.0] Ethernet addr: %02lx:%02lx:%02lx:%02lx:%02lx:%02lx\n",
         unit->wu_OrigEtherAddr[0], unit->wu_OrigEtherAddr[1], unit->wu_OrigEtherAddr[2],
@@ -605,7 +608,14 @@ static int Do_S2_SETKEY(struct IOSana2Req *io)
 
         PacketSetVar(WiFiBase->w_SDIO, "wsec_key", &key, sizeof(key));
         D(bug("[WiFi.0] Key set\n"));
-        PacketGetVar(WiFiBase->w_SDIO, "wsec", &wsec_orig, sizeof(ULONG));
+        /* The other security bits come from the firmware's current wsec: a
+           word that did not arrive whole is not OR-ed into them (#93). */
+        if (CtrlLost(PacketGetVarMin(WiFiBase->w_SDIO, "wsec", &wsec_orig, sizeof(ULONG), sizeof(ULONG))))
+        {
+            io->ios2_Req.io_Error = S2ERR_OUTOFSERVICE;
+            io->ios2_WireError = S2WERR_GENERIC_ERROR;
+            return 1;
+        }
         wsec_orig = LE32(wsec_orig);
         D(bug("[WiFi.0] Orig wsec: %08lx\n", wsec_orig));
         wsec_orig &= ~(TKIP_ENABLED | WEP_ENABLED | AES_ENABLED);
@@ -1503,6 +1513,7 @@ static int Do_S2_CONFIGINTERFACE(struct IOSana2Req *io)
     struct SDIO *sdio = WiFiBase->w_SDIO;
 
     D(bug("[WiFi.0] S2_CONFIGINTERFACE\n"));
+#define CFG_ALIVE(e) do { if (PACKET_CTRL_DEAD(e)) goto lost; } while (0)
 
     if (unit->wu_Flags & IFF_CONFIGURED)
     {
@@ -1533,15 +1544,17 @@ static int Do_S2_CONFIGINTERFACE(struct IOSana2Req *io)
 
         ULONG d11Type = 0;
         static const char * const types[]= { "UNKNOWN", "N", "AC" };
-        if (0 == PacketCmdIntGet(sdio, BRCMF_C_GET_VERSION, &d11Type))
+        err = PacketCmdIntGet(sdio, BRCMF_C_GET_VERSION, &d11Type);
+        CFG_ALIVE(err);
+        if (0 == err)
         {
             D(bug("[WiFi] D11 Version: %s\n", (ULONG)types[d11Type]));
             sdio->s_Chip->c_D11Type = d11Type;
         }
 
-        PacketUploadCLM(sdio);
+        CFG_ALIVE(PacketUploadCLM(sdio));
 
-        PacketSetVarInt(sdio, "assoc_listen", 10);
+        CFG_ALIVE(PacketSetVarInt(sdio, "assoc_listen", 10));
 
         struct JoinPrefParams jpp[2];
         jpp[0].jp_Type = JOIN_PREF_RSSI_DELTA;
@@ -1554,23 +1567,25 @@ static int Do_S2_CONFIGINTERFACE(struct IOSana2Req *io)
         jpp[1].jp_RSSIGain = 0;
         jpp[1].jp_Band = 0;
 
-        PacketSetVar(sdio, "join_pref", jpp, sizeof(jpp));
+        CFG_ALIVE(PacketSetVar(sdio, "join_pref", jpp, sizeof(jpp)));
 
         if (sdio->s_Chip->c_ChipID == BRCM_CC_43430_CHIP_ID || sdio->s_Chip->c_ChipID == BRCM_CC_4345_CHIP_ID)
         {
-            PacketCmdInt(sdio, 0x56, 0);
+            CFG_ALIVE(PacketCmdInt(sdio, 0x56, 0));
         }
         else
         {
-            PacketCmdInt(sdio, 0x56, 2);
+            CFG_ALIVE(PacketCmdInt(sdio, 0x56, 2));
         }
 
-        PacketSetVarInt(sdio, "bus:txglom", 1);
-        PacketSetVarInt(sdio, "bus:txglomalign", 4);
-        if (PacketSetVarInt(sdio, "bus:rxglom", 1) == 0)
+        CFG_ALIVE(PacketSetVarInt(sdio, "bus:txglom", 1));
+        CFG_ALIVE(PacketSetVarInt(sdio, "bus:txglomalign", 4));
+        err = PacketSetVarInt(sdio, "bus:rxglom", 1);
+        CFG_ALIVE(err);
+        if (err == 0)
         sdio->s_GlomEnabled = TRUE;
-        PacketSetVarInt(sdio, "bcn_timeout", 10);
-        PacketSetVarInt(sdio, "assoc_retry_max", 3);
+        CFG_ALIVE(PacketSetVarInt(sdio, "bcn_timeout", 10));
+        CFG_ALIVE(PacketSetVarInt(sdio, "assoc_retry_max", 3));
 
         /* Pepare event mask. Allow only events which are really needed */
         UBYTE ev_mask[(BRCMF_E_LAST + 7) / 8];
@@ -1589,23 +1604,23 @@ static int Do_S2_CONFIGINTERFACE(struct IOSana2Req *io)
         EVENT_BIT_CLEAR(ev_mask, 124);
 #undef EVENT_BIT
 
-        PacketSetVar(sdio, "event_msgs", ev_mask, (BRCMF_E_LAST + 7) / 8);
+        CFG_ALIVE(PacketSetVar(sdio, "event_msgs", ev_mask, (BRCMF_E_LAST + 7) / 8));
 
-        PacketCmdInt(sdio, BRCMF_C_SET_SCAN_CHANNEL_TIME, 40);
-        PacketCmdInt(sdio, BRCMF_C_SET_SCAN_UNASSOC_TIME, 40);
-        PacketCmdInt(sdio, BRCMF_C_SET_SCAN_PASSIVE_TIME, 120);
+        CFG_ALIVE(PacketCmdInt(sdio, BRCMF_C_SET_SCAN_CHANNEL_TIME, 40));
+        CFG_ALIVE(PacketCmdInt(sdio, BRCMF_C_SET_SCAN_UNASSOC_TIME, 40));
+        CFG_ALIVE(PacketCmdInt(sdio, BRCMF_C_SET_SCAN_PASSIVE_TIME, 120));
 
-        PacketCmdInt(sdio, BRCMF_C_UP, 0);
+        CFG_ALIVE(PacketCmdInt(sdio, BRCMF_C_UP, 0));
 
         char ver[128];
         for (int i=0; i < 128; i++) ver[i] = 0;
-        PacketGetVar(sdio, "ver", ver, 128);
+        CFG_ALIVE(PacketGetVar(sdio, "ver", ver, 128));
 
         // Remove \r and \n from version string. Replace first found with 0
         for (int i=0; i < 128; i++) { if (ver[i] == 13 || ver[i] == 10) { ver[i] = 0; break; } }
         D(bug("[WiFi.0] Firmware version: %s\n", (ULONG)ver));
 
-        PacketSetVarInt(sdio, "roam_off", 1);
+        CFG_ALIVE(PacketSetVarInt(sdio, "roam_off", 1));
 
         /* Enable TX beamforming */
         //PacketSetVarInt(sdio, "txbf", 1);
@@ -1618,12 +1633,14 @@ static int Do_S2_CONFIGINTERFACE(struct IOSana2Req *io)
         PacketSetVarInt(sdio, "toe", 0);
 #endif
 
-        PacketSetVarInt(sdio, "sup_wpa", 0);
+        CFG_ALIVE(PacketSetVarInt(sdio, "sup_wpa", 0));
 
-        PacketCmdInt(sdio, BRCMF_C_SET_INFRA, 1);
-        PacketCmdInt(sdio, BRCMF_C_SET_AP, 0);
-        PacketCmdInt(sdio, BRCMF_C_SET_PROMISC, 0);
-        PacketCmdInt(sdio, BRCMF_C_UP, 1);
+        CFG_ALIVE(PacketCmdInt(sdio, BRCMF_C_SET_INFRA, 1));
+        CFG_ALIVE(PacketCmdInt(sdio, BRCMF_C_SET_AP, 0));
+        CFG_ALIVE(PacketCmdInt(sdio, BRCMF_C_SET_PROMISC, 0));
+        /* The last step, and the one that must have happened: an interface
+           the firmware never took up is not online. */
+        CFG_ALIVE(PacketCmdInt(sdio, BRCMF_C_UP, 1));
 
         // If Network Config is already set up, attempt to connect.
         // For now, only open networks are supported
@@ -1652,6 +1669,16 @@ static int Do_S2_CONFIGINTERFACE(struct IOSana2Req *io)
     }
 
     return 1;
+
+lost:
+    /* The firmware stopped answering during bring-up: fail the command at
+       the first such step instead of waiting 2.5 s at each of the rest, and
+       do not report the unit up or online (#93).  A firmware that answers
+       with an error is still passed over as before. */
+    io->ios2_Req.io_Error = S2ERR_OUTOFSERVICE;
+    io->ios2_WireError = S2WERR_GENERIC_ERROR;
+    return 1;
+#undef CFG_ALIVE
 }
 
 static int Do_S2_OFFLINE(struct IOSana2Req *io)
