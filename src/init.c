@@ -677,7 +677,7 @@ struct WiFiBase * WiFi_Init(REGARG(struct WiFiBase *base, "d0"), REGARG(BPTR seg
 
     D(bug("[WiFi] WiFi_Init(%08lx, %08lx, %08lx)\n", (ULONG)base, seglist, (ULONG)SysBase));
 
-    /* Create mem pool for internal use */
+    /* Not task-safe: used only at init/expunge or under wu_Lock, never from the receiver (#94) */
     WiFiBase->w_MemPool = CreatePool(MEMF_ANY, 16384, 4096);
 
     WiFiBase->w_SegList = seglist;
