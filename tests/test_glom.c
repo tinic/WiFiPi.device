@@ -8,8 +8,9 @@
  * frame is a whole number of 512-byte F2 blocks.  The last frame's tail pad
  * takes the chain up to the next block, (512 - total % 512) % 512 bytes, so
  * an aligned chain gets nothing added; those bytes are zero, and the first
- * frame's hardware length covers them.  One frame goes out as before, byte
- * for byte.
+ * frame's hardware length covers them.  One frame, as Linux sends a queue of
+ * one, declares its own length and no tail pad; the transfer still runs to
+ * the next word.
  *
  * Covered: count 1, 2, 3, 4 and 32; each of the four subframe residues
  * (length % 4); a chain that is already a multiple of 512; one that spans
@@ -122,8 +123,8 @@ static void run(const char *name, UBYTE count, const UWORD *dl, UBYTE seq0)
     for (i = 0; i < count; i++)
     {
         UBYTE *f = want + off[i];
-        ULONG hl = i == 0 ? total : pl[i];
-        ULONG tp = ((-pl[i]) & 3) + (i == count - 1 ? pad : 0);
+        ULONG hl = count == 1 ? pl[0] : i == 0 ? total : pl[i];
+        ULONG tp = count == 1 ? 0 : ((-pl[i]) & 3) + (i == count - 1 ? pad : 0);
         le16(f + 0, hl);
         le16(f + 2, ~hl);
         le16(f + 4, pl[i] - 4);
@@ -165,13 +166,20 @@ static void run(const char *name, UBYTE count, const UWORD *dl, UBYTE seq0)
 
     expect_eq(sends, 1, "one SendPKT per chain");
     expect_eq(sentLen, total, "transfer length");
-    expect_eq(rd16(sent), total & 0xffff, "first hw length = chain total");
-    expect_eq(rd16(sent + 2), (~total) & 0xffff, "first hw complement");
     if (count > 1)
+    {
+        expect_eq(rd16(sent), total & 0xffff, "first hw length = chain total");
+        expect_eq(rd16(sent + 2), (~total) & 0xffff, "first hw complement");
         expect_eq(sentLen % 512, 0, "a chain is whole 512-byte blocks");
+        expect_eq(rd16(sent + off[count - 1] + 10), ((-pl[count - 1]) & 3) + pad, "last TailPad");
+    }
     else
-        expect_eq(sentLen, (pl[0] + 3) & ~3, "one frame: length as before");
-    expect_eq(rd16(sent + off[count - 1] + 10), ((-pl[count - 1]) & 3) + pad, "last TailPad");
+    {
+        expect_eq(rd16(sent), pl[0], "one frame: hw length is the frame's own");
+        expect_eq(rd16(sent + 2), (~pl[0]) & 0xffff, "one frame: hw complement");
+        expect_eq(rd16(sent + 10), 0, "one frame: no tail pad declared");
+        expect_eq(sentLen, (pl[0] + 3) & ~3, "one frame: transfer to the next word");
+    }
     expect_eq(sent[off[count - 1] + 7], 1, "last-frame flag on the last");
     for (i = 0, bad = 0; i + 1 < count; i++)
         if (sent[off[i] + 7] != 0) bad++;
