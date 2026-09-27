@@ -1552,9 +1552,16 @@ static int Do_S2_GETSPECIALSTATS(struct IOSana2Req *io)
        the reply with no deadline, and this runs in the caller's task under
        wu_Lock: on the A1200 (2026-09-27) the first 'counters' read never
        came back and every read and write of the stack queued behind the
-       lock.  The firmware records stay at route 0 until the read can be
-       bounded; the driver's own counters need no firmware traffic. */
-    (void)firstFw;
+       lock.  Until the read can be bounded the firmware records say route 0
+       and every value 0xffffffff -- unavailable, not a count of zero; the
+       driver's own counters need no firmware traffic. */
+    {
+        ULONG *fw = &sdio->s_StatWakes + firstFw;
+        ULONG last = (offsetof(struct SDIO, s_FwRaw) - offsetof(struct SDIO, s_StatWakes)) / sizeof(ULONG) + 128;
+        fw[0] = 0;                              /* route: not read */
+        for (i = firstFw + 1; i < last; i++)
+            (&sdio->s_StatWakes)[i] = FW_UNKNOWN;
+    }
 
     if (n > hdr->RecordCountMax)
         n = hdr->RecordCountMax;

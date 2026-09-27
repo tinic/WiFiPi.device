@@ -148,7 +148,7 @@ int main(void)
 
     PutStr("step 1 stack and NetDevStats queries, online, repeated\n");
     funit.wu_Flags |= IFF_UP | IFF_ONLINE;
-    fsdio.s_StatFwRoute = 0xdead;
+    fsdio.s_StatFwRoute = 0;
     for (k = 0; k < 5; k++)
     {
         r = stats(io, 24, &supplied);
@@ -161,13 +161,19 @@ int main(void)
         expect(named(&r[63], "orphans multicast"), "record 63 is the last before the firmware block");
     }
     expect((struct Message *)GetMsg(fsdio.s_ReceiverPort) == NULL, "no firmware command queued");
-    expect_eq(fsdio.s_StatFwRoute, 0xdead, "firmware counters not read");
+    expect_eq(fsdio.s_StatFwRoute, 0, "firmware counters not read (route 0)");
 
     PutStr("step 2 full reader, unit online\n");
     r = stats(io, 256, &supplied);
     expect_eq(io->ios2_Req.io_Error, 0, "256-record query answered online");
     expect_eq(supplied, 203, "all 203 records supplied online");
-    expect_eq(r[64].Count, 0xdead, "online: firmware counters not read");
+    expect_eq(r[64].Count, 0, "online: route 0, firmware not read");
+    for (k = 65; k < 203; k++)
+        if (r[k].Count != 0xffffffff)
+            break;
+    expect_eq(k, 203, "online: every firmware value reads unavailable (0xffffffff), not zero");
+    expect(named(&r[65], "fw counters error") && named(&r[72], "fw txfail"), "firmware record names in place");
+    expect(named(&r[35], "tx CMD53s failed") && named(&r[63], "orphans multicast"), "driver TX/orphan records preserved");
     expect((struct Message *)GetMsg(fsdio.s_ReceiverPort) == NULL, "online 256: no firmware command queued");
 
     PutStr("step 3 full reader, unit offline\n");
