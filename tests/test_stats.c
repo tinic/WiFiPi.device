@@ -3,8 +3,8 @@
  * is touched.  The driver's own WiFi_Open/WiFi_BeginIO/WiFi_Close are linked
  * in and called against a fake WiFiBase/WiFiUnit/SDIO.
  *
- * S2_GETSPECIALSTATS reads the firmware's wl_cnt counters only for a caller
- * asking past the driver's own records (#89).  AmiNetXDuo's RX reader asks
+ * S2_GETSPECIALSTATS never reads the firmware (#89): its wait has no
+ * deadline and runs under wu_Lock.  AmiNetXDuo's RX reader asks
  * for 24 records and NetDevStats for 64, repeatedly and on an online unit:
  * those must never queue a firmware command.  A firmware command here goes
  * to s_ReceiverPort and waits for a reply nobody sends, so a gate that let
@@ -163,13 +163,21 @@ int main(void)
     expect((struct Message *)GetMsg(fsdio.s_ReceiverPort) == NULL, "no firmware command queued");
     expect_eq(fsdio.s_StatFwRoute, 0xdead, "firmware counters not read");
 
-    PutStr("step 2 full reader, unit offline\n");
+    PutStr("step 2 full reader, unit online\n");
+    r = stats(io, 256, &supplied);
+    expect_eq(io->ios2_Req.io_Error, 0, "256-record query answered online");
+    expect_eq(supplied, 203, "all 203 records supplied online");
+    expect_eq(r[64].Count, 0xdead, "online: firmware counters not read");
+    expect((struct Message *)GetMsg(fsdio.s_ReceiverPort) == NULL, "online 256: no firmware command queued");
+
+    PutStr("step 3 full reader, unit offline\n");
+    fsdio.s_StatFwRoute = 0;
     funit.wu_Flags &= ~IFF_ONLINE;
     r = stats(io, 256, &supplied);
     expect_eq(io->ios2_Req.io_Error, 0, "256-record query answered");
     expect_eq(supplied, 203, "all 203 records supplied");
     expect(named(&r[64], "fw counters route"), "record 64 is the firmware route");
-    expect_eq(r[64].Count, 0, "offline: route 0, no firmware read");
+    expect_eq(r[64].Count, 0, "offline: route 0");
     expect(named(&r[202], "fw raw +1fc"), "record 202 is the last raw word");
     expect((struct Message *)GetMsg(fsdio.s_ReceiverPort) == NULL, "still no firmware command queued");
 

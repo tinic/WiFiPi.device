@@ -1415,7 +1415,7 @@ static UWORD le16at(const UBYTE *p) { return p[0] | (p[1] << 8); }
 _Static_assert((offsetof(struct SDIO, s_StatFwRoute) - offsetof(struct SDIO, s_StatWakes)) / sizeof(ULONG) == 64,
                "the driver's own counters are 64 records");
 
-static void FwCountersSnapshot(struct WiFiUnit *unit)
+static void __attribute__((unused)) FwCountersSnapshot(struct WiFiUnit *unit)
 {
     struct WiFiBase *WiFiBase = unit->wu_Base;
     struct SDIO *sdio = WiFiBase->w_SDIO;
@@ -1548,12 +1548,13 @@ static int Do_S2_GETSPECIALSTATS(struct IOSana2Req *io)
     const ULONG firstFw = (offsetof(struct SDIO, s_StatFwRoute) - offsetof(struct SDIO, s_StatWakes)) / sizeof(ULONG);
     ULONG i;
 
-    /* Only a caller asking past the driver's own counters gets a firmware
-       read.  AmiNetXDuo's RX reader refreshes its stats with this command
-       (24 records) and NetDevStats asks for 64: neither may put control
-       traffic on the bus or wait for the firmware. */
-    if (hdr->RecordCountMax > firstFw)
-        FwCountersSnapshot(unit);
+    /* No firmware read from here, for any caller.  PacketGetVar() waits for
+       the reply with no deadline, and this runs in the caller's task under
+       wu_Lock: on the A1200 (2026-09-27) the first 'counters' read never
+       came back and every read and write of the stack queued behind the
+       lock.  The firmware records stay at route 0 until the read can be
+       bounded; the driver's own counters need no firmware traffic. */
+    (void)firstFw;
 
     if (n > hdr->RecordCountMax)
         n = hdr->RecordCountMax;
