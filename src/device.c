@@ -150,7 +150,9 @@ static BPTR WiFi_Expunge(REGARG(struct WiFiBase * WiFiBase, "a6"))
         Remove(&WiFiBase->w_Device.dd_Library.lib_Node);
         Enable();
 
-        /* Free memory */
+        /* Free memory; wu_AssocIE is AllocVec'd, not in the pool (#94) */
+        if (WiFiBase->w_Unit != NULL && WiFiBase->w_Unit->wu_AssocIE != NULL)
+            FreeVec(WiFiBase->w_Unit->wu_AssocIE);
         DeletePool(WiFiBase->w_MemPool);
         FreeMem((APTR)((ULONG)WiFiBase - negSize), negSize + posSize);
     }

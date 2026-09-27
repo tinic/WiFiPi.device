@@ -664,15 +664,20 @@ void ProcessEvent(struct SDIO *sdio, struct PacketEvent *pe)
 
         case BRCMF_E_ASSOC:
             D(bug("[WiFi] E_ASSOC\n"));
-            if (unit->wu_AssocIE) FreeVecPooled(base->w_MemPool, unit->wu_AssocIE);
+            /* AllocVec, not w_MemPool: this is the receiver, outside wu_Lock (#94) */
+            if (unit->wu_AssocIE) FreeVec(unit->wu_AssocIE);
             unit->wu_AssocIE = NULL;
             unit->wu_AssocIELength = pe->e_DataLen;
             if (unit->wu_AssocIELength)
             {
-                unit->wu_AssocIE = AllocVecPooled(base->w_MemPool, pe->e_DataLen);
+                unit->wu_AssocIE = AllocVec(pe->e_DataLen, MEMF_ANY);
                 if (unit->wu_AssocIE != NULL)
                 {
                     CopyMem(((UBYTE*)pe) + sizeof(struct PacketEvent), unit->wu_AssocIE, pe->e_DataLen);
+                }
+                else
+                {
+                    unit->wu_AssocIELength = 0;
                 }
             }
             CopyMem(&pe->e_Address, unit->wu_JoinParams.ej_Assoc.ap_BSSID, 6);
@@ -2694,7 +2699,6 @@ void PacketSetVarAsync(struct SDIO *sdio, char *varName, const void *setBuffer, 
        while this frame is being built, and every field must agree (#96) */
     BOOL glom = sdio->s_GlomEnabled;
     struct ExecBase *SysBase = sdio->s_SysBase;
-    struct WiFiBase *WiFiBase = sdio->s_WiFiBase;
     UBYTE *pkt;
     ULONG totalLen = sizeof(struct Packet) + sizeof(struct PacketCmd) + setSize;
 
@@ -2705,9 +2709,12 @@ void PacketSetVarAsync(struct SDIO *sdio, char *varName, const void *setBuffer, 
 
     totalLen += varSize;
 
-    /* the frame is sent rounded up to 4 bytes: allocate (zeroed) that far (#97) */
+    /* the frame is sent rounded up to 4 bytes: allocate (zeroed) that far (#97);
+       AllocMem, not w_MemPool: the receiver sends these, outside wu_Lock (#94) */
     ULONG allocLen = (totalLen + 3) & ~3;
-    pkt = AllocPooledClear(WiFiBase->w_MemPool, allocLen);
+    pkt = AllocMem(allocLen, MEMF_PUBLIC | MEMF_CLEAR);
+    if (pkt == NULL)
+        return;
 
     struct PacketHeaderHW *hw = (APTR)&pkt[0];
     struct GlomHeader *gl = (APTR)&pkt[4];
@@ -2744,7 +2751,7 @@ void PacketSetVarAsync(struct SDIO *sdio, char *varName, const void *setBuffer, 
     // Async - fire the packet and forget
     sdio->SendPKT(pkt, totalLen, sdio);
 
-    FreePooled(WiFiBase->w_MemPool, pkt, allocLen);
+    FreeMem(pkt, allocLen);
 }
 
 int PacketSetVarInt(struct SDIO *sdio, char *varName, ULONG varValue)
@@ -2830,16 +2837,18 @@ void PacketCmdIntAsync(struct SDIO *sdio, ULONG cmd, ULONG cmdValue)
        while this frame is being built, and every field must agree (#96) */
     BOOL glom = sdio->s_GlomEnabled;
     struct ExecBase *SysBase = sdio->s_SysBase;
-    struct WiFiBase *WiFiBase = sdio->s_WiFiBase;
     UBYTE *pkt;
     ULONG totalLen = sizeof(struct Packet) + sizeof(struct PacketCmd) + 4;
 
     if (glom)
         totalLen += 8;
 
-    /* the frame is sent rounded up to 4 bytes: allocate (zeroed) that far (#97) */
+    /* the frame is sent rounded up to 4 bytes: allocate (zeroed) that far (#97);
+       AllocMem, not w_MemPool: the receiver sends these, outside wu_Lock (#94) */
     ULONG allocLen = (totalLen + 3) & ~3;
-    pkt = AllocPooledClear(WiFiBase->w_MemPool, allocLen);
+    pkt = AllocMem(allocLen, MEMF_PUBLIC | MEMF_CLEAR);
+    if (pkt == NULL)
+        return;
     
     struct PacketHeaderHW *hw = (APTR)&pkt[0];
     struct GlomHeader *gl = (APTR)&pkt[4];
@@ -2876,7 +2885,7 @@ void PacketCmdIntAsync(struct SDIO *sdio, ULONG cmd, ULONG cmdValue)
     // Fire packet and forget it
     sdio->SendPKT(pkt, totalLen, sdio);
 
-    FreePooled(WiFiBase->w_MemPool, pkt, allocLen);
+    FreeMem(pkt, allocLen);
 }
 
 int PacketCmdIntGet(struct SDIO *sdio, ULONG cmd, ULONG *cmdValue)
@@ -3172,6 +3181,7 @@ void StartNetworkScan(struct IOSana2Req *io)
         0x08,0x2b,0x09,0x2b,0x0a,0x2b,0x0b,0x2b,0x0c,0x2b,0x0d,0x2b,0x0e,0x2b,
         0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
     };
+    UBYTE buf[sizeof(params)];      /* the receiver's stack, not w_MemPool (#94) */
     UBYTE *data = (UBYTE*)params;
     
     D(bug("[WiFi] StartNetworkScan("));
@@ -3188,7 +3198,7 @@ void StartNetworkScan(struct IOSana2Req *io)
     if (networkName)
     {
         ULONG len = _strlen(networkName);
-        data = AllocVecPooled(base->w_MemPool, sizeof(params));
+        data = buf;
 
         if (len > 32) len = 32;
 
@@ -3206,9 +3216,6 @@ void StartNetworkScan(struct IOSana2Req *io)
 
     PacketCmdIntAsync(sdio, BRCMF_C_SET_PASSIVE_SCAN, 0);
     PacketSetVarAsync(sdio, "escan", data, sizeof(params));
-    
-    if(networkName)
-        FreeVecPooled(base->w_MemPool, data);
 }
 
 #if 0
