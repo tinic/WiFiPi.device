@@ -211,6 +211,8 @@ int main(void)
     control(&ctl_frame, CMD_FLUSH);
     expect((struct IOSana2Req *)GetMsg(read_reply) == read_io, "CMD_FLUSH returns an ordinary queued read");
     expect_eq(read_io->ios2_Req.io_Error, IOERR_ABORTED, "flushed read reports aborted");
+    control(&ctl_frame, CMD_FLUSH);
+    expect((struct IOSana2Req *)GetMsg(read_reply) == NULL, "a second CMD_FLUSH returns it no second time");
 
     PutStr("step 4 S2_OFFLINE returns a queued read\n");
     read_io = read_on(&read_frame, opener, read_reply);
@@ -219,6 +221,8 @@ int main(void)
     expect((struct IOSana2Req *)GetMsg(read_reply) == read_io, "S2_OFFLINE returns an ordinary queued read");
     expect_eq(read_io->ios2_Req.io_Error, S2ERR_OUTOFSERVICE, "offline read reports out of service");
     expect_eq(read_io->ios2_WireError, S2WERR_UNIT_OFFLINE, "offline read reports unit offline");
+    control(&ctl_frame, S2_OFFLINE);
+    expect((struct IOSana2Req *)GetMsg(read_reply) == NULL, "a second S2_OFFLINE returns it no second time");
 
     PutStr("step 5 offline unit refuses a new read\n");
     read_io = read_on(&read_frame, opener, read_reply);
@@ -232,6 +236,7 @@ int main(void)
     expect((read_io->ios2_Req.io_Flags & IOF_QUICK) == 0, "online unit queues a read again");
     control(&ctl_frame, CMD_FLUSH);
     expect((struct IOSana2Req *)GetMsg(read_reply) == read_io, "and CMD_FLUSH returns it");
+    expect((struct IOSana2Req *)GetMsg(read_reply) == NULL, "exactly once");
 
     PutStr("step 7 full Close\n");
     WiFi_Close(io);
