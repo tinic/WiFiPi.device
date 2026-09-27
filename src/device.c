@@ -227,6 +227,19 @@ void WiFi_Open(REGARG(struct IOSana2Req * io, "a1"), REGARG(LONG unitNumber, "d0
     tags = io->ios2_BufferManagement;
     io->ios2_BufferManagement = NULL;
 
+    /* Start the unit before anything is taken: a unit that cannot start fails
+       the open with nothing changed (#95).  StartUnit waits for the firmware,
+       which breaks exec's Forbid, so another open may run meanwhile; the
+       sharing check below therefore comes after it, and from there to AddTail
+       nothing waits.  Two opens may both run StartUnit, and an open may start
+       the unit and then be refused as busy (limited openers hold it): either
+       way the unit is left started with its whole address, which is right. */
+    if (error == 0 && !(unit->wu_Flags & IFF_STARTED))
+    {
+        if (!StartUnit(unit))
+            error = IOERR_OPENFAIL;
+    }
+
     /* Device sharing */
     if (error == 0)
     {
@@ -327,12 +340,6 @@ void WiFi_Open(REGARG(struct IOSana2Req * io, "a1"), REGARG(LONG unitNumber, "d0
         AddTail((APTR)&unit->wu_Openers, (APTR)opener);
         unit->wu_FreshOpenReqs++;
         Enable();
-
-        /* Start unit here? */
-        if (!(unit->wu_Flags & IFF_STARTED))
-        {
-            StartUnit(unit);
-        }
     }
 
     D(bug("[WiFi] WiFi_Open ends with status %ld\n", error));

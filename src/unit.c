@@ -196,7 +196,7 @@ void UnitTask(struct WiFiUnit *unit, struct Task *parent)
     unit->wu_Task = NULL;
 }
 
-void StartUnit(struct WiFiUnit *unit)
+BOOL StartUnit(struct WiFiUnit *unit)
 {
     struct WiFiBase *WiFiBase = unit->wu_Base;
     struct ExecBase *SysBase = WiFiBase->w_SysBase;
@@ -222,11 +222,18 @@ void StartUnit(struct WiFiUnit *unit)
 #endif
 
     /* The permanent address is taken only whole, and a unit whose firmware
-       did not give it is not marked started: the next open tries again (#93). */
+       did not give it is not marked started: the open fails and the next one
+       tries again (#93, #95).  The wait broke the opener's Forbid: a
+       concurrent open may have started the unit, and configured it,
+       meanwhile.  Then the unit is usable whatever this reply was, so it is
+       left be and the open goes on. */
     {
         UBYTE addr[6];
-        if (PacketGetVarMin(WiFiBase->w_SDIO, "cur_etheraddr", addr, 6, 6) != 0)
-            return;
+        LONG err = PacketGetVarMin(WiFiBase->w_SDIO, "cur_etheraddr", addr, 6, 6);
+        if (unit->wu_Flags & IFF_STARTED)
+            return TRUE;
+        if (err != 0)
+            return FALSE;
         CopyMem(addr, unit->wu_OrigEtherAddr, 6);
     }
 
@@ -238,6 +245,7 @@ void StartUnit(struct WiFiUnit *unit)
     _bzero(unit->wu_EtherAddr, 6);
     
     unit->wu_Flags |= IFF_STARTED;
+    return TRUE;
 }
 
 void StartUnitTask(struct WiFiUnit *unit)

@@ -326,7 +326,7 @@ STRPTR _strncpy(STRPTR dst, CONST_STRPTR src, ULONG len);
 STRPTR _strcpy(STRPTR dst, CONST_STRPTR src);
 int _strcmp(CONST_STRPTR s1, CONST_STRPTR s2);
 int _strncmp(CONST_STRPTR s1, CONST_STRPTR s2, ULONG n);
-void StartUnit(struct WiFiUnit *unit);
+BOOL StartUnit(struct WiFiUnit *unit);
 void StartUnitTask(struct WiFiUnit *unit);
 void HandleRequest(struct IOSana2Req *io);
 APTR AllocPooledClear(APTR pool, ULONG byteSize);
