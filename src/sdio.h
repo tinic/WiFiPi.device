@@ -329,6 +329,47 @@ struct SDIO {
     ULONG               s_StatMbFC;         // mailbox words with HMB_DATA_FC
     ULONG               s_StatFCChanges;    // flow-control mask changes in frame headers
     ULONG               s_StatFCLast;       // the last flow-control mask
+    ULONG               s_StatTxCmdFail;    // failed tx CMD53s, any phase; a send issues 1-2 (#89)
+    ULONG               s_StatTxCmdFailCmd; //   at command complete
+    ULONG               s_StatTxCmdFailData;//   waiting for a data block
+    ULONG               s_StatTxCmdFailXfer;//   at transfer complete
+    ULONG               s_StatTxSplit;      // sends issued as a block CMD53 plus a remainder CMD53
+    ULONG               s_StatTxFailBlock;  //   of them, the block part failed
+    ULONG               s_StatTxFailRem;    //   of them, the remainder part failed
+    ULONG               s_StatWrOOSync;     // intstatus I_WR_OOSYNC seen
+    ULONG               s_StatRdOOSync;     // intstatus I_RD_OOSYNC seen
+    ULONG               s_StatWinFromSub;   // TX window changed by a glom subframe header (brcmf ignores those)
+    ULONG               s_StatWinSuperDiff; // superframe header window != the window its subframes left
+    ULONG               s_StatWinBogus;     // window more than 0x40 ahead of TX seq (brcmf clamps to seq + 2)
+    ULONG               s_StatWinBackward;  // window moved backward, modulo 256
+    ULONG               s_StatTxOverCredit; // data gloms sent with more than 0x40 credit
+    ULONG               s_StatOCLastSeq;    //   the last one's TX seq
+    ULONG               s_StatOCLastMax;    //   the last one's window
+    ULONG               s_StatOCLastCount;  //   the last one's subframe count
+    ULONG               s_StatCtrlNoCredit; // control frames sent outside the TX window
+    ULONG               s_StatTxGlom1;      // data gloms of 1 subframe
+    ULONG               s_StatTxGlom2;      //   2-3
+    ULONG               s_StatTxGlom4;      //   4-7
+    ULONG               s_StatTxGlom8;      //   8-15
+    ULONG               s_StatTxGlom16;     //   16-32
+    ULONG               s_StatOrphanIPv4;   // orphans (UnknownTypes) by EtherType: IPv4
+    ULONG               s_StatOrphanARP;    //   ARP
+    ULONG               s_StatOrphanIPv6;   //   IPv6
+    ULONG               s_StatOrphanEAPOL;  //   EAPOL
+    ULONG               s_StatOrphanOther;  //   anything else, 802.3 included
+    ULONG               s_StatOrphanMcast;  //   multicast/broadcast destination, any type
+    ULONG               s_StatFwRoute;      // firmware counters: 1 'counters' iovar, 2 ioctl 89, 0 not online, 255 both refused
+    ULONG               s_StatFwError;      //   the last refusal's firmware error
+    ULONG               s_StatFwVersion;    //   wl_cnt version (u16 at offset 0)
+    ULONG               s_StatFwLength;     //   wl_cnt length (u16 at offset 2)
+    ULONG               s_StatFwTxFrame;    //   decoded where the version is known, else 0xffffffff
+    ULONG               s_StatFwTxRetrans;
+    ULONG               s_StatFwTxError;
+    ULONG               s_StatFwTxNoBuf;
+    ULONG               s_StatFwTxFail;
+    ULONG               s_StatFwTxRetry;
+    ULONG               s_StatFwTxNoAck;
+    ULONG               s_FwRaw[128];       //   the first 512 bytes as read, big-endian words
     ULONG               s_LastRxHdr[4];     // the previous frame's first 16 bytes
 
     /* The card interrupt: a server on the GIC through gic400.library */
@@ -353,6 +394,7 @@ struct SDIO {
     UBYTE               s_RXSeq;
     UBYTE               s_RXSeqValid;       // s_RXSeq holds the next expected rx sequence
     UBYTE               s_LastFailPhase;    // where the last failed command stopped: 1 cmd, 2 data, 3 xfer
+    UBYTE               s_InGlomSub;        // the receiver is handling glom subframes
     UWORD               s_CmdID;
     UWORD               s_CtrlQuarantine[32]; // control IDs given up on: not issued again while here (#93)
     UBYTE               s_CtrlQuarantineNext;

@@ -1493,6 +1493,98 @@ static int Do_S2_GETNETWORKS(struct IOSana2Req *io)
     return 0;
 }
 
+/*
+ * The firmware's own wl_cnt counters, read when the stats are asked for --
+ * before and after a measurement, never inside it (#89).  The 'counters'
+ * iovar first (what bcmdhd and WHD read), else WLC_GET_D11CNTS (ioctl 89).
+ * Version and length are reported as read.  Fields are decoded only where
+ * the layout is known: version 30 and up is XTLV, and the WLC block (id
+ * 0x100) is taken at WHD's wl_cnt_wlc_t offsets; versions 6-11 are the
+ * legacy wl_cnt_t, whose first fields are fixed.  Anything else reads
+ * 0xffffffff, and the first 512 bytes are always kept raw.
+ */
+#define FW_CNT_BUF      2048
+#define FW_UNKNOWN      0xffffffff
+
+static ULONG le32at(const UBYTE *p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((ULONG)p[3] << 24); }
+static UWORD le16at(const UBYTE *p) { return p[0] | (p[1] << 8); }
+
+static void FwCountersSnapshot(struct WiFiUnit *unit)
+{
+    struct WiFiBase *WiFiBase = unit->wu_Base;
+    struct SDIO *sdio = WiFiBase->w_SDIO;
+    ULONG *f = &sdio->s_StatFwTxFrame;
+    UBYTE *buf;
+    int err;
+    ULONG i;
+
+    for (i = 0; i < 7; i++)
+        f[i] = FW_UNKNOWN;
+
+    if ((unit->wu_Flags & IFF_ONLINE) == 0)
+    {
+        sdio->s_StatFwRoute = 0;
+        return;
+    }
+    buf = AllocVecPooledClear(WiFiBase->w_MemPool, FW_CNT_BUF);
+    if (buf == NULL)
+        return;
+
+    /* Bounded (#93: 2.5 s) and capped at 1518 BCDC bytes sent (#89); no
+       WLC_GET_D11CNTS fallback.  An error or a lost reply leaves every
+       record unavailable, and says which in route/error. */
+    err = PacketGetVarMin(sdio, "counters", buf, FW_CNT_BUF, 0);
+    sdio->s_StatFwRoute = 1;
+    if (err != 0)
+    {
+        sdio->s_StatFwError = err;
+        sdio->s_StatFwRoute = 255;
+    }
+
+    if (err == 0)
+    {
+        UWORD version = le16at(buf);
+        UWORD length = le16at(buf + 2);
+
+        sdio->s_StatFwVersion = version;
+        sdio->s_StatFwLength = length;
+        for (i = 0; i < 128; i++)
+            sdio->s_FwRaw[i] = *(ULONG *)(buf + 4 * i);
+
+        if (version >= 30)
+        {
+            ULONG pos = 4, end = 4 + length;
+            if (end > FW_CNT_BUF)
+                end = FW_CNT_BUF;
+            while (pos + 4 <= end)
+            {
+                UWORD id = le16at(buf + pos), xlen = le16at(buf + pos + 2);
+                const UBYTE *d = buf + pos + 4;
+                if (id == 0x100 && xlen >= 228 && pos + 4 + xlen <= end)
+                {
+                    f[0] = le32at(d + 0);       /* txframe */
+                    f[1] = le32at(d + 8);       /* txretrans */
+                    f[2] = le32at(d + 12);      /* txerror */
+                    f[3] = le32at(d + 28);      /* txnobuf */
+                    f[4] = le32at(d + 200);     /* txfail */
+                    f[5] = le32at(d + 204);     /* txretry */
+                    f[6] = le32at(d + 224);     /* txnoack */
+                    break;
+                }
+                pos += 4 + ((xlen + 3) & ~3);
+            }
+        }
+        else if (version >= 6 && version <= 11)
+        {
+            f[0] = le32at(buf + 4);             /* txframe */
+            f[1] = le32at(buf + 12);            /* txretrans */
+            f[2] = le32at(buf + 16);            /* txerror */
+            f[3] = le32at(buf + 32);            /* txnobuf */
+        }
+    }
+    FreeVecPooled(WiFiBase->w_MemPool, buf);
+}
+
 /* The receiver task's counters (struct SDIO s_Stat*), one record each */
 static int Do_S2_GETSPECIALSTATS(struct IOSana2Req *io)
 {
@@ -1510,11 +1602,41 @@ static int Do_S2_GETSPECIALSTATS(struct IOSana2Req *io)
         "headers repeating the last", "garbage headers", "glom subframe errors", "drains at the frame cap",
         "rx sequence mismatches", "  ahead 1", "  ahead 2-7", "  ahead 8-63", "  ahead 64-191",
         "  ahead 192-254", "  behind 1 (repeat?)", "mailbox NAK handled", "mailbox firmware halt",
-        "mailbox flow control", "flow-control mask changes", "flow-control mask (last)"
+        "mailbox flow control", "flow-control mask changes", "flow-control mask (last)",
+        "tx CMD53s failed", "  at command", "  at data", "  at transfer end", "sends split block+remainder", "  block part failed",
+        "  remainder part failed", "intstatus WR_OOSYNC", "intstatus RD_OOSYNC", "TX window from a subframe", "superframe window differs", "TX window > 0x40 ahead",
+        "TX window moved back", "data gloms over 0x40 credit", "  last: TX seq", "  last: window", "  last: subframes", "control sent without credit",
+        "TX gloms of 1", "TX gloms of 2-3", "TX gloms of 4-7", "TX gloms of 8-15", "TX gloms of 16-32", "orphans IPv4",
+        "orphans ARP", "orphans IPv6", "orphans EAPOL", "orphans other", "orphans multicast", "fw counters route",
+        "fw counters error", "fw counters version", "fw counters length", "fw txframe", "fw txretrans", "fw txerror",
+        "fw txnobuf", "fw txfail", "fw txretry", "fw txnoack", "fw raw +000", "fw raw +004",
+        "fw raw +008", "fw raw +00c", "fw raw +010", "fw raw +014", "fw raw +018", "fw raw +01c",
+        "fw raw +020", "fw raw +024", "fw raw +028", "fw raw +02c", "fw raw +030", "fw raw +034",
+        "fw raw +038", "fw raw +03c", "fw raw +040", "fw raw +044", "fw raw +048", "fw raw +04c",
+        "fw raw +050", "fw raw +054", "fw raw +058", "fw raw +05c", "fw raw +060", "fw raw +064",
+        "fw raw +068", "fw raw +06c", "fw raw +070", "fw raw +074", "fw raw +078", "fw raw +07c",
+        "fw raw +080", "fw raw +084", "fw raw +088", "fw raw +08c", "fw raw +090", "fw raw +094",
+        "fw raw +098", "fw raw +09c", "fw raw +0a0", "fw raw +0a4", "fw raw +0a8", "fw raw +0ac",
+        "fw raw +0b0", "fw raw +0b4", "fw raw +0b8", "fw raw +0bc", "fw raw +0c0", "fw raw +0c4",
+        "fw raw +0c8", "fw raw +0cc", "fw raw +0d0", "fw raw +0d4", "fw raw +0d8", "fw raw +0dc",
+        "fw raw +0e0", "fw raw +0e4", "fw raw +0e8", "fw raw +0ec", "fw raw +0f0", "fw raw +0f4",
+        "fw raw +0f8", "fw raw +0fc", "fw raw +100", "fw raw +104", "fw raw +108", "fw raw +10c",
+        "fw raw +110", "fw raw +114", "fw raw +118", "fw raw +11c", "fw raw +120", "fw raw +124",
+        "fw raw +128", "fw raw +12c", "fw raw +130", "fw raw +134", "fw raw +138", "fw raw +13c",
+        "fw raw +140", "fw raw +144", "fw raw +148", "fw raw +14c", "fw raw +150", "fw raw +154",
+        "fw raw +158", "fw raw +15c", "fw raw +160", "fw raw +164", "fw raw +168", "fw raw +16c",
+        "fw raw +170", "fw raw +174", "fw raw +178", "fw raw +17c", "fw raw +180", "fw raw +184",
+        "fw raw +188", "fw raw +18c", "fw raw +190", "fw raw +194", "fw raw +198", "fw raw +19c",
+        "fw raw +1a0", "fw raw +1a4", "fw raw +1a8", "fw raw +1ac", "fw raw +1b0", "fw raw +1b4",
+        "fw raw +1b8", "fw raw +1bc", "fw raw +1c0", "fw raw +1c4", "fw raw +1c8", "fw raw +1cc",
+        "fw raw +1d0", "fw raw +1d4", "fw raw +1d8", "fw raw +1dc", "fw raw +1e0", "fw raw +1e4",
+        "fw raw +1e8", "fw raw +1ec", "fw raw +1f0", "fw raw +1f4", "fw raw +1f8", "fw raw +1fc"
     };
     const ULONG *counters = &sdio->s_StatWakes;
     ULONG n = sizeof(names) / sizeof(names[0]);
     ULONG i;
+
+    FwCountersSnapshot(unit);
 
     if (n > hdr->RecordCountMax)
         n = hdr->RecordCountMax;

@@ -760,6 +760,45 @@ void ProcessEvent(struct SDIO *sdio, struct PacketEvent *pe)
     }
 }
 
+/*
+ * TX credit, observed only (#89).  Every header this driver handles sets the
+ * window (s_MaxTXSeq), glom subframes included, and the data path takes
+ * maxCount = window - seq modulo 256 as credit.  brcmf_sdio_hdparse() takes
+ * the window only from a plain or superframe header, clamps one more than
+ * 0x40 ahead to seq + 2, and brcmf_sdio_readframes() sends only while
+ * (window - seq) & 0x80 is clear.  These count where the two would differ.
+ */
+static void TxWindowAccount(struct SDIO *sdio, UBYTE window)
+{
+    if (sdio->s_InGlomSub && window != sdio->s_MaxTXSeq)
+        sdio->s_StatWinFromSub++;
+    if ((UBYTE)(window - sdio->s_TXSeq) > 0x40)
+        sdio->s_StatWinBogus++;
+    if ((UBYTE)(window - sdio->s_MaxTXSeq) & 0x80)
+        sdio->s_StatWinBackward++;
+}
+
+static void TxGlomAccount(struct SDIO *sdio, ULONG count, BOOL overCredit)
+{
+    if (count <= 1)
+        sdio->s_StatTxGlom1++;
+    else if (count < 4)
+        sdio->s_StatTxGlom2++;
+    else if (count < 8)
+        sdio->s_StatTxGlom4++;
+    else if (count < 16)
+        sdio->s_StatTxGlom8++;
+    else
+        sdio->s_StatTxGlom16++;
+    if (overCredit)
+    {
+        sdio->s_StatTxOverCredit++;
+        sdio->s_StatOCLastSeq = sdio->s_TXSeq;
+        sdio->s_StatOCLastMax = sdio->s_MaxTXSeq;
+        sdio->s_StatOCLastCount = count;
+    }
+}
+
 ULONG ProcessPacket(struct SDIO *sdio, struct Packet *pkt)
 {
     UBYTE *buffer = (UBYTE*)pkt;
@@ -774,6 +813,7 @@ ULONG ProcessPacket(struct SDIO *sdio, struct Packet *pkt)
     if (pktLen != (~pktChk & 0xffff)) return 0xffffffff;
 
     /* Update max sequence number at transfer */
+    TxWindowAccount(sdio, pkt->c_MaxSeq);
     sdio->s_MaxTXSeq = pkt->c_MaxSeq;
 
     switch(pkt->c_ChannelFlag)
@@ -1208,6 +1248,7 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
             UBYTE maxCount;
 
             maxCount = PacketTxCredit(sdio);
+            BOOL overCredit = (UBYTE)(sdio->s_MaxTXSeq - sdio->s_TXSeq) > 0x40;
             
             /* Make sure we have place in TX */
             if (maxCount == 0)
@@ -1244,6 +1285,7 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
                             ReplyMsg((struct Message *)ioList[i]);
                         }
                         */
+                        TxGlomAccount(sdio, ioCount, overCredit);
                         SendGlomDataPacket(sdio, ioList, ioCount);
                         ioCount = 0;
                     }
@@ -1263,6 +1305,7 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
                 {
                     //D(bug("[WiFi] Glom frame would do, there are %ld entries in queue\n", ioCount));
                     // More items? Construct glom frame
+                    TxGlomAccount(sdio, ioCount, overCredit);
                     SendGlomDataPacket(sdio, ioList, ioCount);
                     /*
                     for (ULONG i=0; i < ioCount; i++)
@@ -1424,8 +1467,10 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
                             else
                             {
                                 ULONG pos = pkt->c_DataOffset;
+                                UBYTE superWindow = pkt->c_MaxSeq;
 
                                 RxSeqAccount(sdio, pkt, RX_SEQ_SHARE);
+                                sdio->s_InGlomSub = 1;
 
                                 while(pos < pktLen)
                                 {
@@ -1451,6 +1496,9 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
                                         pos = (pos + 3) & ~3;
                                     }
                                 }
+                                sdio->s_InGlomSub = 0;
+                                if (superWindow != sdio->s_MaxTXSeq)
+                                    sdio->s_StatWinSuperDiff++;
                             }
                         }
                         else
@@ -1893,6 +1941,18 @@ void ProcessDataPacket(struct SDIO *sdio, UBYTE *packet, ULONG packetLength)
         if (orphan)
         {
             unit->wu_Stats.UnknownTypesReceived++;
+            if (packetType == 0x0800)
+                sdio->s_StatOrphanIPv4++;
+            else if (packetType == 0x0806)
+                sdio->s_StatOrphanARP++;
+            else if (packetType == 0x86dd)
+                sdio->s_StatOrphanIPv6++;
+            else if (packetType == 0x888e)
+                sdio->s_StatOrphanEAPOL++;
+            else
+                sdio->s_StatOrphanOther++;
+            if (packet[0] & 1)
+                sdio->s_StatOrphanMcast++;
 
             Disable();
             /* Go through all openers and offer orphan packet to anyone asking */
@@ -2618,6 +2678,12 @@ void PacketCtrlQueue(struct SDIO *sdio, struct Message *msg)
     /* Numbered here, as it goes out, by the only task that numbers frames:
        data gloms and the scan requests are numbered by this task at send
        too, so the numbers leave in order (brcmf_sdio_tx_ctrlframe). */
+    {
+        /* #89 diagnostic: a control frame sent with no TX credit */
+        UBYTE room = (UBYTE)(sdio->s_MaxTXSeq - sdio->s_TXSeq);
+        if (room == 0 || (room & 0x80))
+            sdio->s_StatCtrlNoCredit++;
+    }
     ((UBYTE *)&m->pm_PacketHeader[0])[m->pm_SeqOff] = sdio->s_TXSeq++;
     sdio->SendPKT((APTR)&m->pm_PacketHeader[0], LE16(m->pm_PacketHeader[0].p_Length), sdio);
 }
