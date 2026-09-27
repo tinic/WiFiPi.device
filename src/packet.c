@@ -857,6 +857,78 @@ ULONG ProcessPacket(struct SDIO *sdio, struct Packet *pkt)
 int SendGlomDataPacket(struct SDIO *sdio, struct IOSana2Req **ioList, UBYTE count);
 
 /*
+ * Receive-path counters for #89, read back through S2_GETSPECIALSTATS.
+ * They change nothing the receiver does.
+ *
+ * SDPCM rx sequence, numbered the way brcmf_sdio_readframes() and
+ * brcmf_sdio_rxglom() number it: a plain frame, a glom descriptor and each
+ * glom subframe take one number; a superframe header shares its number
+ * with the first subframe.  A mismatch goes into a histogram of how far
+ * ahead (modulo 256) the frame is; behind by one is kept apart as a
+ * possible repeat, not a confirmed one.
+ *
+ * s_RXSeq is this diagnostic's expected number and nothing else reads it.
+ * On a mismatch it resyncs to what arrived (a superframe header: that
+ * number; anything else: that number + 1), so one event counts once.  Linux
+ * does not resync inside a glom -- a bad subframe there leaves the rest of
+ * the glom counted against the old number -- so a glom with a gap counts
+ * once here and possibly several times in brcmf's rx_badseq.
+ */
+enum { RX_SEQ_CONSUME, RX_SEQ_SHARE };
+
+static void RxSeqAccount(struct SDIO *sdio, const struct Packet *pkt, int mode)
+{
+    UBYTE seq = pkt->c_Seq;
+
+    if (sdio->s_RXSeqValid)
+    {
+        UBYTE d = (UBYTE)(seq - sdio->s_RXSeq);
+
+        if (d != 0)
+        {
+            sdio->s_StatRxBadSeq++;
+            if (d == 1)
+                sdio->s_StatRxSeqD1++;
+            else if (d < 8)
+                sdio->s_StatRxSeqD2++;
+            else if (d < 64)
+                sdio->s_StatRxSeqD8++;
+            else if (d < 192)
+                sdio->s_StatRxSeqD64++;
+            else if (d < 255)
+                sdio->s_StatRxSeqD192++;
+            else
+                sdio->s_StatRxSeqBack1++;
+        }
+    }
+    sdio->s_RXSeq = (mode == RX_SEQ_CONSUME) ? (UBYTE)(seq + 1) : seq;
+    sdio->s_RXSeqValid = 1;
+}
+
+/* A frame header as it came off the card, before the frame is handled: the
+   flow-control mask it carries (brcmf reads it from every header but a
+   subframe's), and whether its first 16 bytes repeat the previous frame's
+   -- what a failed header read leaves behind in the receive buffer. */
+static void RxHeaderAccount(struct SDIO *sdio, const UBYTE *buffer)
+{
+    const struct Packet *pkt = (const struct Packet *)buffer;
+    const ULONG *hdr = (const ULONG *)buffer;
+    ULONG *last = sdio->s_LastRxHdr;
+
+    if (pkt->c_FlowControl != sdio->s_StatFCLast)
+    {
+        sdio->s_StatFCChanges++;
+        sdio->s_StatFCLast = pkt->c_FlowControl;
+    }
+    if (hdr[0] == last[0] && hdr[1] == last[1] && hdr[2] == last[2] && hdr[3] == last[3])
+        sdio->s_StatRxStaleHdr++;
+    last[0] = hdr[0];
+    last[1] = hdr[1];
+    last[2] = hdr[2];
+    last[3] = hdr[3];
+}
+
+/*
  * THE POLLER.  On Emu68 every interrupt costs ~20 us of exception entry
  * and the WLAN host's line is not to be had anyway (it is the SD card's,
  * see sdio_int_attach); a timer tick sees a frame up to a millisecond late.
@@ -1355,6 +1427,8 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
                 
                     if ((pktChk | pktLen) == 0xffff)
                     {
+                        RxHeaderAccount(sdio, buffer);
+
                         // Until now we have fetched PACKET_INITIAL_FETCH_SIZE bytes only. If packet length is larger, fetch 
                         // the rest now
                         if (pktLen > PACKET_INITIAL_FETCH_SIZE)
@@ -1367,10 +1441,13 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
                             if (pkt->c_ChannelFlag & 0x80)
                             {
                                 // Announcment of large frame
+                                RxSeqAccount(sdio, pkt, RX_SEQ_CONSUME);
                             }
                             else
                             {
                                 ULONG pos = pkt->c_DataOffset;
+
+                                RxSeqAccount(sdio, pkt, RX_SEQ_SHARE);
 
                                 while(pos < pktLen)
                                 {
@@ -1386,10 +1463,12 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
                                     else if (processed == 0xffffffff)
                                     {
                                         D(bug("[WiFi] Frame error\n"));
+                                        sdio->s_StatRxGlomErr++;
                                         break;
                                     }
                                     else
                                     {
+                                        RxSeqAccount(sdio, epkt, RX_SEQ_CONSUME);
                                         pos += processed;
                                         pos = (pos + 3) & ~3;
                                     }
@@ -1398,6 +1477,7 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
                         }
                         else
                         {
+                            RxSeqAccount(sdio, pkt, RX_SEQ_CONSUME);
                             ProcessPacket(sdio, pkt);
                         }
 
@@ -1406,6 +1486,7 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
                     }
                     else
                     {
+                        sdio->s_StatRxGarbage++;
                         D(bug("[WiFi.RECV] Garbage received. Data:\n"));
                         for (int i=0; i < 256; i++)
                         {
@@ -1418,7 +1499,10 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
                     }
 
                     if (++burst >= 64)
+                    {
+                        sdio->s_StatRxBurstCap++;
                         break;
+                    }
                     sdio->RecvPKT(buffer, PACKET_INITIAL_FETCH_SIZE, sdio);
                     if (LE16(pkt->p_Length) == 0)
                         break;
