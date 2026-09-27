@@ -823,14 +823,16 @@ int SendGlomDataPacket(struct SDIO *sdio, struct IOSana2Req **ioList, UBYTE coun
 /*
  * Frames per TX superframe (AmiNetXDuo #89).  With three or more subframes in
  * one CMD53, the first of two same-flow pure TCP ACKs at the head of the
- * superframe was accepted by the bus and never transmitted: 21/21 in a traced
- * run, while identically framed 12-byte UDP pairs in the same run lost 0/153.
- * At two, the same workload lost 0.40% of ACKs instead of 2.94%, with the same
- * receive throughput.  Only the flush point changes: credit, sequence numbers
- * and the subframe build are as before.  Overridable, 1..32, at compile time.
+ * superframe was not seen at the peer: 21/21 in a traced run, while
+ * identically framed 12-byte UDP pairs in the same run lost 0/153.  Built with
+ * -DWIFIPI_TX_MAX_GLOM=2, the same workload lost 0.40% of ACKs instead of
+ * 2.94%, with the same receive throughput.  Where the frames are lost (dongle
+ * or AP) is not established.  The default stays 32 until the upload
+ * throughput A/B is in; only the flush point changes, credit, sequence
+ * numbers and the subframe build are as before.  1..32.
  */
 #ifndef WIFIPI_TX_MAX_GLOM
-#define WIFIPI_TX_MAX_GLOM 2
+#define WIFIPI_TX_MAX_GLOM 32
 #endif
 #if WIFIPI_TX_MAX_GLOM < 1 || WIFIPI_TX_MAX_GLOM > 32
 #error WIFIPI_TX_MAX_GLOM must be 1..32 (ioList holds 32)
