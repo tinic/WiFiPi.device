@@ -19,7 +19,9 @@
  *   - SET at exactly 1518 BCDC bytes sent whole, one byte more refused with
  *     PACKET_CTRL_TOOBIG, nothing sent, not a dead link; negative and huge
  *     sizes refused; the async SET the same, silently;
- *   - a mcast_list SET of 249 groups (the size UpdateMCastList sends) refused.
+ *   - a mcast_list SET of 249 groups refused, and the caller: 247 groups
+ *     through S2_ADDMULTICASTADDRESSES sent with allmulti off, 248 (one byte
+ *     over) not sent and allmulti on.
  */
 #include <exec/exec.h>
 #include <exec/io.h>
@@ -73,6 +75,10 @@ static void expect_eq(LONG got, LONG want, const char *what)
     PutStr("FAIL "); PutStr(what); PutStr(": got "); num(got); PutStr(", want "); num(want); PutStr("\n");
 }
 
+void  WiFi_Open(REGARG(struct IOSana2Req *io, "a1"), REGARG(LONG unitNumber, "d0"), REGARG(ULONG flags, "d1"));
+ULONG WiFi_Close(REGARG(struct IOSana2Req *io, "a1"));
+void  WiFi_BeginIO(REGARG(struct IOSana2Req *io, "a1"));
+
 static struct WiFiBase fbase;
 static struct WiFiUnit funit;
 static struct SDIO fsdio;
@@ -86,6 +92,8 @@ static struct MinList waitList;
 static UBYTE sent[SENTMAX];
 static volatile ULONG sentLen, sentHw, sentAlloc, sends;
 static volatile int sentAsync;
+static char lastName[16];
+static volatile ULONG lastNameVal, mcastSends, mcastCount, allmultiSends, allmultiVal;
 
 static void fake_sendpkt(UBYTE *pkt, ULONG length, struct SDIO *sdio)
 {
@@ -97,6 +105,17 @@ static void fake_sendpkt(UBYTE *pkt, ULONG length, struct SDIO *sdio)
        (pm_AllocSize); an async frame is its own AllocMem block */
     sentAlloc = sentAsync ? 0 : *(ULONG *)(pkt - 12);
     for (i = 0; i < n; i++) sent[i] = pkt[i];
+    {
+        /* the variable a SET names, and the ULONG after it */
+        int glom = (pkt[7] != 12 && pkt[15] == 20);
+        UBYTE *d = pkt + (glom ? 20 : 12) + 16;
+        ULONG k = 0;
+        while (k < 15 && d[k]) { lastName[k] = d[k]; k++; }
+        lastName[k] = 0;
+        lastNameVal = d[k + 1] | (d[k + 2] << 8) | ((ULONG)d[k + 3] << 16) | ((ULONG)d[k + 4] << 24);
+        if (strcmp(lastName, "mcast_list") == 0) { mcastSends++; mcastCount = lastNameVal; }
+        if (strcmp(lastName, "allmulti") == 0) { allmultiSends++; allmultiVal = lastNameVal; }
+    }
     sends++;
 }
 
@@ -216,6 +235,13 @@ int main(void)
     fbase.w_SDIO = &fsdio;
     fbase.w_MemPool = CreatePool(MEMF_ANY | MEMF_CLEAR, 16384, 8192);
     funit.wu_Base = &fbase;
+    funit.wu_Flags = IFF_STARTED | IFF_UP | IFF_ONLINE | IFF_CONFIGURED;
+    InitSemaphore(&funit.wu_Lock);
+    funit.wu_CmdQueue = CreateMsgPort();
+    funit.wu_Openers.mlh_Head = (struct MinNode *)&funit.wu_Openers.mlh_Tail;
+    funit.wu_Openers.mlh_Tail = NULL;
+    funit.wu_Openers.mlh_TailPred = (struct MinNode *)&funit.wu_Openers.mlh_Head;
+    fbase.w_UtilityBase = OpenLibrary((CONST_STRPTR)"utility.library", 37);
     waitList.mlh_Head = (struct MinNode *)&waitList.mlh_Tail;
     waitList.mlh_Tail = NULL;
     waitList.mlh_TailPred = (struct MinNode *)&waitList.mlh_Head;
@@ -300,6 +326,53 @@ int main(void)
     PacketSetVarAsync(&fsdio, "abc", setbuf, -1);
     expect_eq(sends - before, 0, "async SET over the cap or negative: nothing sent");
     sentAsync = 0;
+
+    /* The caller: S2_ADDMULTICASTADDRESSES through the real BeginIO,
+       Do_S2_ADDMULTICASTADDRESSES and UpdateMCastList.  "mcast_list" + NUL
+       is 11 bytes and the list 4 + 6n: 247 groups is 1497 <= 1502, 248 is
+       1503.  A list that does not fit must end with allmulti on. */
+    {
+        static struct IOSana2Req req;
+        static const int groups[2] = { 247, 248 };
+        int g;
+        req.ios2_Req.io_Message.mn_Length = sizeof(struct IOSana2Req);
+        req.ios2_Req.io_Device = (struct Device *)&fbase;
+        WiFi_Open(&req, 0, 0);
+        expect_eq(req.ios2_Req.io_Error, 0, "mcast: full Open");
+        for (g = 0; g < 2; g++)
+        {
+            PutStr("case S2_ADDMULTICASTADDRESSES of "); num(groups[g]); PutStr(" groups\n");
+            funit.wu_MulticastRanges.mlh_Head = (struct MinNode *)&funit.wu_MulticastRanges.mlh_Tail;
+            funit.wu_MulticastRanges.mlh_Tail = NULL;
+            funit.wu_MulticastRanges.mlh_TailPred = (struct MinNode *)&funit.wu_MulticastRanges.mlh_Head;
+            mcastSends = allmultiSends = 0;
+            allmultiVal = 0xdead;
+            replyData = 0; replyPkt = 12 + 16; answer = 1;
+            {
+                static const UBYTE lo[6] = { 0x01, 0x00, 0x5e, 0x00, 0x10, 0x00 };
+                memcpy(req.ios2_SrcAddr, lo, 6);
+                memcpy(req.ios2_DstAddr, lo, 6);
+                req.ios2_DstAddr[5] = (UBYTE)(groups[g] - 1);
+            }
+            req.ios2_Req.io_Command = S2_ADDMULTICASTADDRESSES;
+            req.ios2_Req.io_Flags = IOF_QUICK;
+            WiFi_BeginIO(&req);
+            expect_eq(req.ios2_Req.io_Error, 0, "mcast: request completes");
+            expect_eq(allmultiSends, 1, "mcast: allmulti set once");
+            if (groups[g] == 247)
+            {
+                expect_eq(mcastSends, 1, "247 groups: mcast_list sent");
+                expect_eq(mcastCount, 247, "247 groups: the whole list");
+                expect_eq(allmultiVal, 0, "247 groups: allmulti off");
+            }
+            else
+            {
+                expect_eq(mcastSends, 0, "248 groups: mcast_list not sent (TOOBIG)");
+                expect_eq(allmultiVal, 1, "248 groups: allmulti on");
+            }
+        }
+        WiFi_Close(&req);
+    }
 
     quit = 1;
     Signal((struct Task *)helperTask, SIGBREAKF_CTRL_F);
