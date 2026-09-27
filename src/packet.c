@@ -2599,6 +2599,9 @@ void PacketCtrlShutdown(struct SDIO *sdio, struct MsgPort *ctrl)
 
 int PacketSetVar(struct SDIO *sdio, char *varName, const void *setBuffer, int setSize)
 {
+    /* read once: another task's S2_CONFIGINTERFACE may switch glomming on
+       while this frame is being built, and every field must agree (#96) */
+    BOOL glom = sdio->s_GlomEnabled;
     struct ExecBase *SysBase = sdio->s_SysBase;
     UBYTE *pkt;
     struct MsgPort *port;
@@ -2607,7 +2610,7 @@ int PacketSetVar(struct SDIO *sdio, char *varName, const void *setBuffer, int se
     ULONG totalLen = sizeof(struct Packet) + sizeof(struct PacketCmd) + sizeof(struct PacketMessage) + setSize;
     ULONG error_code = 0;
 
-    if (sdio->s_GlomEnabled)
+    if (glom)
         totalLen += 8;
 
     int varSize = int_strlen(varName) + 1;
@@ -2622,13 +2625,13 @@ int PacketSetVar(struct SDIO *sdio, char *varName, const void *setBuffer, int se
 
     struct PacketHeaderHW *hw = (APTR)&pkt[0];
     struct GlomHeader *gl = (APTR)&pkt[4];
-    struct PacketHeaderSW *sw = sdio->s_GlomEnabled ? (APTR)&pkt[12] : (APTR)&pkt[4];
-    struct PacketCmd *c = sdio->s_GlomEnabled ? (APTR)&pkt[20] : (APTR)&pkt[12];
+    struct PacketHeaderSW *sw = glom ? (APTR)&pkt[12] : (APTR)&pkt[4];
+    struct PacketCmd *c = glom ? (APTR)&pkt[20] : (APTR)&pkt[12];
     
     mpkt->pm_PacketData = c;
     UWORD totLen = sizeof(struct Packet) + sizeof(struct PacketCmd) + varSize + setSize;
     
-    if (sdio->s_GlomEnabled)
+    if (glom)
     {
         totLen += 8;
         gl->gh_Length = LE16(totLen - sizeof(struct PacketHeaderHW));
@@ -2641,10 +2644,10 @@ int PacketSetVar(struct SDIO *sdio, char *varName, const void *setBuffer, int se
     hw->ph_Length = LE16(totLen);
     hw->ph_ChkSum = ~hw->ph_Length;
     sw->c_DataOffset = sizeof(struct Packet);
-    if (sdio->s_GlomEnabled) sw->c_DataOffset += sizeof(struct GlomHeader);
+    if (glom) sw->c_DataOffset += sizeof(struct GlomHeader);
     sw->c_FlowControl = 0;
     /* the receiver numbers it when it sends it (#96) */
-    mpkt->pm_SeqOff = sdio->s_GlomEnabled ? 12 : 4;
+    mpkt->pm_SeqOff = glom ? 12 : 4;
 
     c->c_Command = LE32(BRCMF_C_SET_VAR); 
     c->c_Length = LE32(varSize + setSize);
@@ -2665,12 +2668,15 @@ int PacketSetVar(struct SDIO *sdio, char *varName, const void *setBuffer, int se
 
 void PacketSetVarAsync(struct SDIO *sdio, char *varName, const void *setBuffer, int setSize)
 {
+    /* read once: another task's S2_CONFIGINTERFACE may switch glomming on
+       while this frame is being built, and every field must agree (#96) */
+    BOOL glom = sdio->s_GlomEnabled;
     struct ExecBase *SysBase = sdio->s_SysBase;
     struct WiFiBase *WiFiBase = sdio->s_WiFiBase;
     UBYTE *pkt;
     ULONG totalLen = sizeof(struct Packet) + sizeof(struct PacketCmd) + setSize;
 
-    if (sdio->s_GlomEnabled)
+    if (glom)
         totalLen += 8;
 
     int varSize = int_strlen(varName) + 1;
@@ -2681,10 +2687,10 @@ void PacketSetVarAsync(struct SDIO *sdio, char *varName, const void *setBuffer, 
 
     struct PacketHeaderHW *hw = (APTR)&pkt[0];
     struct GlomHeader *gl = (APTR)&pkt[4];
-    struct PacketHeaderSW *sw = sdio->s_GlomEnabled ? (APTR)&pkt[12] : (APTR)&pkt[4];
-    struct PacketCmd *c = sdio->s_GlomEnabled ? (APTR)&pkt[20] : (APTR)&pkt[12];
+    struct PacketHeaderSW *sw = glom ? (APTR)&pkt[12] : (APTR)&pkt[4];
+    struct PacketCmd *c = glom ? (APTR)&pkt[20] : (APTR)&pkt[12];
 
-    if (sdio->s_GlomEnabled)
+    if (glom)
     {
         gl->gh_Length = LE16(totalLen - sizeof(struct PacketHeaderHW));
         gl->gh_ReservedB = 0;
@@ -2696,7 +2702,7 @@ void PacketSetVarAsync(struct SDIO *sdio, char *varName, const void *setBuffer, 
     hw->ph_Length = LE16(totalLen);
     hw->ph_ChkSum = ~hw->ph_Length;
     sw->c_DataOffset = sizeof(struct Packet);
-    if (sdio->s_GlomEnabled) sw->c_DataOffset += sizeof(struct GlomHeader);
+    if (glom) sw->c_DataOffset += sizeof(struct GlomHeader);
     sw->c_FlowControl = 0;
     sw->c_Seq = sdio->s_TXSeq++;
 
@@ -2731,6 +2737,9 @@ void PacketSetVarIntAsync(struct SDIO *sdio, char *varName, ULONG varValue)
 
 int PacketCmdInt(struct SDIO *sdio, ULONG cmd, ULONG cmdValue)
 {
+    /* read once: another task's S2_CONFIGINTERFACE may switch glomming on
+       while this frame is being built, and every field must agree (#96) */
+    BOOL glom = sdio->s_GlomEnabled;
     struct ExecBase *SysBase = sdio->s_SysBase;
     UBYTE *pkt;
     struct MsgPort *port;
@@ -2739,7 +2748,7 @@ int PacketCmdInt(struct SDIO *sdio, ULONG cmd, ULONG cmdValue)
     ULONG totalLen = sizeof(struct Packet) + sizeof(struct PacketCmd) + sizeof(struct PacketMessage) + 4;
     ULONG error_code = 0;
 
-    if (sdio->s_GlomEnabled)
+    if (glom)
         totalLen += 8;
 
     mpkt = CtrlBegin(sdio, &timer, &port, totalLen);
@@ -2750,14 +2759,14 @@ int PacketCmdInt(struct SDIO *sdio, ULONG cmd, ULONG cmdValue)
     
     struct PacketHeaderHW *hw = (APTR)&pkt[0];
     struct GlomHeader *gl = (APTR)&pkt[4];
-    struct PacketHeaderSW *sw = sdio->s_GlomEnabled ? (APTR)&pkt[12] : (APTR)&pkt[4];
-    struct PacketCmd *c = sdio->s_GlomEnabled ? (APTR)&pkt[20] : (APTR)&pkt[12];
+    struct PacketHeaderSW *sw = glom ? (APTR)&pkt[12] : (APTR)&pkt[4];
+    struct PacketCmd *c = glom ? (APTR)&pkt[20] : (APTR)&pkt[12];
 
     mpkt->pm_PacketData = c;
 
     UWORD totLen = sizeof(struct Packet) + sizeof(struct PacketCmd) + 4;
     
-    if (sdio->s_GlomEnabled)
+    if (glom)
     {
         totLen += 8;
         gl->gh_Length = LE16(totLen - sizeof(struct PacketHeaderHW));
@@ -2770,10 +2779,10 @@ int PacketCmdInt(struct SDIO *sdio, ULONG cmd, ULONG cmdValue)
     hw->ph_Length = LE16(totLen);
     hw->ph_ChkSum = ~hw->ph_Length;
     sw->c_DataOffset = sizeof(struct Packet);
-    if (sdio->s_GlomEnabled) sw->c_DataOffset += sizeof(struct GlomHeader);
+    if (glom) sw->c_DataOffset += sizeof(struct GlomHeader);
     sw->c_FlowControl = 0;
     /* the receiver numbers it when it sends it (#96) */
-    mpkt->pm_SeqOff = sdio->s_GlomEnabled ? 12 : 4;
+    mpkt->pm_SeqOff = glom ? 12 : 4;
 
     c->c_Command = LE32(cmd);
     c->c_Length = LE32(4);
@@ -2793,22 +2802,25 @@ int PacketCmdInt(struct SDIO *sdio, ULONG cmd, ULONG cmdValue)
 
 void PacketCmdIntAsync(struct SDIO *sdio, ULONG cmd, ULONG cmdValue)
 {
+    /* read once: another task's S2_CONFIGINTERFACE may switch glomming on
+       while this frame is being built, and every field must agree (#96) */
+    BOOL glom = sdio->s_GlomEnabled;
     struct ExecBase *SysBase = sdio->s_SysBase;
     struct WiFiBase *WiFiBase = sdio->s_WiFiBase;
     UBYTE *pkt;
     ULONG totalLen = sizeof(struct Packet) + sizeof(struct PacketCmd) + 4;
 
-    if (sdio->s_GlomEnabled)
+    if (glom)
         totalLen += 8;
 
     pkt = AllocPooledClear(WiFiBase->w_MemPool, totalLen);
     
     struct PacketHeaderHW *hw = (APTR)&pkt[0];
     struct GlomHeader *gl = (APTR)&pkt[4];
-    struct PacketHeaderSW *sw = sdio->s_GlomEnabled ? (APTR)&pkt[12] : (APTR)&pkt[4];
-    struct PacketCmd *c = sdio->s_GlomEnabled ? (APTR)&pkt[20] : (APTR)&pkt[12];
+    struct PacketHeaderSW *sw = glom ? (APTR)&pkt[12] : (APTR)&pkt[4];
+    struct PacketCmd *c = glom ? (APTR)&pkt[20] : (APTR)&pkt[12];
 
-    if (sdio->s_GlomEnabled)
+    if (glom)
     {
         gl->gh_Length = LE16(totalLen - sizeof(struct PacketHeaderHW));
         gl->gh_ReservedB = 0;
@@ -2820,7 +2832,7 @@ void PacketCmdIntAsync(struct SDIO *sdio, ULONG cmd, ULONG cmdValue)
     hw->ph_Length = LE16(totalLen);
     hw->ph_ChkSum = ~hw->ph_Length;
     sw->c_DataOffset = sizeof(struct Packet);
-    if (sdio->s_GlomEnabled) sw->c_DataOffset += sizeof(struct GlomHeader);
+    if (glom) sw->c_DataOffset += sizeof(struct GlomHeader);
     sw->c_FlowControl = 0;
     sw->c_Seq = sdio->s_TXSeq++;
 
@@ -2843,6 +2855,9 @@ void PacketCmdIntAsync(struct SDIO *sdio, ULONG cmd, ULONG cmdValue)
 
 int PacketCmdIntGet(struct SDIO *sdio, ULONG cmd, ULONG *cmdValue)
 {
+    /* read once: another task's S2_CONFIGINTERFACE may switch glomming on
+       while this frame is being built, and every field must agree (#96) */
+    BOOL glom = sdio->s_GlomEnabled;
     ULONG error_code = 2;
 
     if (cmdValue != NULL)
@@ -2856,7 +2871,7 @@ int PacketCmdIntGet(struct SDIO *sdio, ULONG cmd, ULONG *cmdValue)
         ULONG totalLen = sizeof(struct Packet) + sizeof(struct PacketCmd) + sizeof(struct PacketMessage) + 4;
         error_code = 0;
 
-        if (sdio->s_GlomEnabled)
+        if (glom)
             totalLen += 8;
 
         mpkt = CtrlBegin(sdio, &timer, &port, totalLen);
@@ -2873,14 +2888,14 @@ int PacketCmdIntGet(struct SDIO *sdio, ULONG cmd, ULONG *cmdValue)
         
         struct PacketHeaderHW *hw = (APTR)&pkt[0];
         struct GlomHeader *gl = (APTR)&pkt[4];
-        struct PacketHeaderSW *sw = sdio->s_GlomEnabled ? (APTR)&pkt[12] : (APTR)&pkt[4];
-        struct PacketCmd *c = sdio->s_GlomEnabled ? (APTR)&pkt[20] : (APTR)&pkt[12];
+        struct PacketHeaderSW *sw = glom ? (APTR)&pkt[12] : (APTR)&pkt[4];
+        struct PacketCmd *c = glom ? (APTR)&pkt[20] : (APTR)&pkt[12];
 
         mpkt->pm_PacketData = c;
 
         UWORD totLen = sizeof(struct Packet) + sizeof(struct PacketCmd) + 4;
         
-        if (sdio->s_GlomEnabled)
+        if (glom)
         {
             totLen += 8;
             gl->gh_Length = LE16(totLen - sizeof(struct PacketHeaderHW));
@@ -2893,10 +2908,10 @@ int PacketCmdIntGet(struct SDIO *sdio, ULONG cmd, ULONG *cmdValue)
         hw->ph_Length = LE16(totLen);
         hw->ph_ChkSum = ~hw->ph_Length;
         sw->c_DataOffset = sizeof(struct Packet);
-        if (sdio->s_GlomEnabled) sw->c_DataOffset += sizeof(struct GlomHeader);
+        if (glom) sw->c_DataOffset += sizeof(struct GlomHeader);
         sw->c_FlowControl = 0;
         /* the receiver numbers it when it sends it (#96) */
-        mpkt->pm_SeqOff = sdio->s_GlomEnabled ? 12 : 4;
+        mpkt->pm_SeqOff = glom ? 12 : 4;
 
         c->c_Command = LE32(cmd);
         c->c_Length = LE32(4);
@@ -2926,6 +2941,9 @@ int PacketCmdIntGet(struct SDIO *sdio, ULONG cmd, ULONG *cmdValue)
    (cur_etheraddr: 6) says so in minSize and gets PACKET_CTRL_SHORT below it. */
 int PacketGetVarMin(struct SDIO *sdio, char *varName, void *getBuffer, int getSize, int minSize)
 {
+    /* read once: another task's S2_CONFIGINTERFACE may switch glomming on
+       while this frame is being built, and every field must agree (#96) */
+    BOOL glom = sdio->s_GlomEnabled;
     struct ExecBase *SysBase = sdio->s_SysBase;
     UBYTE *pkt;
     struct MsgPort *port;
@@ -2934,7 +2952,7 @@ int PacketGetVarMin(struct SDIO *sdio, char *varName, void *getBuffer, int getSi
     ULONG totalLen = sizeof(struct Packet) + sizeof(struct PacketCmd) + sizeof(struct PacketMessage);
     ULONG error_code = 0;
 
-    if (sdio->s_GlomEnabled)
+    if (glom)
         totalLen += 8;
 
     int varSize = int_strlen(varName) + 1;
@@ -2954,8 +2972,8 @@ int PacketGetVarMin(struct SDIO *sdio, char *varName, void *getBuffer, int getSi
 
     struct PacketHeaderHW *hw = (APTR)&pkt[0];
     struct GlomHeader *gl = (APTR)&pkt[4];
-    struct PacketHeaderSW *sw = sdio->s_GlomEnabled ? (APTR)&pkt[12] : (APTR)&pkt[4];
-    struct PacketCmd *c = sdio->s_GlomEnabled ? (APTR)&pkt[20] : (APTR)&pkt[12];
+    struct PacketHeaderSW *sw = glom ? (APTR)&pkt[12] : (APTR)&pkt[4];
+    struct PacketCmd *c = glom ? (APTR)&pkt[20] : (APTR)&pkt[12];
 
     mpkt->pm_PacketData = c;
 
@@ -2964,7 +2982,7 @@ int PacketGetVarMin(struct SDIO *sdio, char *varName, void *getBuffer, int getSi
 
     UWORD totLen = sizeof(struct Packet) + sizeof(struct PacketCmd) + max;
     
-    if (sdio->s_GlomEnabled)
+    if (glom)
     {
         totLen += 8;
         gl->gh_Length = LE16(totLen - sizeof(struct PacketHeaderHW));
@@ -2977,10 +2995,10 @@ int PacketGetVarMin(struct SDIO *sdio, char *varName, void *getBuffer, int getSi
     hw->ph_Length = LE16(totLen);
     hw->ph_ChkSum = ~hw->ph_Length;
     sw->c_DataOffset = sizeof(struct Packet);
-    if (sdio->s_GlomEnabled) sw->c_DataOffset += sizeof(struct GlomHeader);
+    if (glom) sw->c_DataOffset += sizeof(struct GlomHeader);
     sw->c_FlowControl = 0;
     /* the receiver numbers it when it sends it (#96) */
-    mpkt->pm_SeqOff = sdio->s_GlomEnabled ? 12 : 4;
+    mpkt->pm_SeqOff = glom ? 12 : 4;
 
     c->c_Command = LE32(262);
     c->c_Length = LE32(max);

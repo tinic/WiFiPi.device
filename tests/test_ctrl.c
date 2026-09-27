@@ -115,7 +115,7 @@ static volatile UWORD sentID[64];
 static volatile ULONG sentCmd[64];
 static volatile int holdPort, modeCount, upSeen;
 static volatile int seqCheck, seqHave, seqBad, seqFrames;
-static volatile UBYTE seqLast, seqSeen[16];
+static volatile UBYTE seqLast, seqSeen[16], rawAt4, rawAt12;
 static volatile int sendBlockIntact;
 #define CMD_SWEEP       1
 #define CMD_LATE        2
@@ -128,17 +128,23 @@ static volatile int helperCmd;
 
 static void fake_sendpkt(UBYTE *pkt, ULONG length, struct SDIO *sdio)
 {
-    /* the BCDC header follows the SDPCM header, and the glom header when
-       glomming is on -- bring-up switches it on halfway through */
-    UBYTE *c = pkt + 12 + (sdio->s_GlomEnabled ? 8 : 0);
-    (void)length;
+    /* The frame's own layout, not the current flag: bring-up switches
+       glomming on halfway, and a frame built before may be sent after.  A
+       plain frame has c_DataOffset (12) at byte 7; a glommed one has the glom
+       header's last-item byte (1) there and c_DataOffset (20) at byte 15. */
+    int glommed = (pkt[7] != 12 && pkt[15] == 20);
+    UBYTE *c = pkt + (glommed ? 20 : 12);
+    UBYTE seqByte = pkt[glommed ? 12 : 4];
+    (void)length; (void)sdio;
+    rawAt4 = pkt[4];
+    rawAt12 = pkt[12];
     lastCmd = *(ULONG *)(c + 0);                    /* raw LE, compared raw */
     lastID = *(UWORD *)(c + 10);
     lastVal = *(ULONG *)(c + 16);
     if (seqCheck)
     {
         /* c_Seq is the first byte of the SDPCM software header */
-        UBYTE seq = pkt[sdio->s_GlomEnabled ? 12 : 4];
+        UBYTE seq = seqByte;
         if (seqHave && seq != (UBYTE)(seqLast + 1))
             seqBad++;
         seqSeen[seqFrames++ & 15] = seq;
@@ -519,6 +525,35 @@ int main(void)
     else
         expect(0, "caller A2 started");
     seqCheck = 0;
+
+    PutStr("step 10f the number goes where the frame was built to have it\n");
+    /* built glommed: c_Seq at 12 */
+    fsdio.s_GlomEnabled = 1;
+    fsdio.s_TXSeq = 40;
+    mode = M_ECHO;
+    err = PacketCmdIntGet(&fsdio, 16, &v);
+    expect(err == 0 && rawAt12 == 40, "glommed frame numbered at offset 12");
+    expect_eq(fsdio.s_TXSeq, 41, "one number spent");
+    /* built plain, glomming switched on before it is sent: still at 4, and
+       still answered (the fake reads the frame's own layout) */
+    fsdio.s_GlomEnabled = 0;
+    mode = M_ECHO;
+    holdPort = 1;
+    SetSignal(0, SIGBREAKF_CTRL_D);
+    if (CreateNewProcTags(NP_Entry, (ULONG)callerA, NP_Name, (ULONG)"ctrl-A3", NP_Priority, 0, TAG_DONE) != NULL)
+    {
+        Delay(5);                           /* A's plain frame waits on the port */
+        fsdio.s_GlomEnabled = 1;
+        helper_cmd(CMD_PICK);
+        helper_cmd(CMD_SWEEP);
+        Wait(SIGBREAKF_CTRL_D);
+        expect_eq(rawAt4, 41, "plain frame numbered at offset 4 though glom is now on");
+        expect(resA == 0 && valA == 0x11223344, "and its reply matched and delivered");
+    }
+    else
+        expect(0, "caller A3 started");
+    fsdio.s_GlomEnabled = 0;
+    helper_cmd(CMD_SWEEP);
 
     PutStr("step 11 GETSIGNALQUALITY timeout, then a read gets through\n");
     io = frame(&f, FULL);
