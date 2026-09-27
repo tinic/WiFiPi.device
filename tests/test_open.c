@@ -9,7 +9,8 @@
  * exclusive against shared on a running unit (no restart, nothing touched);
  * limited opens; an open started and then refused as busy; a second open
  * arriving while the first waits inside StartUnit; and a first open whose
- * reply is lost or short while a second one starts the unit.
+ * reply is lost or short while a second one starts the unit; and two opens
+ * whose replies are both lost.
  */
 #include <exec/exec.h>
 #include <exec/io.h>
@@ -424,6 +425,33 @@ int main(void)
             helper_cmd(CMD_SWEEP);
         }
     }
+
+    PutStr("step 9 two opens, both replies lost: both fail, nothing changed\n");
+    reset_unit();
+    snap(&s);
+    mode = M_NOREPLY;
+    errX = 99;
+    SetSignal(0, SIGBREAKF_CTRL_D);
+    if (CreateNewProcTags(NP_Entry, (ULONG)openerX, NP_Name, (ULONG)"opener-X", NP_Priority, 0, TAG_DONE) != NULL)
+    {
+        Delay(10);                              /* X waits on its lost get */
+        expect_eq(sends - s.sends, 1, "9 the first get is in flight");
+        expect_eq(errX, 99, "9 the first open has not failed yet");
+        io = frame(&f1, FULL);
+        t0 = NOW();
+        WiFi_Open(io, 0, 0);                    /* sends while X still waits */
+        t1 = NOW();
+        expect(t1 - t0 >= 120, "9 the second open waited its whole deadline");
+        Wait(SIGBREAKF_CTRL_D);
+        expect_eq(errX, IOERR_OPENFAIL, "9 the first open fails");
+        refused((struct IOSana2Req *)&fx, IOERR_OPENFAIL, "9 the first open: IOERR_OPENFAIL");
+        refused(io, IOERR_OPENFAIL, "9 the second open: IOERR_OPENFAIL");
+        expect((funit.wu_Flags & IFF_STARTED) == 0, "9 not started");
+        unchanged(&s, 2, "9 counters, flags, openers, addresses untouched");
+    }
+    else
+        expect(0, "opener X started");
+    helper_cmd(CMD_SWEEP);
 
     helper_cmd(CMD_QUIT);
     PutStr(failures ? "RESULT FAIL " : "RESULT PASS "); num(checks); PutStr(" checks, "); num(failures); PutStr(" failures\n");
