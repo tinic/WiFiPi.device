@@ -1,0 +1,19 @@
+The tests link the driver's own sources against a fake WiFiBase/WiFiUnit
+and run under an A1200 emulator; no Pi hardware is touched.
+
+test_ctrl.c needs -DWIFIPI_TEST_SEAMS for its timer-failure case. From
+the WiFiPi source tree, after configuring CMake to generate the
+devicetree.resource headers:
+
+  gcc=$AMIGA_TOOLCHAIN_ROOT/bin/m68k-amigaos-gcc
+  awk 'BEGIN{skip=0} /^asm\("    \.text/{skip=1} skip&&/\);$/{skip=0; next} !skip' \
+      src/device.c > device_test.c
+  $gcc -O2 -m68020 -Wall -DWIFIPI_TEST_SEAMS -I include -I src \
+      -I <configured-build>/devicetree.resource/include \
+      -DWIFIPI_DEVICE_NAME=\"wifipi.device\" -DVERSION_STRING=\"wifipi.device-test\" \
+      -o test_ctrl tests/test_ctrl.c device_test.c src/unit.c src/init.c \
+      src/mbox.c src/sdio.c src/wifipi.c src/packet.c src/d11.c \
+      src/findtoken.c src/end.c
+
+Run test_ctrl under an A1200 emulator and read its RESULT line. The
+timeout cases deliberately take about a minute.

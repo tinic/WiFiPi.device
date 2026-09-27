@@ -299,6 +299,8 @@ struct SDIO {
     UBYTE               s_TXSeq;
     UBYTE               s_RXSeq;
     UWORD               s_CmdID;
+    UWORD               s_CtrlQuarantine[32]; // control IDs given up on: not issued again while here
+    UBYTE               s_CtrlQuarantineNext;
     BOOL                s_GlomEnabled;
 
     struct Core *       s_CC;       // Chipcomm core
