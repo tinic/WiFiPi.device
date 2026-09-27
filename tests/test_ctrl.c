@@ -114,6 +114,8 @@ static volatile ULONG lastCmd, lastVal;
 static volatile UWORD sentID[64];
 static volatile ULONG sentCmd[64];
 static volatile int holdPort, modeCount, upSeen;
+static volatile int seqCheck, seqHave, seqBad, seqFrames;
+static volatile UBYTE seqLast, seqSeen[16], rawAt4, rawAt12;
 static volatile int sendBlockIntact;
 #define CMD_SWEEP       1
 #define CMD_LATE        2
@@ -121,17 +123,34 @@ static volatile int sendBlockIntact;
 #define CMD_QUIT        4
 #define CMD_PICK        5       /* take what waits on the port now */
 #define CMD_REVERSE     6       /* answer the two held requests, newest first */
+#define CMD_ASYNC       7       /* the scan path: a fire-and-forget control from the receiver */
 static volatile int helperCmd;
 
 static void fake_sendpkt(UBYTE *pkt, ULONG length, struct SDIO *sdio)
 {
-    /* the BCDC header follows the SDPCM header, and the glom header when
-       glomming is on -- bring-up switches it on halfway through */
-    UBYTE *c = pkt + 12 + (sdio->s_GlomEnabled ? 8 : 0);
-    (void)length;
+    /* The frame's own layout, not the current flag: bring-up switches
+       glomming on halfway, and a frame built before may be sent after.  A
+       plain frame has c_DataOffset (12) at byte 7; a glommed one has the glom
+       header's last-item byte (1) there and c_DataOffset (20) at byte 15. */
+    int glommed = (pkt[7] != 12 && pkt[15] == 20);
+    UBYTE *c = pkt + (glommed ? 20 : 12);
+    UBYTE seqByte = pkt[glommed ? 12 : 4];
+    (void)length; (void)sdio;
+    rawAt4 = pkt[4];
+    rawAt12 = pkt[12];
     lastCmd = *(ULONG *)(c + 0);                    /* raw LE, compared raw */
     lastID = *(UWORD *)(c + 10);
     lastVal = *(ULONG *)(c + 16);
+    if (seqCheck)
+    {
+        /* c_Seq is the first byte of the SDPCM software header */
+        UBYTE seq = seqByte;
+        if (seqHave && seq != (UBYTE)(seqLast + 1))
+            seqBad++;
+        seqSeen[seqFrames++ & 15] = seq;
+        seqLast = seq;
+        seqHave = 1;
+    }
     if (lastCmd == LE32(2) && lastVal == LE32(1))
         upSeen = 1;
     sentID[sends & 63] = lastID;
@@ -191,6 +210,7 @@ static void helper(void)
             if (c == CMD_SWEEP) PacketCtrlSweep(sdio);
             else if (c == CMD_LATE) reply(sdio, 0, 0, 4, 12 + 16 + 4);
             else if (c == CMD_SHUTDOWN) PacketCtrlShutdown(sdio, port);
+            else if (c == CMD_ASYNC) PacketCmdIntAsync(sdio, 300, 0);
             else if (c == CMD_REVERSE)
             {
                 int n = sends;
@@ -474,10 +494,66 @@ int main(void)
     err = PacketCmdIntGet(&fsdio, 13, &v);
     expect_eq(err, PACKET_CTRL_TIMEOUT, "times out before the receiver took it");
     expect_eq(sends, k, "not sent yet");
-    helper_cmd(CMD_PICK);
-    helper_cmd(CMD_SWEEP);                  /* wakes the loop, which picks it up */
-    expect_eq(sends, k + 1, "sent anyway: its TX seq is spent");
-    expect(listEmpty(), "and freed, not left waiting");
+    {
+        UBYTE seq0 = fsdio.s_TXSeq;
+        helper_cmd(CMD_PICK);
+        helper_cmd(CMD_SWEEP);              /* wakes the loop, which picks it up */
+        expect_eq(sends, k, "not sent: its caller gave up before it was numbered");
+        expect_eq(fsdio.s_TXSeq, seq0, "and no sequence number spent on it");
+        expect(listEmpty(), "and freed, not left waiting");
+    }
+
+    PutStr("step 10e wire order: a held request, the scan path, across the wrap\n");
+    mode = M_ECHO; holdPort = 1;
+    fsdio.s_TXSeq = 254;
+    seqCheck = 1; seqHave = 0; seqBad = 0; seqFrames = 0;
+    SetSignal(0, SIGBREAKF_CTRL_D);
+    if (CreateNewProcTags(NP_Entry, (ULONG)callerA, NP_Name, (ULONG)"ctrl-A2", NP_Priority, 0, TAG_DONE) != NULL)
+    {
+        Delay(5);                           /* A's request is built and waits on the port */
+        helper_cmd(CMD_ASYNC);              /* the receiver sends two of its own meanwhile */
+        helper_cmd(CMD_ASYNC);
+        helper_cmd(CMD_PICK);
+        helper_cmd(CMD_SWEEP);              /* now it takes A's */
+        Wait(SIGBREAKF_CTRL_D);
+        err = PacketCmdIntGet(&fsdio, 15, &v);
+        expect(resA == 0 && err == 0, "both sync requests answered");
+        expect_eq(seqFrames, 4, "four frames on the wire");
+        expect_eq(seqBad, 0, "sequence numbers leave in order");
+        expect(seqSeen[0] == 254 && seqSeen[1] == 255 && seqSeen[2] == 0 && seqSeen[3] == 1, "254, 255, 0, 1 across the wrap");
+    }
+    else
+        expect(0, "caller A2 started");
+    seqCheck = 0;
+
+    PutStr("step 10f the number goes where the frame was built to have it\n");
+    /* built glommed: c_Seq at 12 */
+    fsdio.s_GlomEnabled = 1;
+    fsdio.s_TXSeq = 40;
+    mode = M_ECHO;
+    err = PacketCmdIntGet(&fsdio, 16, &v);
+    expect(err == 0 && rawAt12 == 40, "glommed frame numbered at offset 12");
+    expect_eq(fsdio.s_TXSeq, 41, "one number spent");
+    /* built plain, glomming switched on before it is sent: still at 4, and
+       still answered (the fake reads the frame's own layout) */
+    fsdio.s_GlomEnabled = 0;
+    mode = M_ECHO;
+    holdPort = 1;
+    SetSignal(0, SIGBREAKF_CTRL_D);
+    if (CreateNewProcTags(NP_Entry, (ULONG)callerA, NP_Name, (ULONG)"ctrl-A3", NP_Priority, 0, TAG_DONE) != NULL)
+    {
+        Delay(5);                           /* A's plain frame waits on the port */
+        fsdio.s_GlomEnabled = 1;
+        helper_cmd(CMD_PICK);
+        helper_cmd(CMD_SWEEP);
+        Wait(SIGBREAKF_CTRL_D);
+        expect_eq(rawAt4, 41, "plain frame numbered at offset 4 though glom is now on");
+        expect(resA == 0 && valA == 0x11223344, "and its reply matched and delivered");
+    }
+    else
+        expect(0, "caller A3 started");
+    fsdio.s_GlomEnabled = 0;
+    helper_cmd(CMD_SWEEP);
 
     PutStr("step 11 GETSIGNALQUALITY timeout, then a read gets through\n");
     io = frame(&f, FULL);
