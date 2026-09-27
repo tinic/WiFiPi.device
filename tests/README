@@ -21,3 +21,6 @@ about 90 s: several steps wait out the 2.5 s control deadline on purpose.
 test_devquery.c (NSCMD_DEVICEQUERY forms) and test_lifecycle.c build the same
 way without -DWIFIPI_TEST_SEAMS; each runs in about 15 s (-t 60).
 test_abortio.c (AbortIO leaves a limited request's io_Actual alone) likewise.
+test_open.c (#95) builds the same way (tests/test_open.c in place of
+tests/test_ctrl.c) and takes about 5 s: a full open fails, with nothing
+changed, when the unit cannot read its permanent address.

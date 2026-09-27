@@ -720,19 +720,20 @@ int main(void)
         mode = M_NOREPLY;
         sio = frame(&g, FULL);
         WiFi_Open(sio, 0, 0);
+        expect_eq(sio->ios2_Req.io_Error, IOERR_OPENFAIL, "lost address: the open fails (#95)");
         expect((funit.wu_Flags & IFF_STARTED) == 0, "lost address: unit not marked started");
         ok = 1; for (i = 0; i < 6; i++) if (funit.wu_OrigEtherAddr[i] != 0xa5) ok = 0;
         expect(ok, "and the permanent address not overwritten");
-        WiFi_Close(sio);
         helper_cmd(CMD_SWEEP);
         mode = M_SHORTN; shortN = 4;
         sio = frame(&g, FULL);
         WiFi_Open(sio, 0, 0);
+        expect_eq(sio->ios2_Req.io_Error, IOERR_OPENFAIL, "4 of 6 address bytes: the open fails");
         expect((funit.wu_Flags & IFF_STARTED) == 0, "4 of 6 address bytes: not started either");
-        WiFi_Close(sio);
         mode = M_UPDEAD;                    /* 8-byte answers: the whole address */
         sio = frame(&g, FULL);
         WiFi_Open(sio, 0, 0);
+        expect_eq(sio->ios2_Req.io_Error, 0, "whole address: the next open succeeds");
         expect((funit.wu_Flags & IFF_STARTED) != 0, "whole address: started on the next open");
         expect(funit.wu_OrigEtherAddr[0] == 0x44 && funit.wu_OrigEtherAddr[5] == 0x66, "with the firmware's address");
         WiFi_Close(sio);
