@@ -1,0 +1,19 @@
+The tests here link the driver's own sources against a fake WiFiBase/WiFiUnit
+and run under an emulator (Amiberry, A1200); no Pi hardware is touched.
+
+test_ctrl.c (#93) needs -DWIFIPI_TEST_SEAMS (the timer-failure seam).  Build
+from a v1.0.0-beta4 AmiNetXDuo tree, which provides include/ and, once
+configured, the generated devicetree headers:
+
+  gcc=$AMIGA_TOOLCHAIN_ROOT/bin/m68k-amigaos-gcc      # pinned 3869b4427396
+  awk 'BEGIN{skip=0} /^asm\("    \.text/{skip=1} skip&&/\);$/{skip=0; next} !skip' \
+      src/device.c > device_test.c                     # entry stub stripped
+  $gcc -O2 -m68020 -Wall -DWIFIPI_TEST_SEAMS -I include -I src \
+      -I <anxd>/include -I <anxd build>/src/wifipi/include \
+      -DWIFIPI_DEVICE_NAME=\"wifipi.device\" -DVERSION_STRING=\"wifipi.device-test\" \
+      -o test_ctrl tests/test_ctrl.c device_test.c src/unit.c src/init.c \
+      src/mbox.c src/sdio.c src/wifipi.c src/packet.c src/d11.c src/findtoken.c src/end.c
+
+then run it in the emulator and read the serial log for the RESULT line
+(AmiNetXDuo: tools/amiberry-run.sh -m A1200 -t 200 test_ctrl).  It takes
+about 90 s: several steps wait out the 2.5 s control deadline on purpose.

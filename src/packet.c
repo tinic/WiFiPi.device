@@ -210,6 +210,10 @@ struct PacketMessage {
     APTR            pm_RecvBuffer;
     ULONG           pm_RecvSize;
     APTR            pm_PacketData;
+    ULONG           pm_AllocSize;   // the whole block, for whoever frees it
+    ULONG           pm_Copied;      // bytes of the reply copied to pm_RecvBuffer
+    UBYTE           pm_Abandoned;   // the caller gave up: the receiver frees the block (#93)
+    UBYTE           pm_Pad[3];
     struct Packet   pm_PacketHeader[];
 };
 
@@ -752,7 +756,6 @@ void ProcessEvent(struct SDIO *sdio, struct PacketEvent *pe)
 
 ULONG ProcessPacket(struct SDIO *sdio, struct Packet *pkt)
 {
-    struct ExecBase *SysBase = sdio->s_SysBase;
     UBYTE *buffer = (UBYTE*)pkt;
 
     UWORD pktLen = LE16(pkt->p_Length);
@@ -770,55 +773,10 @@ ULONG ProcessPacket(struct SDIO *sdio, struct Packet *pkt)
     switch(pkt->c_ChannelFlag)
     {
         case SDPCM_CONTROL_CHANNEL:
-        { 
-            // Control channel contains commands only. Get it.
-            struct PacketCmd *cmd = (APTR)&buffer[pkt->c_DataOffset];
-
-            // Go through control wait list. If message is found with given ID, reply it
-            // No need to lock the list, it is accessed only in this task
-            struct PacketMessage *m;
-            ForeachNode(sdio->s_CtrlWaitList, m)
-            {
-                struct PacketCmd *c = (APTR)m->pm_PacketData;
-
-                // If the ID of waiting packet and received packet match, copy the received
-                // Data back into the message and reply it
-                if (c->c_ID == cmd->c_ID)
-                {
-                    // Message match. Remove it from wait list.
-                    Remove(&m->pm_Message.mn_Node);
-
-                    // Warn in case of length mismatch. Should not be the case though!
-                    if (pktLen != LE16(pkt->p_Length))
-                    {
-                        //D(bug("[WiFi.RECV] Length mismatch %ld!=%ld\n", pktLen, LE16(pkt->p_Length)));
-                    }
-
-                    // Copy PacketCmd back to buffer
-                    CopyMem(cmd, c, sizeof(struct PacketCmd));
-
-                    // If get-type of packet and no error flag was set, copy data back
-                    if (!(c->c_Flags & LE16(BCDC_DCMD_SET)))
-                    {
-                        if (!(c->c_Flags & LE16(BCDC_DCMD_ERROR)))
-                        {
-                            if (m->pm_RecvBuffer != NULL && m->pm_RecvSize != 0)
-                            {
-                                // RecvBuffer and RecvSize are given, there was no error and
-                                // packet type is "Get"
-                                // Copy data back now
-                                CopyMem((UBYTE*)cmd + sizeof(struct PacketCmd), m->pm_RecvBuffer, m->pm_RecvSize);
-                            }
-                        }
-                    }
-
-                    // Reply back to sender
-                    ReplyMsg(&m->pm_Message);
-                    break;
-                }
-            }
+            /* A reply to one of our control requests (#93): matched, bounded
+               and handed over in PacketCtrlComplete(). */
+            PacketCtrlComplete(sdio, pkt, pktLen);
             break;
-        }
 
         case SDPCM_EVENT_CHANNEL:
         {
@@ -1130,6 +1088,9 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
                             (1 << port->mp_SigBit) |
                             (1 << ctrl->mp_SigBit) |
                             irqMask | pollMask);
+
+        /* control requests whose callers gave up (#93) */
+        PacketCtrlSweep(sdio);
        
         // Signal from control message port?
         if (sigSet & (1 << ctrl->mp_SigBit))
@@ -1139,11 +1100,8 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
             // Repeat until we run out of the messages
             while((msg = (struct PacketMessage *)GetMsg(ctrl)) != NULL)
             {
-                // Put message in the control wait list
-                AddTail((struct List*)&ctrlWaitList, &msg->pm_Message.mn_Node);
-
-                // Send out the control packet
-                sdio->SendPKT((APTR)&msg->pm_PacketHeader[0], LE16(msg->pm_PacketHeader[0].p_Length), sdio);
+                // Onto the control wait list and out, unless its caller gave up
+                PacketCtrlQueue(sdio, &msg->pm_Message);
                 /* its answer is wanted at the fast tick, not the idle one */
                 sendTransfer = TRUE;
             }
@@ -1500,6 +1458,7 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
     }
 
     D(bug("[WiFi.RECV] Packet receiver is closing now\n"));
+    PacketCtrlShutdown(sdio, ctrl);
     if (sdio->s_PollTask != NULL)
     {
         /* it runs at -128: wait for its goodbye so it gets the CPU to leave */
@@ -2281,12 +2240,361 @@ static int int_strlen(const char *c)
     return len;
 }
 
+/*
+ * Synchronous control requests (#93).  A caller builds the request, hands it
+ * to the receiver task and waits for the firmware's reply -- used to wait
+ * forever, in the caller's task under wu_Lock, so one lost reply stopped all
+ * of the unit's traffic.  Now the wait has a deadline, and ownership is:
+ *
+ *   queued on the receiver's port, on ctrlWaitList, being sent:
+ *       the receiver owns the block; the caller owns its reply port.
+ *   completed (taken off the list and replied, under Forbid):
+ *       the caller owns block and port and frees both.
+ *   abandoned (pm_Abandoned set under Forbid, no reply yet):
+ *       the caller deletes only its own port (its signal bit is its own);
+ *       the receiver frees the block -- when it takes it from its port, when
+ *       a reply walk or a sweep finds it -- never while sending it, and never
+ *       copies into pm_RecvBuffer (cleared) or replies it.
+ *
+ * The caller's give-up and the receiver's check-copy-reply both run under
+ * Forbid, so each sees the other's result whole.  The blocks come from
+ * AllocMem(), not w_MemPool: an exec pool has no locking of its own on 3.x,
+ * and these are freed by whichever task ends up owning them.  No allocation
+ * or free is made under Forbid.
+ *
+ * Replies match on c_ID and c_Command.  The protocol echoes no generation, so
+ * an ID given up on is quarantined (the last 32) and not issued again while
+ * there: a reply delayed past 65,504 later requests, for the same command,
+ * could still be taken for a new one.  Nothing stronger is claimed.
+ */
+#ifdef WIFIPI_TEST_SEAMS
+int wifipi_test_fail_timer;
+#endif
+
+static UWORD NextCmdID(struct SDIO *sdio)
+{
+    struct ExecBase *SysBase = sdio->s_SysBase;
+    UWORD id;
+    ULONG i;
+    BOOL used;
+
+    Forbid();
+    do
+    {
+        id = ++(sdio->s_CmdID);
+        used = (id == 0);
+        for (i = 0; i < 32 && !used; i++)
+            if (sdio->s_CtrlQuarantine[i] == id)
+                used = TRUE;
+    } while (used);
+    Permit();
+    return id;
+}
+
+struct CtrlTimer {
+    struct MsgPort *        ct_Port;
+    struct timerequest *    ct_Req;
+};
+
+static BOOL CtrlTimerOpen(struct SDIO *sdio, struct CtrlTimer *t)
+{
+    struct ExecBase *SysBase = sdio->s_SysBase;
+
+    t->ct_Req = NULL;
+    t->ct_Port = CreateMsgPort();
+#ifdef WIFIPI_TEST_SEAMS
+    /* 1: no port; 2: timer.device refuses the open */
+    if (wifipi_test_fail_timer == 1 && t->ct_Port != NULL)
+    {
+        DeleteMsgPort(t->ct_Port);
+        t->ct_Port = NULL;
+    }
+#endif
+    if (t->ct_Port == NULL)
+        return FALSE;
+    t->ct_Req = (struct timerequest *)CreateIORequest(t->ct_Port, sizeof(struct timerequest));
+    if (t->ct_Req != NULL &&
+#ifdef WIFIPI_TEST_SEAMS
+        wifipi_test_fail_timer != 2 &&
+#endif
+        OpenDevice((CONST_STRPTR)TIMERNAME, UNIT_MICROHZ, (struct IORequest *)t->ct_Req, 0) == 0)
+        return TRUE;
+    if (t->ct_Req != NULL)
+        DeleteIORequest((struct IORequest *)t->ct_Req);
+    DeleteMsgPort(t->ct_Port);
+    t->ct_Req = NULL;
+    t->ct_Port = NULL;
+    return FALSE;
+}
+
+static void CtrlTimerClose(struct SDIO *sdio, struct CtrlTimer *t)
+{
+    struct ExecBase *SysBase = sdio->s_SysBase;
+
+    CloseDevice((struct IORequest *)t->ct_Req);
+    DeleteIORequest((struct IORequest *)t->ct_Req);
+    DeleteMsgPort(t->ct_Port);
+}
+
+/* Everything a synchronous request needs before it may be queued: a timer,
+   a reply port and the block.  All or nothing: on failure nothing is left
+   allocated and nothing is queued. */
+static struct PacketMessage *CtrlBegin(struct SDIO *sdio, struct CtrlTimer *t, struct MsgPort **port, ULONG totalLen)
+{
+    struct ExecBase *SysBase = sdio->s_SysBase;
+    struct PacketMessage *mpkt;
+
+    if (!CtrlTimerOpen(sdio, t))
+        return NULL;
+    *port = CreateMsgPort();
+    if (*port == NULL)
+    {
+        CtrlTimerClose(sdio, t);
+        return NULL;
+    }
+    mpkt = AllocMem(totalLen, MEMF_PUBLIC | MEMF_CLEAR);
+    if (mpkt == NULL)
+    {
+        DeleteMsgPort(*port);
+        CtrlTimerClose(sdio, t);
+        return NULL;
+    }
+    mpkt->pm_Message.mn_ReplyPort = *port;
+    mpkt->pm_Message.mn_Length = totalLen;
+    mpkt->pm_AllocSize = totalLen;
+    return mpkt;
+}
+
+/* Queue the request, wait for its reply or the deadline, and settle who owns
+   what.  Returns the firmware status (0 = done), or PACKET_CTRL_TIMEOUT. */
+static ULONG CtrlTransact(struct SDIO *sdio, struct PacketMessage *mpkt, struct MsgPort *port, struct CtrlTimer *t, ULONG *copied)
+{
+    struct ExecBase *SysBase = sdio->s_SysBase;
+    struct PacketCmd *c = mpkt->pm_PacketData;
+    BOOL replied = FALSE;
+    BOOL queued = FALSE;
+    ULONG error_code;
+
+    if (copied != NULL)
+        *copied = 0;
+
+    /* No receiver (it has shut down): nothing is queued, all is still ours */
+    Forbid();
+    if (sdio->s_ReceiverPort != NULL)
+    {
+        PutMsg(sdio->s_ReceiverPort, &mpkt->pm_Message);
+        queued = TRUE;
+    }
+    Permit();
+    if (!queued)
+    {
+        FreeMem(mpkt, mpkt->pm_AllocSize);
+        CtrlTimerClose(sdio, t);
+        DeleteMsgPort(port);
+        return PACKET_CTRL_NORES;
+    }
+
+    t->ct_Req->tr_node.io_Command = TR_ADDREQUEST;
+    t->ct_Req->tr_time.tv_secs = PACKET_CTRL_TIMEOUT_MS / 1000;
+    t->ct_Req->tr_time.tv_micro = (PACKET_CTRL_TIMEOUT_MS % 1000) * 1000;
+    SendIO((struct IORequest *)t->ct_Req);
+
+    for (;;)
+    {
+        if (GetMsg(port) != NULL)
+        {
+            replied = TRUE;
+            break;
+        }
+        if (CheckIO((struct IORequest *)t->ct_Req))
+            break;
+        Wait((1UL << port->mp_SigBit) | (1UL << t->ct_Port->mp_SigBit));
+    }
+
+    if (!replied)
+    {
+        /* The receiver completes a request under Forbid too: either its reply
+           is already on the port, or it will find the flag and not touch the
+           caller's buffer or port. */
+        Forbid();
+        if (GetMsg(port) != NULL)
+            replied = TRUE;
+        else
+        {
+            mpkt->pm_Abandoned = 1;
+            mpkt->pm_RecvBuffer = NULL;
+            mpkt->pm_RecvSize = 0;
+            sdio->s_CtrlQuarantine[sdio->s_CtrlQuarantineNext++ & 31] = LE16(c->c_ID);
+        }
+        Permit();
+    }
+
+    if (!CheckIO((struct IORequest *)t->ct_Req))
+        AbortIO((struct IORequest *)t->ct_Req);
+    WaitIO((struct IORequest *)t->ct_Req);
+    CtrlTimerClose(sdio, t);
+
+    if (replied)
+    {
+        error_code = (c->c_Flags & LE16(BCDC_DCMD_ERROR)) ? LE32(c->c_Status) : 0;
+        if (copied != NULL)
+            *copied = mpkt->pm_Copied;
+        FreeMem(mpkt, mpkt->pm_AllocSize);
+    }
+    else
+        error_code = PACKET_CTRL_TIMEOUT;   /* the block is the receiver's now */
+
+    DeleteMsgPort(port);
+    return error_code;
+}
+
+/* Receiver side.  These run only in the receiver task (and the tests' stand-in
+   for it); ctrlWaitList is touched nowhere else. */
+
+static void CtrlFreeChain(struct SDIO *sdio, struct PacketMessage *chain)
+{
+    struct ExecBase *SysBase = sdio->s_SysBase;
+
+    while (chain != NULL)
+    {
+        struct PacketMessage *next = (struct PacketMessage *)chain->pm_Message.mn_Node.ln_Succ;
+        FreeMem(chain, chain->pm_AllocSize);
+        chain = next;
+    }
+}
+
+/* A request taken from the receiver's port: queue it for its reply and send
+   it, unless its caller has already given up. */
+void PacketCtrlQueue(struct SDIO *sdio, struct Message *msg)
+{
+    struct ExecBase *SysBase = sdio->s_SysBase;
+    struct PacketMessage *m = (struct PacketMessage *)msg;
+    BOOL abandoned;
+
+    Forbid();
+    abandoned = m->pm_Abandoned;
+    if (!abandoned)
+        AddTail((struct List *)sdio->s_CtrlWaitList, &m->pm_Message.mn_Node);
+    Permit();
+
+    /* Sent even if its caller gave up: its TX sequence number is already
+       spent, and a gap would leave the firmware waiting for it.  Only its
+       reply is not waited for -- nothing on the list will match it. */
+    sdio->SendPKT((APTR)&m->pm_PacketHeader[0], LE16(m->pm_PacketHeader[0].p_Length), sdio);
+    if (abandoned)
+        FreeMem(m, m->pm_AllocSize);
+}
+
+/* A control reply from the firmware.  Abandoned requests met on the way are
+   taken off and freed; only a live request with the same c_ID and c_Command
+   gets the reply, and never more of it than arrived. */
+void PacketCtrlComplete(struct SDIO *sdio, struct Packet *pkt, ULONG pktLen)
+{
+    struct ExecBase *SysBase = sdio->s_SysBase;
+    UBYTE *buffer = (UBYTE *)pkt;
+    struct PacketCmd *cmd;
+    struct PacketMessage *m, *next, *chain = NULL;
+    ULONG avail;
+
+    if (pkt->c_DataOffset < sizeof(struct Packet) ||
+        pktLen < (ULONG)pkt->c_DataOffset + sizeof(struct PacketCmd))
+        return;
+    cmd = (APTR)&buffer[pkt->c_DataOffset];
+    avail = pktLen - pkt->c_DataOffset - sizeof(struct PacketCmd);
+
+    Forbid();
+    for (m = (APTR)sdio->s_CtrlWaitList->mlh_Head; (next = (APTR)m->pm_Message.mn_Node.ln_Succ) != NULL; m = next)
+    {
+        struct PacketCmd *c = (APTR)m->pm_PacketData;
+
+        if (m->pm_Abandoned)
+        {
+            Remove(&m->pm_Message.mn_Node);
+            m->pm_Message.mn_Node.ln_Succ = (APTR)chain;
+            chain = m;
+            continue;
+        }
+        if (c->c_ID == cmd->c_ID && c->c_Command == cmd->c_Command)
+        {
+            Remove(&m->pm_Message.mn_Node);
+            CopyMem(cmd, c, sizeof(struct PacketCmd));
+            if (!(c->c_Flags & LE16(BCDC_DCMD_SET)) && !(c->c_Flags & LE16(BCDC_DCMD_ERROR)) &&
+                m->pm_RecvBuffer != NULL && m->pm_RecvSize != 0)
+            {
+                ULONG n = m->pm_RecvSize;
+                if (n > avail)
+                    n = avail;
+                if (n > LE32(c->c_Length))
+                    n = LE32(c->c_Length);
+                CopyMem((UBYTE *)cmd + sizeof(struct PacketCmd), m->pm_RecvBuffer, n);
+                m->pm_Copied = n;
+            }
+            ReplyMsg(&m->pm_Message);
+            break;
+        }
+    }
+    Permit();
+    CtrlFreeChain(sdio, chain);
+}
+
+/* Every receiver wake-up: free the requests whose callers gave up. */
+void PacketCtrlSweep(struct SDIO *sdio)
+{
+    struct ExecBase *SysBase = sdio->s_SysBase;
+    struct PacketMessage *m, *next, *chain = NULL;
+
+    Forbid();
+    for (m = (APTR)sdio->s_CtrlWaitList->mlh_Head; (next = (APTR)m->pm_Message.mn_Node.ln_Succ) != NULL; m = next)
+    {
+        if (m->pm_Abandoned)
+        {
+            Remove(&m->pm_Message.mn_Node);
+            m->pm_Message.mn_Node.ln_Succ = (APTR)chain;
+            chain = m;
+        }
+    }
+    Permit();
+    CtrlFreeChain(sdio, chain);
+}
+
+/* The receiver is leaving: waiting callers get an error reply now, abandoned
+   requests are freed. */
+void PacketCtrlShutdown(struct SDIO *sdio, struct MsgPort *ctrl)
+{
+    struct ExecBase *SysBase = sdio->s_SysBase;
+    struct PacketMessage *m, *chain = NULL;
+
+    Forbid();
+    sdio->s_ReceiverPort = NULL;            /* new requests fail closed from here */
+    while ((m = (APTR)GetMsg(ctrl)) != NULL)
+        AddTail((struct List *)sdio->s_CtrlWaitList, &m->pm_Message.mn_Node);
+    while ((m = (APTR)RemHead((struct List *)sdio->s_CtrlWaitList)) != NULL)
+    {
+        if (m->pm_Abandoned)
+        {
+            m->pm_Message.mn_Node.ln_Succ = (APTR)chain;
+            chain = m;
+        }
+        else
+        {
+            struct PacketCmd *c = (APTR)m->pm_PacketData;
+            c->c_Flags |= LE16(BCDC_DCMD_ERROR);
+            c->c_Status = LE32((ULONG)PACKET_CTRL_TIMEOUT);
+            ReplyMsg(&m->pm_Message);
+        }
+    }
+    /* the list lives on the receiver's stack, which is about to go */
+    sdio->s_CtrlWaitList = NULL;
+    Permit();
+    CtrlFreeChain(sdio, chain);
+}
+
 int PacketSetVar(struct SDIO *sdio, char *varName, const void *setBuffer, int setSize)
 {
     struct ExecBase *SysBase = sdio->s_SysBase;
-    struct WiFiBase *WiFiBase = sdio->s_WiFiBase;
     UBYTE *pkt;
-    struct MsgPort *port = CreateMsgPort();
+    struct MsgPort *port;
+    struct CtrlTimer timer;
     struct PacketMessage *mpkt;
     ULONG totalLen = sizeof(struct Packet) + sizeof(struct PacketCmd) + sizeof(struct PacketMessage) + setSize;
     ULONG error_code = 0;
@@ -2298,11 +2606,11 @@ int PacketSetVar(struct SDIO *sdio, char *varName, const void *setBuffer, int se
 
     totalLen += varSize;
 
-    mpkt = AllocPooledClear(WiFiBase->w_MemPool, totalLen);
+    mpkt = CtrlBegin(sdio, &timer, &port, totalLen);
+    if (mpkt == NULL)
+        return PACKET_CTRL_NORES;
     pkt = (APTR)&mpkt->pm_PacketHeader[0];
 
-    mpkt->pm_Message.mn_ReplyPort = port;
-    mpkt->pm_Message.mn_Length = totalLen;
 
     struct PacketHeaderHW *hw = (APTR)&pkt[0];
     struct GlomHeader *gl = (APTR)&pkt[4];
@@ -2332,7 +2640,7 @@ int PacketSetVar(struct SDIO *sdio, char *varName, const void *setBuffer, int se
     c->c_Command = LE32(BRCMF_C_SET_VAR); 
     c->c_Length = LE32(varSize + setSize);
     c->c_Flags = LE16(BCDC_DCMD_SET);
-    c->c_ID = LE16(++(sdio->s_CmdID));
+    c->c_ID = LE16(NextCmdID(sdio));
     c->c_Status = 0;
 
     UBYTE *param = (UBYTE*)c + sizeof(struct PacketCmd);
@@ -2340,18 +2648,8 @@ int PacketSetVar(struct SDIO *sdio, char *varName, const void *setBuffer, int se
     CopyMem(varName, &param[0], varSize);
     CopyMem((APTR)setBuffer, &param[varSize], setSize);
 
-    PutMsg(sdio->s_ReceiverPort, &mpkt->pm_Message);
-    WaitPort(port);
-    GetMsg(port);
-
-    if (c->c_Flags & LE16(BCDC_DCMD_ERROR))
-    {
-        error_code = LE32(c->c_Status);
-        D(bug("[WiFi] PacketSetVar ended with error. Code: %s", (ULONG)brcmf_fil_errstr[-error_code]));
-    }
-
-    FreePooled(WiFiBase->w_MemPool, mpkt, totalLen);
-    DeleteMsgPort(port);
+    error_code = CtrlTransact(sdio, mpkt, port, &timer, NULL);
+    D(bug("[WiFi] PacketSetVar ended with %08lx\n", error_code));
 
     return error_code;
 }
@@ -2396,7 +2694,7 @@ void PacketSetVarAsync(struct SDIO *sdio, char *varName, const void *setBuffer, 
     c->c_Command = LE32(263);
     c->c_Length = LE32(varSize + setSize);
     c->c_Flags = LE16(BCDC_DCMD_SET);
-    c->c_ID = LE16(++(sdio->s_CmdID));
+    c->c_ID = LE16(NextCmdID(sdio));
     c->c_Status = 0;
 
     UBYTE *param = (UBYTE*)c + sizeof(struct PacketCmd);
@@ -2425,9 +2723,9 @@ void PacketSetVarIntAsync(struct SDIO *sdio, char *varName, ULONG varValue)
 int PacketCmdInt(struct SDIO *sdio, ULONG cmd, ULONG cmdValue)
 {
     struct ExecBase *SysBase = sdio->s_SysBase;
-    struct WiFiBase *WiFiBase = sdio->s_WiFiBase;
     UBYTE *pkt;
-    struct MsgPort *port = CreateMsgPort();
+    struct MsgPort *port;
+    struct CtrlTimer timer;
     struct PacketMessage *mpkt;
     ULONG totalLen = sizeof(struct Packet) + sizeof(struct PacketCmd) + sizeof(struct PacketMessage) + 4;
     ULONG error_code = 0;
@@ -2435,11 +2733,11 @@ int PacketCmdInt(struct SDIO *sdio, ULONG cmd, ULONG cmdValue)
     if (sdio->s_GlomEnabled)
         totalLen += 8;
 
-    mpkt = AllocPooledClear(WiFiBase->w_MemPool, totalLen);
+    mpkt = CtrlBegin(sdio, &timer, &port, totalLen);
+    if (mpkt == NULL)
+        return PACKET_CTRL_NORES;
     pkt = (APTR)&mpkt->pm_PacketHeader[0];
 
-    mpkt->pm_Message.mn_ReplyPort = port;
-    mpkt->pm_Message.mn_Length = totalLen;
     
     struct PacketHeaderHW *hw = (APTR)&pkt[0];
     struct GlomHeader *gl = (APTR)&pkt[4];
@@ -2470,25 +2768,15 @@ int PacketCmdInt(struct SDIO *sdio, ULONG cmd, ULONG cmdValue)
     c->c_Command = LE32(cmd);
     c->c_Length = LE32(4);
     c->c_Flags = LE16(BCDC_DCMD_SET);
-    c->c_ID = LE16(++(sdio->s_CmdID));
+    c->c_ID = LE16(NextCmdID(sdio));
     c->c_Status = 0;
 
     ULONG *param = (APTR)((UBYTE*)c + sizeof(struct PacketCmd));
 
     *param = LE32(cmdValue);
 
-    PutMsg(sdio->s_ReceiverPort, &mpkt->pm_Message);
-    WaitPort(port);
-    GetMsg(port);
-
-    if (c->c_Flags & LE16(BCDC_DCMD_ERROR))
-    {
-        error_code = LE32(c->c_Status);
-        D(bug("[WiFi] PacketCmdInt ended with error. Code: %s", (ULONG)brcmf_fil_errstr[-error_code]));
-    }
-
-    FreePooled(WiFiBase->w_MemPool, mpkt, totalLen);
-    DeleteMsgPort(port);
+    error_code = CtrlTransact(sdio, mpkt, port, &timer, NULL);
+    D(bug("[WiFi] PacketCmdInt ended with %08lx\n", error_code));
 
     return error_code;
 }
@@ -2529,7 +2817,7 @@ void PacketCmdIntAsync(struct SDIO *sdio, ULONG cmd, ULONG cmdValue)
     c->c_Command = LE32(cmd);
     c->c_Length = LE32(4);
     c->c_Flags = LE16(BCDC_DCMD_SET);
-    c->c_ID = LE16(++(sdio->s_CmdID));
+    c->c_ID = LE16(NextCmdID(sdio));
     c->c_Status = 0;
 
     ULONG *param = (APTR)((UBYTE*)c + sizeof(struct PacketCmd));
@@ -2549,10 +2837,11 @@ int PacketCmdIntGet(struct SDIO *sdio, ULONG cmd, ULONG *cmdValue)
 
     if (cmdValue != NULL)
     {
+        ULONG scratch = 0;
         struct ExecBase *SysBase = sdio->s_SysBase;
-        struct WiFiBase *WiFiBase = sdio->s_WiFiBase;
         UBYTE *pkt;
-        struct MsgPort *port = CreateMsgPort();
+        struct MsgPort *port;
+    struct CtrlTimer timer;
         struct PacketMessage *mpkt;
         ULONG totalLen = sizeof(struct Packet) + sizeof(struct PacketCmd) + sizeof(struct PacketMessage) + 4;
         error_code = 0;
@@ -2560,12 +2849,16 @@ int PacketCmdIntGet(struct SDIO *sdio, ULONG cmd, ULONG *cmdValue)
         if (sdio->s_GlomEnabled)
             totalLen += 8;
 
-        mpkt = AllocPooledClear(WiFiBase->w_MemPool, totalLen);
+        mpkt = CtrlBegin(sdio, &timer, &port, totalLen);
+        if (mpkt == NULL)
+            return PACKET_CTRL_NORES;
         pkt = (APTR)&mpkt->pm_PacketHeader[0];
 
-        mpkt->pm_Message.mn_ReplyPort = port;
-        mpkt->pm_Message.mn_Length = totalLen;
-        mpkt->pm_RecvBuffer = cmdValue;
+        /* The reply lands in scratch, and reaches *cmdValue only whole: a
+           short reply must not leave a half-written value behind.  On the
+           stack is safe -- a request given up on has pm_RecvBuffer cleared
+           under Forbid before this function returns. */
+        mpkt->pm_RecvBuffer = &scratch;
         mpkt->pm_RecvSize = 4;
         
         struct PacketHeaderHW *hw = (APTR)&pkt[0];
@@ -2597,38 +2890,35 @@ int PacketCmdIntGet(struct SDIO *sdio, ULONG cmd, ULONG *cmdValue)
         c->c_Command = LE32(cmd);
         c->c_Length = LE32(4);
         c->c_Flags = LE16(0);
-        c->c_ID = LE16(++(sdio->s_CmdID));
+        c->c_ID = LE16(NextCmdID(sdio));
         c->c_Status = 0;
 
         //PacketDump(sdio, p, "WiFi");
 
-        PutMsg(sdio->s_ReceiverPort, &mpkt->pm_Message);
-        WaitPort(port);
-        GetMsg(port);
+        ULONG copied;
 
-        if (c->c_Flags & LE16(BCDC_DCMD_ERROR))
-        {
-            error_code = LE32(c->c_Status);
-            D(bug("[WiFi] PacketCmdIntGet ended with error. Code: %s", (ULONG)brcmf_fil_errstr[-error_code]));
-        }
-        else
-        {
-            *cmdValue = LE32(*cmdValue);
-        }
-
-        FreePooled(WiFiBase->w_MemPool, mpkt, totalLen);
-        DeleteMsgPort(port);
+        error_code = CtrlTransact(sdio, mpkt, port, &timer, &copied);
+        /* The value is the firmware's only if all four bytes of it arrived */
+        if (error_code == 0 && copied < 4)
+            error_code = PACKET_CTRL_SHORT;
+        if (error_code == 0)
+            *cmdValue = LE32(scratch);
+        D(bug("[WiFi] PacketCmdIntGet ended with %08lx\n", error_code));
     }
 
     return error_code;
 }
 
-int PacketGetVar(struct SDIO *sdio, char *varName, void *getBuffer, int getSize)
+/* getSize is the buffer's capacity: a well-formed reply may be shorter ('ver',
+   'counters'), is copied as far as it goes and the rest zeroed -- success, as
+   brcmf_proto_bcdc_query_dcmd() does.  A caller that needs an exact size
+   (cur_etheraddr: 6) says so in minSize and gets PACKET_CTRL_SHORT below it. */
+int PacketGetVarMin(struct SDIO *sdio, char *varName, void *getBuffer, int getSize, int minSize)
 {
     struct ExecBase *SysBase = sdio->s_SysBase;
-    struct WiFiBase *WiFiBase = sdio->s_WiFiBase;
     UBYTE *pkt;
-    struct MsgPort *port = CreateMsgPort();
+    struct MsgPort *port;
+    struct CtrlTimer timer;
     struct PacketMessage *mpkt;
     ULONG totalLen = sizeof(struct Packet) + sizeof(struct PacketCmd) + sizeof(struct PacketMessage);
     ULONG error_code = 0;
@@ -2643,11 +2933,11 @@ int PacketGetVar(struct SDIO *sdio, char *varName, void *getBuffer, int getSize)
     else
         totalLen += getSize;
 
-    mpkt = AllocPooledClear(WiFiBase->w_MemPool, totalLen);
+    mpkt = CtrlBegin(sdio, &timer, &port, totalLen);
+    if (mpkt == NULL)
+        return PACKET_CTRL_NORES;
     pkt = (APTR)&mpkt->pm_PacketHeader[0];
 
-    mpkt->pm_Message.mn_ReplyPort = port;
-    mpkt->pm_Message.mn_Length = totalLen;
     mpkt->pm_RecvBuffer = getBuffer;
     mpkt->pm_RecvSize = getSize;
 
@@ -2683,27 +2973,34 @@ int PacketGetVar(struct SDIO *sdio, char *varName, void *getBuffer, int getSize)
     c->c_Command = LE32(262);
     c->c_Length = LE32(max);
     c->c_Flags = LE16(0);
-    c->c_ID = LE16(++(sdio->s_CmdID));
+    c->c_ID = LE16(NextCmdID(sdio));
     c->c_Status = 0;
 
     UBYTE *param = (UBYTE*)c + sizeof(struct PacketCmd);
     
     CopyMem(varName, &param[0], varSize);
 
-    PutMsg(sdio->s_ReceiverPort, &mpkt->pm_Message);
-    WaitPort(port);
-    GetMsg(port);
+    ULONG copied;
 
-    if (c->c_Flags & LE16(BCDC_DCMD_ERROR))
+    error_code = CtrlTransact(sdio, mpkt, port, &timer, &copied);
+    /* No stale bytes behind a shorter answer: the rest is zeroed */
+    if (error_code == 0 && copied < (ULONG)getSize)
     {
-        error_code = LE32(c->c_Status);
-        D(bug("[WiFi] PacketGetVar ended with error. Code: %s", (ULONG)brcmf_fil_errstr[-error_code]));
+        UBYTE *out = getBuffer;
+        ULONG i;
+        for (i = copied; i < (ULONG)getSize; i++)
+            out[i] = 0;
+        if (copied < (ULONG)minSize)
+            error_code = PACKET_CTRL_SHORT;
     }
-
-    FreePooled(WiFiBase->w_MemPool, mpkt, totalLen);
-    DeleteMsgPort(port);
+    D(bug("[WiFi] PacketGetVar ended with %08lx\n", error_code));
 
     return error_code;
+}
+
+int PacketGetVar(struct SDIO *sdio, char *varName, void *getBuffer, int getSize)
+{
+    return PacketGetVarMin(sdio, varName, getBuffer, getSize, 0);
 }
 
 #define MAX_CHUNK_LEN			1400
@@ -2738,6 +3035,7 @@ int PacketUploadCLM(struct SDIO *sdio)
         };
 
         struct UploadHeader *upload = AllocPooled(WiFiBase->w_MemPool, sizeof(struct UploadHeader) + MAX_CHUNK_LEN);
+        ULONG err = 0;
 
         if (upload)
         {
@@ -2760,7 +3058,11 @@ int PacketUploadCLM(struct SDIO *sdio)
                 upload->len = LE32(transferLen);
                 upload->crc = 0;
 
-                PacketSetVar(sdio, "clmload", upload, sizeof(struct UploadHeader) + transferLen);
+                err = PacketSetVar(sdio, "clmload", upload, sizeof(struct UploadHeader) + transferLen);
+                /* a firmware that stopped answering is not asked again, chunk
+                   after chunk, 2.5 s each (#93); its refusals are ignored as before */
+                if (PACKET_CTRL_DEAD(err))
+                    break;
 
                 dataLen -= transferLen;
                 data += transferLen;
@@ -2769,6 +3071,8 @@ int PacketUploadCLM(struct SDIO *sdio)
             } while (dataLen > 0);
 
             FreePooled(WiFiBase->w_MemPool, upload, sizeof(struct UploadHeader) + MAX_CHUNK_LEN);
+            if (PACKET_CTRL_DEAD(err))
+                return err;
         }
 
         //D(bug("[WiFi] CLM upload complete. Getting status\n"));
