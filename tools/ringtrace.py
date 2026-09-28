@@ -429,6 +429,9 @@ def cmd_rxjoin(dump, pcap, start, end, w=TXJOIN_W, times=None):
         for i, p in enumerate(v):
             p["copy"] = i
     rxs = rx_frames(recs)
+    # covered: nothing lost, or the first kept record precedes the earliest send a frame here could match
+    first_t = to_peer(m, recs[0]["t"] / 1e6) if recs else None
+    covered = h["lost"] == 0 or (first_t is not None and first_t < lo - w)
     for fr in rxs:
         fr["pt"] = to_peer(m, fr["t"] / 1e6)
         cand = [p for p in byk.get(rxkey(fr), []) if fr["pt"] - w <= p["ep"] <= fr["pt"] + m["bound"]]
@@ -441,8 +444,8 @@ def cmd_rxjoin(dump, pcap, start, end, w=TXJOIN_W, times=None):
             fr["cls"] = "UNSEEN"
         else:
             fr["cls"] = "CENSORED"
-    print("window_s=%.6f..%.6f bound_ms=%.3f join_window=[host_t-%.3f s, host_t+%.3f ms] (W provisional) capture=%.6f..%.6f lost=%d" % (
-        lo, hi, m["bound"] * 1e3, w, m["bound"] * 1e3, c_lo, c_hi, h["lost"]))
+    print("window_s=%.6f..%.6f bound_ms=%.3f join_window=[host_t-%.3f s, host_t+%.3f ms] (W provisional) capture=%.6f..%.6f covered=%d lost=%d" % (
+        lo, hi, m["bound"] * 1e3, w, m["bound"] * 1e3, c_lo, c_hi, covered, h["lost"]))
     print("note=key flow+flags+seq+len on the peer's wire segments (super-frames split); ip_id and ack shown, not matched. "
           "delay_ms is host handoff minus peer send: air, AP, chip and driver together")
     inw = [fr for fr in rxs if lo <= fr["pt"] <= hi]

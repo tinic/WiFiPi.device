@@ -182,6 +182,17 @@ expect(num(a, "read_delay_ms", "exit_segment host_rx_t=", "outcome=read", near=1
 expect(num(a, "ack_production_ms", "release_ack host_tx_t=", "ack=8240", "write=ok", near=100.0), "A: release ACK 100 ms after the read")
 expect(has(a, "edge read_delay_ms=", "larger=host_ack_production"), "A: host ACK production")
 expect(a[-1] == "received_at_host=6 seen=4 unseen=2 ambiguous=0 censored=0", "A: summary")
+expect(" covered=1 lost=0" in a[0], "A: coverage in the header")
+early = run(peer(BASE) - 5, peer(A_END))
+expect(" covered=1 " in early[0], "nothing lost: covered even before the first record")
+lossy = os.path.join(d, "lossy.bin")                       # same records, 5 counted as lost before them
+raw = bytearray(open(dump, "rb").read()); raw[12:16] = struct.pack(">I", len(recs) + 5); raw[16:20] = struct.pack(">I", 5); raw[24:28] = struct.pack(">I", 5)
+open(lossy, "wb").write(bytes(raw))
+lo_early = subprocess.run([sys.executable, TOOL, "rxjoin", lossy, pcap, "%.6f" % (peer(BASE) - 5), "%.6f" % peer(A_END)],
+                          capture_output=True, text=True).stdout.splitlines()
+lo_late = subprocess.run([sys.executable, TOOL, "rxjoin", lossy, pcap, "%.6f" % peer(A0), "%.6f" % peer(A_END)],
+                         capture_output=True, text=True).stdout.splitlines()
+expect(" covered=0 lost=5" in lo_early[0] and " covered=1 lost=5" in lo_late[0], "records lost: covered only once the window starts after the first kept record")
 expect(has(a, "arrived frames=6 ", "outcomes=dropped=1,orphan=1,read=4"), "A: arrival summary")
 
 b = run(peer(EXB) - 0.2, peer(B_END))
