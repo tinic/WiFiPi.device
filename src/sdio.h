@@ -7,6 +7,9 @@
 #include <exec/interrupts.h>
 #include <devices/sana2.h>
 #include <stdint.h>
+#ifdef WIFIPI_WLSAMPLE
+#include "wlsample.h"
+#endif
 
 #define	EMMC_ARG2		0
 #define EMMC_BLKSIZECNT		4
@@ -357,6 +360,9 @@ struct SDIO {
     ULONG               s_RtTxIrq;  // interrupt status of the part that failed, 0 = none
     UBYTE               s_RtRxIdx;  // index of the frame being processed in its glom (0: not glommed)
     UBYTE               s_RtRxSeq;  // its SDPCM rx seq
+#ifdef WIFIPI_WLSAMPLE
+    struct WsState      s_Ws;       // in-leg counter sampler (#89), src/wlsample.h
+#endif
 #endif
 };
 

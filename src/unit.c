@@ -2060,6 +2060,23 @@ void HandleRequest(struct IOSana2Req *io)
                 complete = Do_WlCnt(io);
                 break;
 #endif
+#ifdef WIFIPI_WLSAMPLE
+            case WIFIPI_CMD_WLSAMPLE_ENABLE:
+                /* one-shot per driver instance: a second one, or one after
+                   a disable, is refused (and SAMPLER_REFUSED is in the ring) */
+                if (WsEnable(unit->wu_Base->w_SDIO) != 0)
+                {
+                    io->ios2_Req.io_Error = S2ERR_BAD_STATE;
+                    io->ios2_WireError = S2WERR_GENERIC_ERROR;
+                }
+                complete = 1;
+                break;
+
+            case WIFIPI_CMD_WLSAMPLE_DISABLE:
+                WsDisable(unit->wu_Base->w_SDIO);
+                complete = 1;
+                break;
+#endif
 
             default:
                 D(bug("[WiFi.0] Unknown command %ld\n", io->ios2_Req.io_Command));

@@ -307,8 +307,15 @@ ULONG RtClock(struct SDIO *sdio);
 void RtPut(struct SDIO *sdio, UBYTE kind, UBYTE a, UWORD b, ULONG c, ULONG d);
 ULONG RtDump(struct SDIO *sdio, void *out, ULONG size);
 #define RT(sdio, k, a, b, c, d) RtPut((sdio), (k), (a), (b), (c), (d))
+#ifdef WIFIPI_WLSAMPLE
+int WsEnable(struct SDIO *sdio);
+void WsDisable(struct SDIO *sdio);
+#endif
 #else
 #define RT(sdio, k, a, b, c, d) do { } while (0)
+#ifdef WIFIPI_WLSAMPLE
+#error "WIFIPI_WLSAMPLE needs WIFIPI_RINGTRACE"
+#endif
 #endif
 
 #endif /* _PACKET_H */

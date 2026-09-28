@@ -896,6 +896,112 @@ ULONG RtDump(struct SDIO *sdio, void *out, ULONG size)
     return n;
 }
 
+#ifdef WIFIPI_WLSAMPLE
+/* In-leg counter sampler (#89): the pure part is src/wlsample.h, called here
+   under Forbid() -- enable/disable come from a caller's task, the tick and
+   the replies from the receiver. */
+int WsEnable(struct SDIO *sdio)
+{
+    struct ExecBase *SysBase = sdio->s_SysBase;
+    int rc;
+
+    Forbid();
+    rc = ws_enable(&sdio->s_Ws, sdio->s_Ring, sdio->s_CmdID, RtClock(sdio));
+    Permit();
+    return rc;
+}
+
+void WsDisable(struct SDIO *sdio)
+{
+    struct ExecBase *SysBase = sdio->s_SysBase;
+
+    Forbid();
+    ws_disable(&sdio->s_Ws, sdio->s_Ring, RtClock(sdio));
+    Permit();
+}
+
+/* Receiver tick: the slot deadline, and one GET 'counters' of 848 bytes
+   when due -- built as PacketSetVarAsync() builds its frame, sent on the
+   same path, never waited for (#94: outside wu_Lock, AllocMem) */
+static void WsTick(struct SDIO *sdio)
+{
+    BOOL glom = sdio->s_GlomEnabled;
+    struct ExecBase *SysBase = sdio->s_SysBase;
+    struct WsState *w = &sdio->s_Ws;
+    ULONG clo = RtClock(sdio);
+    ULONG totalLen = sizeof(struct Packet) + sizeof(struct PacketCmd) + WS_V10_LEN;
+    ULONG allocLen;
+    UBYTE *pkt;
+    UWORD id = 0;
+    int go;
+
+    Forbid();
+    go = ws_tick(w, sdio->s_Ring, clo, sdio->s_CtrlWaitList != NULL &&
+                 !IsListEmpty((struct List *)sdio->s_CtrlWaitList));
+    Permit();
+    if (!go)
+        return;
+
+    if (glom)
+        totalLen += 8;
+    allocLen = (totalLen + 3) & ~3;
+    pkt = AllocMem(allocLen, MEMF_PUBLIC | MEMF_CLEAR);
+    if (pkt == NULL)
+    {
+        Forbid();
+        ws_nomem(w, sdio->s_Ring, clo);
+        Permit();
+        return;
+    }
+
+    /* the id cap is checked before the id is taken */
+    Forbid();
+    go = ws_take_id(w, sdio->s_Ring, clo, &sdio->s_CmdID, sdio->s_CtrlQuarantine, &id);
+    Permit();
+    if (!go)
+    {
+        FreeMem(pkt, allocLen);
+        return;
+    }
+
+    struct PacketHeaderHW *hw = (APTR)&pkt[0];
+    struct GlomHeader *gl = (APTR)&pkt[4];
+    struct PacketHeaderSW *sw = glom ? (APTR)&pkt[12] : (APTR)&pkt[4];
+    struct PacketCmd *c = glom ? (APTR)&pkt[20] : (APTR)&pkt[12];
+
+    if (glom)
+    {
+        gl->gh_Length = LE16(totalLen - sizeof(struct PacketHeaderHW));
+        gl->gh_ReservedB = 0;
+        gl->gh_LastItem = 1;
+        gl->gh_ReservedW = 0;
+        gl->gh_TailPad = LE16((-totalLen) & 3);
+    }
+    hw->ph_Length = LE16(totalLen);
+    hw->ph_ChkSum = ~hw->ph_Length;
+    sw->c_DataOffset = sizeof(struct Packet);
+    if (glom) sw->c_DataOffset += sizeof(struct GlomHeader);
+    sw->c_FlowControl = 0;
+    sw->c_Seq = sdio->s_TXSeq++;
+
+    c->c_Command = LE32(WS_GET_VAR);
+    c->c_Length = LE32(WS_V10_LEN);
+    c->c_Flags = LE16(0);
+    c->c_ID = LE16(id);
+    c->c_Status = 0;
+    CopyMem("counters", (UBYTE *)c + sizeof(struct PacketCmd), 9);
+
+    /* REQ is taken before the frame leaves: nothing the firmware counts
+       for this answer can be older */
+    clo = RtClock(sdio);
+    sdio->SendPKT(pkt, totalLen, sdio);
+    Forbid();
+    ws_sent(w, sdio->s_Ring, clo, id);
+    Permit();
+    FreeMem(pkt, allocLen);
+}
+#endif
+
 /* Once per SDIO: the largest ring that can be had, never freed */
 static void RtAlloc(struct SDIO *sdio)
 {
@@ -1516,6 +1622,9 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
                 rtArm = RtClock(sdio);
                 rtArmDelay = waitDelay;
                 rtArmUnit = (cur == trv);
+#endif
+#ifdef WIFIPI_WLSAMPLE
+                WsTick(sdio);
 #endif
             }
 
@@ -2854,6 +2963,22 @@ void PacketCtrlComplete(struct SDIO *sdio, struct Packet *pkt, ULONG pktLen)
     cmd = (APTR)&buffer[pkt->c_DataOffset];
     avail = pktLen - pkt->c_DataOffset - sizeof(struct PacketCmd);
     RT(sdio, RT_CTRL, 3, LE16(cmd->c_ID), LE32(cmd->c_Command), LE32(cmd->c_Status));
+
+#ifdef WIFIPI_WLSAMPLE
+    /* the sample slot first; a sample's reply never reaches a waiter */
+    {
+        ULONG n = avail < LE32(cmd->c_Length) ? avail : LE32(cmd->c_Length);
+        int taken;
+
+        Forbid();
+        taken = ws_reply(&sdio->s_Ws, sdio->s_Ring, RtClock(sdio), LE16(cmd->c_ID), LE32(cmd->c_Command),
+                         (cmd->c_Flags & LE16(BCDC_DCMD_ERROR)) != 0, LE32(cmd->c_Status),
+                         (const UBYTE *)(cmd + 1), n);
+        Permit();
+        if (taken != WS_R_NOTMINE)
+            return;
+    }
+#endif
 
     Forbid();
     for (m = (APTR)sdio->s_CtrlWaitList->mlh_Head; (next = (APTR)m->pm_Message.mn_Node.ln_Succ) != NULL; m = next)
