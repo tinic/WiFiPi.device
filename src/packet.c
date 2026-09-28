@@ -957,6 +957,31 @@ static inline UWORD RtCap16(ULONG v) { return v > 0xffff ? 0xffff : v; }
 #define RT_HDR(p) (((ULONG)(p)->c_ChannelFlag << 24) | ((ULONG)(p)->c_Seq << 16) | \
                    ((ULONG)(p)->c_MaxSeq << 8) | (p)->c_FlowControl)
 
+/* Per-frame TX identity (#89), as the frame is copied into the glom buffer:
+   the last point the host owns it before CMD53.  A pair under one Forbid. */
+static void RtTxFrame(struct SDIO *sdio, const UBYTE *data, ULONG len, BOOL raw, UWORD ptype,
+                      UBYTE idx, UBYTE count, UBYTE seq)
+{
+    struct ExecBase *SysBase = sdio->s_SysBase;
+    struct RtRing *r = sdio->s_Ring;
+    struct RtTx t;
+    UWORD et = ptype;
+    int tcp;
+
+    if (r == NULL)
+        return;
+    if (raw)
+    {
+        et = len >= 14 ? rt_be16(&data[12]) : 0;
+        data += 14;
+        len = len >= 14 ? len - 14 : 0;
+    }
+    tcp = rt_parse_tx(data, len, et, &t);
+    Forbid();
+    rt_put_tx(r, RtClock(sdio), &t, tcp, idx, count, seq, et, len);
+    Permit();
+}
+
 /* The alignment ping: ICMP echo, IPv4 without options, total length 1139
    (ping -s 1111).  Returns type<<16 | 1, or 0; *idseq gets id<<16 | seq. */
 static inline ULONG RtMarkPing(const UBYTE *ip, ULONG *idseq)
@@ -2140,6 +2165,10 @@ int SendGlomDataPacket(struct SDIO *sdio, struct IOSana2Req **ioList, UBYTE coun
         {
             D(bug("[WiFi] Sending Frame without data, packet type %04lx\n", io->ios2_PacketType));
         }
+#ifdef WIFIPI_RINGTRACE
+        RtTxFrame(sdio, ptr, io->ios2_DataLength, (io->ios2_Req.io_Flags & SANA2IOF_RAW) != 0,
+                  io->ios2_PacketType, i, count, hdr->c_Seq);
+#endif
 
 #if 1
         if (io->ios2_PacketType == 0x888e)

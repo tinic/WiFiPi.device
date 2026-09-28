@@ -206,12 +206,81 @@ static void test_mask_index(void)
     free(r);
 }
 
+/* An IPv4 TCP frame from the IP header on: ihl in words, payload bytes after a 20-byte TCP header */
+static ULONG mk_tcp(UBYTE *b, int ihl, ULONG payload, UWORD id, ULONG seq, ULONG ack, UBYTE flags, UWORD frag)
+{
+    ULONG hl = ihl * 4, tot = hl + 20 + payload, i;
+    memset(b, 0, tot);
+    b[0] = 0x40 | ihl; b[2] = tot >> 8; b[3] = tot; b[4] = id >> 8; b[5] = id;
+    b[6] = frag >> 8; b[7] = frag; b[8] = 64; b[9] = 6;
+    b[12] = 192; b[13] = 168; b[14] = 1; b[15] = 137; b[16] = 192; b[17] = 168; b[18] = 1; b[19] = 136;
+    b[hl] = 0x1d; b[hl + 1] = 0x4e; b[hl + 2] = 0x9e; b[hl + 3] = 0x0e;      /* 7502 -> 40462 */
+    for (i = 0; i < 4; i++) { b[hl + 4 + i] = seq >> (24 - 8 * i); b[hl + 8 + i] = ack >> (24 - 8 * i); }
+    b[hl + 12] = 5 << 4; b[hl + 13] = flags;
+    return tot;
+}
+
+static void test_txid(void)
+{
+    UBYTE b[256];
+    struct RtTx t;
+    struct RtRing *r = mkring(RT_MIN_LOG2);
+    size_t full = sizeof(struct RtDumpHeader) + 4096 * 16;
+    void *buf = malloc(full);
+    const struct RtRec *e = (const struct RtRec *)((struct RtDumpHeader *)buf + 1);
+    ULONG n;
+
+    /* plain ACK, then options in the IP header, both parse */
+    n = mk_tcp(b, 5, 0, 0x1234, 0xA1B2C3D4, 0x0102F0F0, 0x10, 0);
+    EXPECT(rt_parse_tx(b, n, 0x0800, &t) == 1);
+    EXPECT(t.tx_IPId == 0x1234 && t.tx_Ack == 0x0102F0F0 && t.tx_Seq == 0xA1B2C3D4 && t.tx_Flags == 0x10);
+    EXPECT(t.tx_SPort == 7502 && t.tx_DPort == 40462 && t.tx_Src == 137 && t.tx_Dst == 136 && t.tx_Payload == 0);
+    n = mk_tcp(b, 6, 100, 7, 1, 2, 0x18, 0);
+    EXPECT(rt_parse_tx(b, n, 0x0800, &t) == 1 && t.tx_SPort == 7502 && t.tx_Payload == 100 && t.tx_IPId == 7);
+    /* IP length past the bytes given: clipped to them */
+    EXPECT(rt_parse_tx(b, n - 50, 0x0800, &t) == 1 && t.tx_Payload == 50);
+
+    /* refused, with what is known */
+    n = mk_tcp(b, 5, 0, 1, 1, 1, 0x10, 0);
+    EXPECT(rt_parse_tx(b, n, 0x86dd, &t) == 0 && t.tx_Proto == 0xff);          /* not IPv4 ethertype */
+    EXPECT(rt_parse_tx(b, 19, 0x0800, &t) == 0 && t.tx_Proto == 0xff);         /* short of an IP header */
+    EXPECT(rt_parse_tx(b, 30, 0x0800, &t) == 0 && t.tx_Proto == 6);            /* short of a TCP header */
+    b[0] = 0x45 + 0x10;
+    EXPECT(rt_parse_tx(b, n, 0x0800, &t) == 0 && t.tx_Proto == 0xff);          /* version 5 */
+    b[0] = 0x44;
+    EXPECT(rt_parse_tx(b, n, 0x0800, &t) == 0 && t.tx_Proto == 0xff);          /* ihl 4 */
+    b[0] = 0x4f;
+    EXPECT(rt_parse_tx(b, n, 0x0800, &t) == 0 && t.tx_Proto == 0xff);          /* ihl past the frame */
+    n = mk_tcp(b, 5, 0, 1, 1, 1, 0x10, 0x0010);
+    EXPECT(rt_parse_tx(b, n, 0x0800, &t) == 0 && t.tx_Proto == 6);             /* not the first fragment */
+    n = mk_tcp(b, 5, 0, 1, 1, 1, 0x10, 0); b[9] = 17;
+    EXPECT(rt_parse_tx(b, n, 0x0800, &t) == 0 && t.tx_Proto == 17);            /* UDP */
+    n = mk_tcp(b, 5, 8, 1, 1, 1, 0x10, 0); b[32] = 0x20;
+    EXPECT(rt_parse_tx(b, n, 0x0800, &t) == 1 && t.tx_Payload == 0);           /* data offset 8 words: no payload claimed */
+
+    /* records: a TCP frame is a TXID1/TXID2 pair, anything else one TXO */
+    n = mk_tcp(b, 5, 0, 0xBEEF, 0x11111111, 0x22222222, 0x10, 0);
+    rt_put_tx(r, 500, &t, rt_parse_tx(b, n, 0x0800, &t), 3, 7, 0xC4, 0x0800, n);
+    t.tx_Proto = 17;
+    rt_put_tx(r, 501, &t, 0, 4, 7, 0xC5, 0x0800, 60);
+    EXPECT(rt_snapshot(r, 0, buf, full) == 32 + 3 * 16);
+    EXPECT(e[0].r_Kind == RT_TXID1 && e[0].r_Clo == 500 && e[0].r_A == 0x10 && e[0].r_B == 0xBEEF &&
+           e[0].r_C == 0x22222222 && e[0].r_D == 0x11111111);
+    EXPECT(e[1].r_Kind == RT_TXID2 && e[1].r_Clo == 500 && e[1].r_A == 3 && e[1].r_B == ((7 << 8) | 0xC4) &&
+           e[1].r_C == ((7502UL << 16) | 40462) && e[1].r_D == ((137UL << 24) | (136UL << 16)));
+    EXPECT(e[2].r_Kind == RT_TXO && e[2].r_A == 4 && e[2].r_B == ((7 << 8) | 0xC5) &&
+           e[2].r_C == ((0x0800UL << 16) | 17) && e[2].r_D == 60);
+    free(buf);
+    free(r);
+}
+
 int main(void)
 {
     test_layout();
     test_fill_and_wrap();
     test_dump_while_recording();
     test_mask_index();
+    test_txid();
     printf("RESULT host_ringtrace checks=%d failures=%d\n", checks, failures);
     return failures ? 1 : 0;
 }

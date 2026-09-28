@@ -38,7 +38,10 @@ enum {
     RT_SCAN   = 9,      /* S2_GETNETWORKS queued, escan started, scan done */
     RT_CTRL   = 10,     /* firmware control transaction */
     RT_MARK   = 11,     /* alignment ping seen (RX request, TX reply) */
-    RT_POLL   = 12      /* poller: line seen, write wake, grace ran out */
+    RT_POLL   = 12,     /* poller: line seen, write wake, grace ran out */
+    RT_TXID1  = 13,     /* TX frame identity, IPv4 TCP, first of a pair */
+    RT_TXID2  = 14,     /* ... second of the pair, always the next record */
+    RT_TXO    = 15      /* TX frame identity, anything else */
 };
 
 struct RtRec {
@@ -74,6 +77,64 @@ struct RtDumpHeader {
 _Static_assert(sizeof(struct RtRec) == 16, "record is 16 bytes");
 _Static_assert(sizeof(struct RtDumpHeader) == 32, "dump header is 32 bytes");
 
+/*
+ * Per-frame TX identity (#89), taken as each frame is copied into the glom
+ * buffer.  IPv4 TCP gives two records written together:
+ *   TXID1  a TCP flags, b IP id, c ACK number, d sequence number
+ *   TXID2  a glom index, b count<<8 | SDPCM seq, c sport<<16 | dport,
+ *          d src last octet<<24 | dst last octet<<16 | TCP payload length
+ * anything else one:
+ *   TXO    a glom index, b count<<8 | SDPCM seq, c ethertype<<16 | IP protocol
+ *          (0xff: not IPv4, or the header does not parse), d frame length
+ * The address discriminator is each address's last octet: the rig is one
+ * /24, the join key is (IP id, ACK), and the octets only tell flows apart.
+ * Header fields are read a byte at a time (network order on any host).
+ */
+struct RtTx {
+    UWORD   tx_Proto;   /* 6 = a parsed TCP header, else the protocol or 0xff */
+    UBYTE   tx_Flags;
+    UBYTE   tx_Src, tx_Dst;
+    UWORD   tx_IPId, tx_SPort, tx_DPort, tx_Payload;
+    ULONG   tx_Seq, tx_Ack;
+};
+
+static inline ULONG rt_be16(const UBYTE *p) { return ((ULONG)p[0] << 8) | p[1]; }
+static inline ULONG rt_be32(const UBYTE *p)
+{
+    return ((ULONG)p[0] << 24) | ((ULONG)p[1] << 16) | ((ULONG)p[2] << 8) | p[3];
+}
+
+/* l3: the IP header, len: bytes there.  Returns 1 for a whole IPv4 TCP
+   header (first fragment, header inside both len and the IP length). */
+static inline int rt_parse_tx(const UBYTE *l3, ULONG len, UWORD ethertype, struct RtTx *t)
+{
+    ULONG ihl, tot, doff;
+
+    t->tx_Proto = 0xff;
+    if (ethertype != 0x0800 || len < 20 || (l3[0] >> 4) != 4)
+        return 0;
+    ihl = (l3[0] & 15) * 4;
+    tot = rt_be16(&l3[2]);
+    if (ihl < 20 || ihl > len || tot < ihl)
+        return 0;
+    t->tx_Proto = l3[9];
+    if (tot > len)
+        tot = len;
+    if (l3[9] != 6 || (rt_be16(&l3[6]) & 0x1fff) != 0 || ihl + 20 > tot)
+        return 0;
+    doff = (l3[ihl + 12] >> 4) * 4;
+    t->tx_IPId = rt_be16(&l3[4]);
+    t->tx_Src = l3[15];
+    t->tx_Dst = l3[19];
+    t->tx_SPort = rt_be16(&l3[ihl]);
+    t->tx_DPort = rt_be16(&l3[ihl + 2]);
+    t->tx_Seq = rt_be32(&l3[ihl + 4]);
+    t->tx_Ack = rt_be32(&l3[ihl + 8]);
+    t->tx_Flags = l3[ihl + 13];
+    t->tx_Payload = (doff >= 20 && ihl + doff <= tot) ? tot - ihl - doff : 0;
+    return 1;
+}
+
 static inline void rt_init(struct RtRing *r, ULONG log2, ULONG size)
 {
     r->rt_Magic = RT_RING_MAGIC;
@@ -93,6 +154,24 @@ static inline void rt_put(struct RtRing *r, ULONG clo, UBYTE kind, UBYTE a, UWOR
     e->r_C = c;
     e->r_D = d;
     r->rt_Seq++;
+}
+
+/* One frame's identity: two records (TCP) or one; the caller holds Forbid,
+   so a pair is never split by another writer (a dump or a lap can still cut
+   one at the ring's oldest end: readers pair TXID1 with the very next record) */
+static inline void rt_put_tx(struct RtRing *r, ULONG clo, const struct RtTx *t, int tcp,
+                             UBYTE idx, UBYTE count, UBYTE sdpcmSeq, UWORD ethertype, ULONG flen)
+{
+    UWORD b = ((UWORD)count << 8) | sdpcmSeq;
+
+    if (tcp)
+    {
+        rt_put(r, clo, RT_TXID1, t->tx_Flags, t->tx_IPId, t->tx_Ack, t->tx_Seq);
+        rt_put(r, clo, RT_TXID2, idx, b, ((ULONG)t->tx_SPort << 16) | t->tx_DPort,
+               ((ULONG)t->tx_Src << 24) | ((ULONG)t->tx_Dst << 16) | t->tx_Payload);
+    }
+    else
+        rt_put(r, clo, RT_TXO, idx, b, ((ULONG)ethertype << 16) | t->tx_Proto, flen);
 }
 
 /* Header plus the newest records that fit in `size` bytes, oldest first.
@@ -120,12 +199,17 @@ static inline ULONG rt_snapshot(const struct RtRing *r, ULONG clo, void *out, UL
     h->rd_Lost = r->rt_Seq - n;
     h->rd_Clo = clo;
 
-    /* longword copies: a struct assignment may become a memcpy call */
+    /* field by field: a struct assignment may become a memcpy call, and
+       longword casts over the record would break strict aliasing */
     for (i = 0, s = h->rd_First; i < n; i++, s++)
     {
-        const ULONG *from = (const ULONG *)&r->rt_Rec[s & r->rt_Mask];
-        ULONG *to = (ULONG *)&dst[i];
-        to[0] = from[0]; to[1] = from[1]; to[2] = from[2]; to[3] = from[3];
+        const struct RtRec *from = &r->rt_Rec[s & r->rt_Mask];
+        dst[i].r_Clo = from->r_Clo;
+        dst[i].r_Kind = from->r_Kind;
+        dst[i].r_A = from->r_A;
+        dst[i].r_B = from->r_B;
+        dst[i].r_C = from->r_C;
+        dst[i].r_D = from->r_D;
     }
     return sizeof(*h) + n * sizeof(struct RtRec);
 }

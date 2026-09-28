@@ -6,6 +6,8 @@ what the driver did inside a silence.
   ringtrace.py pcapmarks PCAP > MARKS            the alignment pings in a peer capture
   ringtrace.py align  DUMP MARKS                 clock model from paired pings
   ringtrace.py window DUMP MARKS START END       records and verdicts for a gap
+  ringtrace.py txjoin DUMP PCAP START END        each TX TCP frame the host produced in
+                                                 the gap, and whether the peer saw it
 
 MARKS is the peer capture's alignment pings (ICMP echo, IP length 1139,
 ping -s 1111), one per line: epoch type id seq.  pcapmarks writes it from a
@@ -37,12 +39,19 @@ Record fields (r_A, r_B, r_C, r_D) per kind:
          frame length (RX) or glom size<<16 | index (TX)
   POLL   1 line seen, 2 woke receiver for a write, 3 grace ran out,
          4 woken; 0, us since the poller last looked, counter
+  TXID1  (IPv4 TCP frame copied into the glom, then TXID2 as the very next
+         record) TCP flags, IP id, ACK number, sequence number
+  TXID2  glom index, count<<8 | SDPCM seq, sport<<16 | dport,
+         src last octet<<24 | dst last octet<<16 | TCP payload length
+  TXO    (any other frame) glom index, count<<8 | SDPCM seq,
+         ethertype<<16 | IP protocol (0xff not parsed), frame length
 """
 import struct
 import sys
 
 KINDS = {1: "START", 2: "WAKE", 3: "READ", 4: "TICK", 5: "RXQ", 6: "TX",
-         7: "CREDIT", 8: "EVENT", 9: "SCAN", 10: "CTRL", 11: "MARK", 12: "POLL"}
+         7: "CREDIT", 8: "EVENT", 9: "SCAN", 10: "CTRL", 11: "MARK", 12: "POLL",
+         13: "TXID1", 14: "TXID2", 15: "TXO"}
 E_ESCAN_RESULT = 69
 SCAN_EVENTS = {E_ESCAN_RESULT, 26, 19, 32, 37, 36, 38, 9, 11, 12, 5, 6, 16}
 # 26 SCAN_COMPLETE, 19 ROAM, 32 ROAM_PREP, 37 ROAM_START, 36 JOIN_START,
@@ -86,7 +95,8 @@ def pcap_marks(path):
     return m
 
 
-def cmd_pcapmarks(path):
+def pcap_frames(path):
+    """(epoch seconds, frame bytes) from a classic Ethernet pcap (us or ns)"""
     b = open(path, "rb").read()
     magic = b[:4]
     if magic in (b"\xd4\xc3\xb2\xa1", b"\x4d\x3c\xb2\xa1"):
@@ -101,14 +111,95 @@ def cmd_pcapmarks(path):
     o = 24
     while o + 16 <= len(b):
         sec, sub, incl, _ = struct.unpack(e + "IIII", b[o:o + 16])
-        f = b[o + 16:o + 16 + incl]
+        yield sec, int(sub * 1e6 / frac), b[o + 16:o + 16 + incl]
         o += 16 + incl
+
+
+def ping_rows(path):
+    for sec, us, f in pcap_frames(path):
         if len(f) < 42 or f[12:14] != b"\x08\x00" or f[14] != 0x45 or f[23] != 1:
             continue
         if struct.unpack(">H", f[16:18])[0] != 1139 or f[34] not in (0, 8):
             continue
         ident, sq = struct.unpack(">HH", f[38:42])
-        print("%d.%06d\t%d\t%d\t%d" % (sec, int(sub * 1e6 / frac), f[34], ident, sq))
+        yield sec + us / 1e6, "%d.%06d\t%d\t%d\t%d" % (sec, us, f[34], ident, sq), (f[34], ident, sq)
+
+
+def cmd_pcapmarks(path):
+    for _, line, _ in ping_rows(path):
+        print(line)
+
+
+def marks_from_pcap(path):
+    m = {}
+    for ep, _, (typ, ident, sq) in ping_rows(path):
+        m.setdefault((ident, sq), {})[typ] = ep
+    return m
+
+
+def tx_frames(recs):
+    """TX TCP frames: a TXID1 and the TXID2 written right after it"""
+    out = []
+    for r, n in zip(recs, recs[1:]):
+        if r["k"] == 13 and n["k"] == 14 and n["seq"] == r["seq"] + 1:
+            out.append({"t": r["t"], "flags": r["a"], "ipid": r["b"], "ack": r["c"], "seq": r["d"],
+                        "idx": n["a"], "count": n["b"] >> 8, "sdpcm": n["b"] & 0xff,
+                        "sport": n["c"] >> 16, "dport": n["c"] & 0xffff,
+                        "src": n["d"] >> 24, "dst": (n["d"] >> 16) & 0xff, "len": n["d"] & 0xffff})
+    return out
+
+
+def peer_tcp(path):
+    """(IP id, ACK, src last octet) -> epochs of IPv4 TCP frames in the peer capture"""
+    seen = {}
+    for sec, us, f in pcap_frames(path):
+        if len(f) < 34 or f[12:14] != b"\x08\x00" or f[14] >> 4 != 4 or f[23] != 6:
+            continue
+        ihl = (f[14] & 15) * 4
+        if ihl < 20 or len(f) < 14 + ihl + 12:
+            continue
+        ipid = struct.unpack(">H", f[18:20])[0]
+        ack = struct.unpack(">I", f[14 + ihl + 8:14 + ihl + 12])[0]
+        seen.setdefault((ipid, ack, f[29]), []).append(sec + us / 1e6)
+    return seen
+
+
+FLAGS = "FSRPAUEC"
+
+
+def flagstr(v):
+    return "".join(c for i, c in enumerate(FLAGS) if v & (1 << i)) or "-"
+
+
+def cmd_txjoin(dump, pcap, start, end, horizon=2.0):
+    h, recs = load(dump)
+    m = model(pings(recs, marks_from_pcap(pcap)))
+    lo, hi = float(start), float(end)
+    seen = peer_tcp(pcap)
+    first_t = to_peer(m, recs[0]["t"] / 1e6) if recs else None
+    covered = h["lost"] == 0 or (first_t is not None and first_t < lo - m["bound"])
+    print("window_s=%.6f..%.6f bound_ms=%.3f covered=%d lost=%d" % (lo, hi, m["bound"] * 1e3, covered, h["lost"]))
+    flows, n_seen, n_miss = {}, 0, 0
+    for fr in tx_frames(recs):
+        pt = to_peer(m, fr["t"] / 1e6)
+        if not lo <= pt <= hi:
+            continue
+        hits = [e for e in seen.get((fr["ipid"], fr["ack"], fr["src"]), []) if pt - m["bound"] <= e <= pt + horizon]
+        flow = "%d>%d" % (fr["sport"], fr["dport"])
+        st = flows.setdefault(flow, [0, 0, 0])
+        st[0] += 1
+        if hits:
+            n_seen += 1; st[1] += 1
+            what = "seen_at_peer=%.6f delay_ms=%.3f" % (hits[0], (hits[0] - pt) * 1e3)
+        else:
+            n_miss += 1; st[2] += 1
+            what = "MISSING"
+        print("host_t=%.6f flow=%s ip_id=%d ack=%d seq=%d flags=%s len=%d sdpcm=%d glom=%d/%d %s" % (
+            pt, flow, fr["ipid"], fr["ack"], fr["seq"], flagstr(fr["flags"]), fr["len"],
+            fr["sdpcm"], fr["idx"], fr["count"], what))
+    for flow, (p, s_, x) in sorted(flows.items()):
+        print("flow=%s produced_at_host=%d seen_at_peer=%d missing=%d" % (flow, p, s_, x))
+    print("produced_at_host=%d seen_at_peer=%d missing=%d" % (n_seen + n_miss, n_seen, n_miss))
 
 
 def pings(recs, pm):
@@ -222,6 +313,8 @@ def main():
         cmd_pcapmarks(sys.argv[2])
     elif len(sys.argv) == 4 and sys.argv[1] == "align":
         cmd_align(sys.argv[2], sys.argv[3])
+    elif len(sys.argv) == 6 and sys.argv[1] == "txjoin":
+        cmd_txjoin(*sys.argv[2:6])
     elif len(sys.argv) == 6 and sys.argv[1] == "window":
         cmd_window(*sys.argv[2:6])
     else:
