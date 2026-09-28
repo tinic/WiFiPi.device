@@ -57,8 +57,11 @@ delta groups the listed fields (every field still gets delta.NAME=):
   ambient_rf  PHY/CRC-class errors (AMBIENT_*): ambient_rf_delta.NAME and
               ambient_rf_rate.NAME per second over elapsed_us, then
               ambient_rf_verdict=descriptive_only -- no verdict either way
-  host_drop   overflow, no-buffer, DMA, reset/reinit (DROP_*):
-              host_drop_delta.NAME, host_drop_rose=0/1, host_drop_rose_fields=
+  chip_rx_drop_or_reset
+              overflow, no-buffer, DMA, reset/reinit (DROP_*):
+              chip_rx_drop_or_reset_delta.NAME,
+              chip_rx_drop_or_reset_rose=0/1,
+              chip_rx_drop_or_reset_rose_fields=
   other       listed, no verdict
 Snapshots are pre and post a leg only: the command holds the unit lock for
 up to the 2.5 s GET deadline.
@@ -314,9 +317,9 @@ RX_V10 = (
     "reinit", "rxrtry")
 # Two groups of the list above; every other listed field gets a delta, no verdict.
 # ambient_rf: PHY/CRC-class errors that any radio in range produces on every
-# leg -- descriptive only, never a verdict.  host_drop: the chip dropping or
-# overflowing on its way to the host, or resetting -- host_drop_rose is 1 if
-# any rose.
+# leg -- descriptive only, never a verdict.  chip_rx_drop_or_reset: the chip
+# dropping or overflowing on its way to the host, or resetting --
+# chip_rx_drop_or_reset_rose is 1 if any rose.
 AMBIENT_V10 = (
     "rxcrc", "rxbadfcs", "rxbadplcp", "bphy_badplcp", "rxcrsglitch", "bphy_rxcrsglitch",
     "rxfrmtooshrt", "rxfrmtoolong", "rxinvmachdr")
@@ -496,7 +499,7 @@ def cmd_delta(pre_path, post_path, every=False):
            "elapsed_us=%d" % elapsed,
            "fields=%s" % ",".join(names),
            "ambient_rf_fields=%s" % ",".join(ambient),
-           "host_drop_fields=%s" % ",".join(drops),
+           "chip_rx_drop_or_reset_fields=%s" % ",".join(drops),
            "other_fields=%s" % ",".join(other)]
     wrapped, rose = [], []
     for n in names:
@@ -519,13 +522,13 @@ def cmd_delta(pre_path, post_path, every=False):
     out.append("ambient_rf_verdict=descriptive_only")
     for n in drops:
         if n not in d:
-            out.append("host_drop_delta.%s=absent" % n)
+            out.append("chip_rx_drop_or_reset_delta.%s=absent" % n)
             continue
-        out.append("host_drop_delta.%s=%d" % (n, d[n][0]))
+        out.append("chip_rx_drop_or_reset_delta.%s=%d" % (n, d[n][0]))
         if d[n][0]:
             rose.append(n)
-    out.append("host_drop_rose=%d" % (1 if rose else 0))
-    out.append("host_drop_rose_fields=%s" % (",".join(rose) or "none"))
+    out.append("chip_rx_drop_or_reset_rose=%d" % (1 if rose else 0))
+    out.append("chip_rx_drop_or_reset_rose_fields=%s" % (",".join(rose) or "none"))
     return out
 
 
