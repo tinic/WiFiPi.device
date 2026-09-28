@@ -13,8 +13,29 @@
 #include "brcm.h"
 #include "brcm_sdio.h"
 #include "brcm_chipcommon.h"
+#include "fwupload.h"
 
 #define D(x) x
+
+struct FwWriteCtx {
+    struct SDIO *   fw_SDIO;
+    ULONG           fw_RAMBase;
+};
+
+/* One firmware chunk to the chip's RAM (fw_upload() in src/fwupload.h) */
+static void FwWrite(void *c, ULONG off, const UBYTE *src, ULONG len)
+{
+    struct FwWriteCtx *ctx = c;
+    struct SDIO *sdio = ctx->fw_SDIO;
+    struct ExecBase *SysBase = sdio->s_SysBase;     /* bug() */
+    ULONG addr = sdio->BackplaneAddr(ctx->fw_RAMBase + off, sdio);
+
+    sdio->Write(SD_FUNC_BAK, SB_32BIT_WIN + addr, (APTR)src, len, sdio);
+    if (sdio->IsError(sdio))
+    {
+        D(bug("[WiFi] Firmware write error!\n"));
+    }
+}
 
 /* Agent registers (common for every core) */
 #define BCMA_OOB_SEL_OUT_A30		0x0100
@@ -1174,27 +1195,11 @@ int chip_init(struct SDIO *sdio)
 
     if (chip->c_FirmwareBase && chip->c_FirmwareSize)
     {
-        ULONG ram_base = chip->c_RAMBase;
-        D(bug("[WiFi] Uploading firmware to %08lx...\n", ram_base));
-        ULONG remaining = (ULONG)chip->c_FirmwareSize;
-        UBYTE *sdio_bin = chip->c_FirmwareBase;
-        ULONG pos;
-    
-        for (pos = 0; pos < (ULONG)chip->c_FirmwareSize; )
-        {
-            ULONG sz = remaining > 64 ? 64 : remaining;
-            ULONG addr = sdio->BackplaneAddr(ram_base + pos, sdio);
-
-            sz = (sz + 3) & ~3;
-
-            sdio->Write(SD_FUNC_BAK, SB_32BIT_WIN + addr, &sdio_bin[pos], sz, sdio);
-            if (sdio->IsError(sdio))
-            {
-                D(bug("[WiFi] Firmware write error!\n"));
-            }
-            pos += sz;
-            remaining -= sz;
-        }
+        struct FwWriteCtx ctx = { sdio, chip->c_RAMBase };
+        D(bug("[WiFi] Uploading firmware to %08lx...\n", ctx.fw_RAMBase));
+        /* src/fwupload.h: the last chunk goes from a zero-padded copy, never
+           from past the exact-size image buffer */
+        ULONG pos = fw_upload(chip->c_FirmwareBase, (ULONG)chip->c_FirmwareSize, FwWrite, &ctx);
 
         D(bug("[WiFi] wrote %ld bytes\n", pos));
     }
