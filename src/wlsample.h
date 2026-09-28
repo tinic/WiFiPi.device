@@ -9,8 +9,21 @@
  * slot, so at most one is outstanding.  Its reply is taken in
  * PacketCtrlComplete() before the synchronous waiters are looked at, only on
  * id AND command AND a live slot; ten fields of it go into the ring.  A slot
- * not answered in 500 ms is LOST and its id tombstoned; a reply to any id
- * the sampler ever issued that is not the live slot is LATE and never read.
+ * not answered in 500 ms is LOST; a reply to any id the sampler ever issued
+ * that is not the live slot, and that no waiter takes, is LATE and never
+ * read.
+ *
+ * Lost ids.  Every sample id that ends LOST, and the one outstanding when
+ * the sampler stops (DISABLE, idcap, wrap), is set in ws_Lost: its request
+ * may still be answered, so NextCmdID() does not hand it out again -- it
+ * skips ws_Lost as it skips s_CtrlQuarantine, one bit test a candidate, and
+ * a very late 'counters' reply can never reach a later waiter.  No
+ * capacity, no eviction.  A request gets one reply: a late one clears the
+ * bit, and the id may be handed out again after it.  If every id were
+ * blocked the walk would never end, so after 65536 blocked candidates the
+ * sampler stops (id_space) and ws_Lost is no longer consulted: the walk is
+ * the base driver's from then on.  At most WS_ID_CAP ids can be set, so
+ * this is not reached; it only must not hang.
  *
  * Ids: E is the command id counter (s_CmdID, the last id handed out) at
  * enable.  Before each sample id is taken, the id NextCmdID() would hand out
@@ -37,7 +50,7 @@
 #define WS_PERIOD_US    50000UL
 #define WS_DEADLINE_US  500000UL
 #define WS_ID_CAP       60000UL
-#define WS_TOMBS        16
+#define WS_TOMBS        16              /* latency lookup only; evicted freely */
 #define WS_GET_VAR      262             /* BRCMF_C_GET_VAR */
 #define WS_NFIELDS      10
 
@@ -87,7 +100,7 @@ enum {
 enum { WS_REP_OK = 0, WS_REP_BAD_LAYOUT = 1, WS_REP_FW_ERROR = 2 };
 enum { WS_SKIP_SLOT_BUSY = 1, WS_SKIP_CTRL_BUSY = 2, WS_SKIP_NOMEM = 3, WS_SKIP_STOPPED = 4,
        WS_SKIP_NO_CREDIT = 5 };
-enum { WS_STOP_IDCAP = 1, WS_STOP_DISABLED = 2, WS_STOP_WRAP = 3 };
+enum { WS_STOP_IDCAP = 1, WS_STOP_DISABLED = 2, WS_STOP_WRAP = 3, WS_STOP_ID_SPACE = 4 };
 enum { WS_IDLE = 0, WS_LIVE = 1, WS_STOPPED = 2 };
 enum { WS_R_NOTMINE = 0, WS_R_TAKEN = 1, WS_R_LATE = 2 };
 
@@ -105,7 +118,9 @@ struct WsState {
     UWORD   ws_TombId[WS_TOMBS];
     ULONG   ws_TombClo[WS_TOMBS];
     UBYTE   ws_TombUsed[WS_TOMBS];
+    UBYTE   ws_LostOff;             /* the id_space guard fired: ws_Lost not consulted */
     UBYTE   ws_Issued[65536 / 8];   /* ids ever sent as samples */
+    UBYTE   ws_Lost[65536 / 8];     /* sample ids whose reply may still come: not handed out */
 };
 
 static inline void ws_log(struct RtRing *r, ULONG clo, UBYTE k, UBYTE a, UWORD b, ULONG c, ULONG d)
@@ -148,12 +163,25 @@ static inline void ws_tomb(struct WsState *w, UWORD id, ULONG reqClo)
     w->ws_TombUsed[i] = 1;
 }
 
+static inline int ws_lost(const struct WsState *w, UWORD id)
+{
+    return (w->ws_Lost[id >> 3] >> (id & 7)) & 1;
+}
+
+/* An id whose request may still be answered: not handed out again until
+   that answer comes */
+static inline void ws_retire(struct WsState *w, UWORD id, ULONG reqClo)
+{
+    ws_tomb(w, id, reqClo);
+    w->ws_Lost[id >> 3] |= (UBYTE)(1 << (id & 7));
+}
+
 static inline void ws_stop(struct WsState *w, struct RtRing *r, ULONG clo, UBYTE reason, UWORD notTaken, ULONG dist)
 {
     if (w->ws_SlotLive)
     {
-        /* its reply, if it comes, is LATE and never read */
-        ws_tomb(w, w->ws_SlotId, w->ws_SlotReqClo);
+        /* its reply, if it comes, is LATE and never read; its id is never reused */
+        ws_retire(w, w->ws_SlotId, w->ws_SlotReqClo);
         w->ws_SlotLive = 0;
     }
     w->ws_State = WS_STOPPED;
@@ -178,7 +206,7 @@ static inline int ws_tick(struct WsState *w, struct RtRing *r, ULONG clo, int ct
     if (w->ws_SlotLive && (ULONG)(clo - w->ws_SlotReqClo) >= WS_DEADLINE_US)
     {
         ws_log(r, clo, RT_SAMPLE_LOST, 0, w->ws_SlotId, w->ws_SlotReqClo, 0);
-        ws_tomb(w, w->ws_SlotId, w->ws_SlotReqClo);
+        ws_retire(w, w->ws_SlotId, w->ws_SlotReqClo);
         w->ws_SlotLive = 0;
     }
     if (w->ws_State == WS_IDLE)
@@ -221,11 +249,16 @@ static inline void ws_nomem(struct WsState *w, struct RtRing *r, ULONG clo)
     ws_log(r, clo, RT_SAMPLE_SKIP, WS_SKIP_NOMEM, 0, 0, 0);
 }
 
-/* The id NextCmdID() would hand out next: never 0, never a quarantined one */
-static inline UWORD ws_next_id(UWORD cmdID, const UWORD *quarantine)
+/* The walk NextCmdID() makes, and the sampler's own ids: from cmdID, the
+   next id that is not 0, not in s_CtrlQuarantine, not set in ws_Lost.
+   After 65536 blocked candidates in a row (every id blocked) the sampler
+   stops (id_space) and ws_Lost is dropped from the walk, which then ends
+   as the base driver's does: at most 33 ids are blocked there. */
+static inline UWORD ws_next_id(struct WsState *w, struct RtRing *r, ULONG clo, UWORD cmdID,
+                               const UWORD *quarantine)
 {
     UWORD id = cmdID;
-    ULONG i;
+    ULONG i, blocked = 0;
     int used;
 
     do
@@ -235,6 +268,13 @@ static inline UWORD ws_next_id(UWORD cmdID, const UWORD *quarantine)
         for (i = 0; i < 32 && !used; i++)
             if (quarantine[i] == id)
                 used = 1;
+        if (!used && !w->ws_LostOff && ws_lost(w, id))
+            used = 1;
+        if (used && ++blocked >= 65536 && !w->ws_LostOff)
+        {
+            w->ws_LostOff = 1;
+            ws_stop(w, r, clo, WS_STOP_ID_SPACE, 0, blocked);
+        }
     } while (used);
     return id;
 }
@@ -244,7 +284,7 @@ static inline UWORD ws_next_id(UWORD cmdID, const UWORD *quarantine)
 static inline int ws_take_id(struct WsState *w, struct RtRing *r, ULONG clo, UWORD *cmdID,
                              const UWORD *quarantine, UWORD *idOut)
 {
-    UWORD id = ws_next_id(*cmdID, quarantine);
+    UWORD id = ws_next_id(w, r, clo, *cmdID, quarantine);
     ULONG dist = (UWORD)(id - w->ws_E);
 
     if (w->ws_State != WS_LIVE)
@@ -266,15 +306,13 @@ static inline int ws_take_id(struct WsState *w, struct RtRing *r, ULONG clo, UWO
 }
 
 /* NextCmdID() handed id to another caller (under its Forbid()): it is no
-   longer a sample id, and a reply to it is never taken as a late sample */
+   longer a sample id.  Only the ws_Issued mark goes; a ws_Lost bit is
+   never cleared here -- ws_next_id does not hand out a ws_Lost id while
+   ws_Lost is consulted, and after the id_space guard the bit stays as it
+   was.  Only the id's own late reply clears it (ws_reply_late). */
 static inline void ws_realloc(struct WsState *w, UWORD id)
 {
-    ULONG i;
-
     w->ws_Issued[id >> 3] &= (UBYTE)~(1 << (id & 7));
-    for (i = 0; i < WS_TOMBS; i++)
-        if (w->ws_TombId[i] == id)
-            w->ws_TombUsed[i] = 0;
 }
 
 /* The request with this id has gone out, bytes long */
@@ -290,7 +328,7 @@ static inline void ws_sent(struct WsState *w, struct RtRing *r, ULONG clo, UWORD
         w->ws_SlotReqClo = clo;
     }
     else
-        ws_tomb(w, id, clo);        /* disabled while it was being built */
+        ws_retire(w, id, clo);      /* stopped while it was being built */
 }
 
 /* A control reply, before the synchronous waiters: taken only if it is the
@@ -342,6 +380,9 @@ static inline int ws_reply_late(struct WsState *w, struct RtRing *r, ULONG clo, 
 
     if (w->ws_State == WS_IDLE || cmd != WS_GET_VAR || !ws_issued(w, id))
         return WS_R_NOTMINE;
+    /* its one reply -- id and command checked above, under the Forbid()
+       NextCmdID() allocates under: the id may be handed out again */
+    w->ws_Lost[id >> 3] &= (UBYTE)~(1 << (id & 7));
     for (i = 0; i < WS_TOMBS; i++)
         if (w->ws_TombUsed[i] && w->ws_TombId[i] == id)
         {

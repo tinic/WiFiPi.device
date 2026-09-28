@@ -47,6 +47,8 @@ expect(kinds == {"SAMPLE_REQ": 20, "SAMPLE_REP": 21, "SAMPLE_VAL": 22, "SAMPLE_S
 
 skips_c = {int(m.group(2)): m.group(1).lower() for m in re.finditer(r"WS_SKIP_(\w+)\s*=\s*(\d+)", hdr)}
 expect(skips_c == wlsample.SKIP_REASON, "skip reasons as the decoder names them: %s" % skips_c)
+stops_c = {int(m.group(2)): m.group(1).lower() for m in re.finditer(r"WS_STOP_(\w+)\s*=\s*(\d+)", hdr)}
+expect(stops_c == wlsample.STOP_REASON, "stop reasons as the decoder names them: %s" % stops_c)
 
 # --- a synthetic run --------------------------------------------------------
 OFF = 1_790_000_000.0

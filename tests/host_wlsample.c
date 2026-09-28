@@ -21,6 +21,9 @@ typedef int32_t LONG;
 static int checks, failures;
 
 #define EXPECT(c) do { checks++; if (!(c)) { failures++; printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #c); } } while (0)
+/* inside a long loop: one check however many turns */
+static int quietFailed;
+#define EXPECT_QUIET(c) do { if (!(c) && !quietFailed++) { failures++; printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #c); } } while (0)
 
 static struct RtRing *ring;
 static struct WsState *ws;
@@ -91,7 +94,7 @@ static UBYTE credit(void)
 
 static UWORD other_id(void)
 {
-    cmdID = ws_next_id(cmdID, quar);
+    cmdID = ws_next_id(ws, ring, now, cmdID, quar);   /* NextCmdID() under WIFIPI_WLSAMPLE, as is */
     ws_realloc(ws, cmdID);
     return cmdID;
 }
@@ -511,57 +514,130 @@ int main(void)
     EXPECT(e && e->r_A == WS_STOP_IDCAP && e->r_B == (UWORD)(4000 + 60000) && e->r_D == 60000);
     EXPECT(cmdID == (UWORD)(4000 + 59999) && count(RT_SAMPLE_REQ) == 0);
 
-    /* ---- LAP-AFTER-STOP: a former sample id, handed to a sync caller ----- */
-    fresh(5000);
-    ws_enable(ws, ring, cmdID, now);
-    EXPECT(tick(0, &s1));                           /* 5001, answered */
-    reply(s1, WS_GET_VAR, 848);
-    now += 50000;
-    EXPECT(tick(0, &s2));                           /* 5002, never answered */
-    req = now;
-    now += 500000;
-    tick(0, &sy);                                   /* LOST, tombstoned */
-    ws_disable(ws, ring, now);
-    EXPECT(ws_issued(ws, s1) && ws_issued(ws, s2));
-    for (ULONG n = 0; n < 65536; n++)               /* sync callers go all the way round */
-        other_id();
-    while (cmdID != (UWORD)(s1 - 1))
-        other_id();
-    view();
-    sy = sync_req(WS_GET_VAR);
-    EXPECT(sy == s1 && !ws_issued(ws, s1));         /* handing it out cleared the mark */
-    EXPECT(reply(sy, WS_GET_VAR, 848) == WAITER && count(RT_SAMPLE_LATE) == 0 && count(0) == 0);
+    /* ---- LOST, then full laps: the lost id is skipped; the answered one is
+       handed out again; s_CtrlQuarantine untouched; ws_Lost survives
+       disable and refused re-enables ------------------------------------ */
+    {
+        UWORD qsnap[32];
+        fresh(5000);
+        quar[0] = 5100; quar[1] = 12345; quar[31] = 60000;
+        memcpy(qsnap, quar, sizeof(qsnap));
+        ws_enable(ws, ring, cmdID, now);
+        EXPECT(tick(0, &s1));                       /* 5001, answered */
+        reply(s1, WS_GET_VAR, 848);
+        now += 50000;
+        EXPECT(tick(0, &s2));                       /* 5002, never answered */
+        req = now;
+        now += 500000;
+        tick(1, &sy);                               /* LOST; a sync waits, so no new sample */
+        EXPECT(ws_lost(ws, s2) && !ws_lost(ws, s1) && !ws->ws_SlotLive);
+        ws_disable(ws, ring, now);
+        EXPECT(ws_enable(ws, ring, cmdID, now) == -1 && ws_enable(ws, ring, cmdID, now) == -1);
+        EXPECT(ws_lost(ws, s2));                    /* survives disable and refused enables */
+        int seen2 = 0, seen1 = 0;
+        for (ULONG n = 0; n < 2 * 65536; n++)       /* two full laps of sync allocations */
+        {
+            UWORD id = other_id();
+            if (id == s2) seen2++;
+            if (id == s1) seen1++;
+            if (id == 0 || id == 5100 || id == 12345 || id == 60000) seen2 += 1000;   /* base rules still hold */
+        }
+        EXPECT(seen2 == 0 && seen1 == 2);
+        EXPECT(ws_lost(ws, s2) && !ws->ws_LostOff && memcmp(quar, qsnap, sizeof(qsnap)) == 0);
+        /* the answered id went to a sync caller: its reply is the waiter's */
+        while (cmdID != (UWORD)(s1 - 1))
+            other_id();
+        sy = sync_req(WS_GET_VAR);
+        view();
+        EXPECT(sy == s1 && !ws_issued(ws, s1));
+        EXPECT(reply(sy, WS_GET_VAR, 848) == WAITER && count(0) == 0);
 
-    /* ---- a late reply before its id is handed out again: LATE, values dropped */
+        /* ---- the lost id's late reply, before it is ever reused: LATE, no
+           values, not a waiter's; it clears the bit and the id is reusable */
+        while (cmdID != (UWORD)(s2 - 1))
+            other_id();
+        sy = sync_req(WS_GET_VAR);                  /* skips s2: a waiter with the same command */
+        EXPECT(sy == (UWORD)(s2 + 1));
+        now += 30000;
+        view();
+        EXPECT(reply(s2, 263, 848) == NONE && ws_lost(ws, s2));        /* wrong command: bit stays */
+        EXPECT(reply(s2, WS_GET_VAR, 848) == WS_R_LATE && count(RT_SAMPLE_VAL) == 0);
+        EXPECT(last(RT_SAMPLE_LATE)->r_A == 1 && last(RT_SAMPLE_LATE)->r_C == now - req);
+        EXPECT(!ws_lost(ws, s2) && waiters[0].live);                   /* the waiter still waits */
+        reply(sy, WS_GET_VAR, 848);
+        while (cmdID != (UWORD)(s2 - 1))
+            other_id();
+        EXPECT(other_id() == s2);                   /* reusable after its one reply */
+        EXPECT(memcmp(quar, qsnap, sizeof(qsnap)) == 0);
+    }
+
+    /* ---- outstanding at DISABLE: set in ws_Lost; its late reply is never a
+       waiter's, even with a same-command waiter queued behind it ---------- */
     fresh(6000);
     ws_enable(ws, ring, cmdID, now);
     EXPECT(tick(0, &s1));
-    req = now;
-    now += 500000;
-    tick(1, &s2);                                   /* LOST */
-    for (int k = 0; k < 100; k++)
-        other_id();                                 /* others move on, nowhere near s1 again */
-    now += 7000;
+    ws_disable(ws, ring, now);
+    EXPECT(ws_lost(ws, s1) && !ws->ws_SlotLive);
+    sy = sync_req(WS_GET_VAR);
+    EXPECT(sy == s1 + 1);
+    for (ULONG n = 0; n < 65536; n++)
+        EXPECT_QUIET(other_id() != s1);
     view();
-    EXPECT(reply(s1, WS_GET_VAR, 848) == WS_R_LATE && count(RT_SAMPLE_VAL) == 0);
-    EXPECT(last(RT_SAMPLE_LATE)->r_C == now - req && last(RT_SAMPLE_LATE)->r_D == (REPLY_FRAME << 16));
+    EXPECT(reply(s1, WS_GET_VAR, 848) == WS_R_LATE && count(RT_SAMPLE_VAL) == 0 && waiters[0].live);
+    EXPECT(!ws_lost(ws, s1));
 
-    /* ---- a late sample reply after its id went to a sync waiter with the
-       same command: the waiter takes it.  The base driver has this exposure
-       already (a reply delayed past 65,504 later ids); zz9k accepted it: the
-       waiter's own id/command match governs. */
+    /* ---- STOP by idcap: the slot is free then (ws_tick hands out a sample
+       only with the slot free), and the ids lost before it stay set; the
+       stop path retires a live slot if one were there -------------------- */
     fresh(7000);
     ws_enable(ws, ring, cmdID, now);
     EXPECT(tick(0, &s1));
     now += 500000;
-    tick(1, &s2);                                   /* LOST */
-    ws_disable(ws, ring, now);
-    while (cmdID != (UWORD)(s1 - 1))
-        other_id();
-    sy = sync_req(WS_GET_VAR);
-    EXPECT(sy == s1);
+    tick(1, &s2);                                   /* s1 LOST */
+    cmdID = (UWORD)(7000 + 59999);
+    now += 50000;
+    EXPECT(!tick(0, &s2) && last(RT_SAMPLER_STOP)->r_A == WS_STOP_IDCAP);
+    EXPECT(ws_lost(ws, s1) && ws->ws_State == WS_STOPPED);
+    for (ULONG n = 0; n < 65536; n++)
+        EXPECT_QUIET(other_id() != s1);
     view();
-    EXPECT(reply(s1, WS_GET_VAR, 848) == WAITER && count(0) == 0);   /* the old sample's answer */
+    EXPECT(reply(s1, WS_GET_VAR, 848) == WS_R_LATE && !ws_lost(ws, s1));
+    fresh(7500);                                    /* a live slot at an idcap stop, forced */
+    ws_enable(ws, ring, cmdID, now);
+    EXPECT(tick(0, &s1));
+    cmdID = (UWORD)(7500 + 59999);
+    EXPECT(!ws_take_id(ws, ring, now, &cmdID, quar, &s2));
+    EXPECT(last(RT_SAMPLER_STOP)->r_A == WS_STOP_IDCAP && ws_lost(ws, s1) && !ws->ws_SlotLive);
+
+    /* ---- worst case under the cap: 60000 ids set in a row, the base
+       quarantine right behind them; the walk ends, the guard does not fire */
+    fresh(100);
+    ws_enable(ws, ring, cmdID, now);
+    for (ULONG k = 1; k <= 60000; k++)
+        ws->ws_Lost[(UWORD)(100 + k) >> 3] |= (UBYTE)(1 << ((UWORD)(100 + k) & 7));
+    for (int q = 0; q < 32; q++)
+        quar[q] = (UWORD)(100 + 60001 + q);
+    view();
+    EXPECT(other_id() == (UWORD)(100 + 60033));
+    EXPECT(!ws->ws_LostOff && ws->ws_State == WS_LIVE && count(RT_SAMPLER_STOP) == 0);
+
+    /* ---- every id blocked: the guard stops the sampler (id_space) and the
+       walk becomes the base one; no ws_Lost bit is cleared on allocation -- */
+    fresh(200);
+    ws_enable(ws, ring, cmdID, now);
+    memset(ws->ws_Lost, 0xff, sizeof(ws->ws_Lost));
+    view();
+    EXPECT(other_id() == 201);
+    e = last(RT_SAMPLER_STOP);
+    EXPECT(e && e->r_A == WS_STOP_ID_SPACE && e->r_D == 65536 && ws->ws_LostOff && ws->ws_State == WS_STOPPED);
+    EXPECT(other_id() == 202 && ws_lost(ws, 201) && ws_lost(ws, 202));
+    EXPECT(count(RT_SAMPLER_STOP) == 1);           /* once */
+    {
+        int all = 1;
+        for (ULONG k = 0; k < sizeof(ws->ws_Lost); k++)
+            if (ws->ws_Lost[k] != 0xff) all = 0;
+        EXPECT(all);
+    }
 
     /* ---- never enabled: every reply is the waiters' --------------------- */
     fresh(900);

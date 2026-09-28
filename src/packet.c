@@ -2684,6 +2684,14 @@ static UWORD NextCmdID(struct SDIO *sdio)
     BOOL used;
 
     Forbid();
+#ifdef WIFIPI_WLSAMPLE
+    /* the same walk, skipping ws_Lost too (#89): src/wlsample.h */
+    (void)i;
+    (void)used;
+    id = ws_next_id(&sdio->s_Ws, sdio->s_Ring, RtClock(sdio), sdio->s_CmdID, sdio->s_CtrlQuarantine);
+    sdio->s_CmdID = id;
+    ws_realloc(&sdio->s_Ws, id);
+#else
     do
     {
         id = ++(sdio->s_CmdID);
@@ -2692,8 +2700,6 @@ static UWORD NextCmdID(struct SDIO *sdio)
             if (sdio->s_CtrlQuarantine[i] == id)
                 used = TRUE;
     } while (used);
-#ifdef WIFIPI_WLSAMPLE
-    ws_realloc(&sdio->s_Ws, id);            /* no longer a sample id (#89) */
 #endif
     Permit();
     return id;

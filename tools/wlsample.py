@@ -50,7 +50,7 @@ FIELDS = ("tbtt", "rxbeaconmbss", "rxframe", "rxcrsglitch", "rxbadplcp",
 (K_REQ, K_REP, K_VAL, K_SKIP, K_LOST, K_LATE, K_STOP, K_REFUSED, K_ENABLE) = range(20, 29)
 REP_STATUS = {0: "ok", 1: "bad_layout", 2: "fw_error"}
 SKIP_REASON = {1: "slot_busy", 2: "ctrl_busy", 3: "nomem", 4: "stopped", 5: "no_credit"}
-STOP_REASON = {1: "idcap", 2: "disabled", 3: "wrap"}
+STOP_REASON = {1: "idcap", 2: "disabled", 3: "wrap", 4: "id_space"}
 BEACON_S = 0.1024
 LABEL = "label=descriptive_association_not_a_falsifier"
 
