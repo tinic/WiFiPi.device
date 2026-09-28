@@ -435,5 +435,28 @@ print("RING capacity=%d per_sample=%d sample_records_per_s=%d traffic_records_pe
           cap / (traffic + samp)))
 expect(leg <= 0.9 * cap, "a 180 s leg stays within 90%% of the ring (%.1f%%)" % (100 * leg / cap))
 
+# --- FWINFO records (kind 30), listed by `fwinfo`, invisible to `samples` ----
+fr = [(t + 50, 30, 0x3c, 0, 643651, 0x78DD5FDC), (t + 60, 30, 0x3d, 8, 616233, 0x85787FD7),
+      (t + 70, 30, 0x2c, 0, 643651, 0x78DD5FDC)]
+recs3 = sorted(recs + fr, key=lambda r: r[0])
+dump3 = os.path.join(tmp, "ring_fwinfo.bin")
+with open(dump3, "wb") as f:
+    f.write(struct.pack(">IHHIIIIII", 0x52544431, 1, 16, 1 << 22, len(recs3), 0, len(recs3), 0,
+                        recs3[-1][0]) + b"".join(struct.pack(">IBBHII", *r) for r in recs3))
+rq = subprocess.run([sys.executable, TOOL, "fwinfo", dump3], capture_output=True, text=True)
+fl = rq.stdout.splitlines()
+expect(rq.returncode == 0 and len(fl) == 4 and fl[-1] == "fwinfo_records=3", "fwinfo lists three: %s" % fl)
+expect(fl[0].endswith("flags=loaded,clmsent,clmstatus,ver clmload_status=0 clmload_status_meaning=zero "
+                      "fw_size=643651 fw_crc32=0x78dd5fdc"), fl[0])
+expect("flags=altdir,loaded,clmsent,clmstatus,ver clmload_status=8 clmload_status_meaning=chipid_mismatch "
+       "fw_size=616233 fw_crc32=0x85787fd7" in fl[1], fl[1])
+expect("clmload_status_meaning=not_asked" in fl[2], fl[2])
+rw2 = subprocess.run([sys.executable, TOOL, "btc", dump3], capture_output=True, text=True)
+expect(rw2.stdout == "btc_records=0\n", "btc ignores FWINFO records")
+fh = open(os.path.join(HERE, "..", "src", "fwinfo.h")).read()
+expect(re.search(r"#define RT_FWINFO\s+30\b", fh) is not None and wlsample.K_FWINFO == 30, "RT_FWINFO is kind 30 on both sides")
+fl_c = {int(m.group(2), 16): m.group(1).lower() for m in re.finditer(r"#define FWI_F_(\w+)\s+0x([0-9a-f]+)", fh)}
+expect(fl_c == dict(wlsample.FWI_FLAGS), "FWINFO flag names as the decoder's: %s" % fl_c)
+
 print("RESULT test_wlsample checks=%d failures=%d" % (checks, failures))
 sys.exit(1 if failures else 0)

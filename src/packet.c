@@ -896,6 +896,17 @@ ULONG RtDump(struct SDIO *sdio, void *out, ULONG size)
     return n;
 }
 
+#ifdef WIFIPI_FWINFO
+/* The 'ver' answer into the firmware record, and the record into the ring */
+void FwInfoVer(struct SDIO *sdio, const char *ver, LONG rc)
+{
+    struct FwInfo *fi = &sdio->s_Chip->c_FwInfo;
+
+    fwi_ver(fi, ver, 128, rc);
+    RtPut(sdio, RT_FWINFO, (UBYTE)fi->fi_Flags, (UWORD)fi->fi_ClmStatus, fi->fi_FwSize, fi->fi_FwCrc32);
+}
+#endif
+
 #ifdef WIFIPI_WLSAMPLE
 /* In-leg counter sampler (#89): the pure part is src/wlsample.h, called here
    under Forbid() -- enable/disable come from a caller's task, the tick and
@@ -3571,6 +3582,11 @@ int PacketUploadCLM(struct SDIO *sdio)
 
         struct UploadHeader *upload = AllocPooled(WiFiBase->w_MemPool, sizeof(struct UploadHeader) + MAX_CHUNK_LEN);
         ULONG err = 0;
+#ifdef WIFIPI_FWINFO
+        struct FwInfo *fi = &sdio->s_Chip->c_FwInfo;
+        ULONG fiChunk = 0;
+        fwi_clm_begin(fi, dataLen);
+#endif
 
         if (upload)
         {
@@ -3594,6 +3610,9 @@ int PacketUploadCLM(struct SDIO *sdio)
                 upload->crc = 0;
 
                 err = PacketSetVar(sdio, "clmload", upload, sizeof(struct UploadHeader) + transferLen);
+#ifdef WIFIPI_FWINFO
+                fwi_clm_chunk(fi, fiChunk++, err);
+#endif
                 /* a firmware that stopped answering is not asked again, chunk
                    after chunk, 2.5 s each (#93); its refusals are ignored as before */
                 if (PACKET_CTRL_DEAD(err))
@@ -3608,6 +3627,14 @@ int PacketUploadCLM(struct SDIO *sdio)
             FreePooled(WiFiBase->w_MemPool, upload, sizeof(struct UploadHeader) + MAX_CHUNK_LEN);
             if (PACKET_CTRL_DEAD(err))
                 return err;
+#ifdef WIFIPI_FWINFO
+            /* after the last chunk, whatever the chunks answered (#89) */
+            {
+                ULONG st = 0;
+                LONG rc = PacketGetVarMin(sdio, "clmload_status", &st, 4, 4);
+                fwi_clm_status(fi, LE32(st), rc);
+            }
+#endif
         }
 
         //D(bug("[WiFi] CLM upload complete. Getting status\n"));
@@ -3857,7 +3884,11 @@ void StartPacketReceiver(struct SDIO *sdio)
 
     char ver[128];
     for (int i=0; i < 128; i++) ver[i] = 0;
+#ifdef WIFIPI_FWINFO
+    FwInfoVer(sdio, ver, PacketGetVar(sdio, "ver", ver, 128));
+#else
     PacketGetVar(sdio, "ver", ver, 128);
+#endif
 
     // Remove \r and \n from version string. Replace first found with 0
     for (int i=0; i < 128; i++) { if (ver[i] == 13 || ver[i] == 10) { ver[i] = 0; break; } }

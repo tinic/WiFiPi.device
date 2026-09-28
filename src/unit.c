@@ -1791,7 +1791,15 @@ static int Do_S2_CONFIGINTERFACE(struct IOSana2Req *io)
 
         char ver[128];
         for (int i=0; i < 128; i++) ver[i] = 0;
+#ifdef WIFIPI_FWINFO
+        {
+            LONG verRc = PacketGetVar(sdio, "ver", ver, 128);
+            FwInfoVer(sdio, ver, verRc);
+            CFG_ALIVE(verRc);
+        }
+#else
         CFG_ALIVE(PacketGetVar(sdio, "ver", ver, 128));
+#endif
 
         // Remove \r and \n from version string. Replace first found with 0
         for (int i=0; i < 128; i++) { if (ver[i] == 13 || ver[i] == 10) { ver[i] = 0; break; } }
@@ -2103,6 +2111,22 @@ void HandleRequest(struct IOSana2Req *io)
 #ifdef WIFIPI_WLCNT
             case WIFIPI_CMD_WLCNT:
                 complete = Do_WlCnt(io);
+                break;
+#endif
+#ifdef WIFIPI_FWINFO
+            case WIFIPI_CMD_FWINFO:
+                /* the boot-time firmware record, whole (#89) */
+                if (io->ios2_Data == NULL || io->ios2_DataLength < sizeof(struct FwInfo))
+                {
+                    io->ios2_DataLength = 0;
+                    io->ios2_Req.io_Error = S2ERR_BAD_ARGUMENT;
+                }
+                else
+                {
+                    CopyMem(&WiFiBase->w_SDIO->s_Chip->c_FwInfo, io->ios2_Data, sizeof(struct FwInfo));
+                    io->ios2_DataLength = sizeof(struct FwInfo);
+                }
+                complete = 1;
                 break;
 #endif
 #ifdef WIFIPI_BTC

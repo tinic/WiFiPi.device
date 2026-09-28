@@ -11,6 +11,9 @@
 #include <proto/exec.h>
 #include <proto/devicetree.h>
 #include <proto/dos.h>
+#ifdef WIFIPI_FWINFO
+#include <dos/var.h>
+#endif
 #endif
 
 #include "findtoken.h"
@@ -248,6 +251,32 @@ BOOL LoadFirmware(struct Chip *chip)
     Write(file, buf, 4);
     Close(file);
 
+#ifdef WIFIPI_FWINFO
+    /* One directory for all three files, chosen before the first: the
+       stock DEVS:Firmware, or ENV:WiFiPi/FirmwareDir when it is set.  A
+       file missing there, or a variable that is no absolute path, fails
+       the load; nothing falls back to DEVS: (#89) */
+    struct FwInfo *fi = &chip->c_FwInfo;
+    char fwEnv[FWI_ENV_BUF];
+    LONG fwEnvLen;
+    int fwSel;
+
+    fwi_init(fi);
+    fwEnvLen = GetVar((CONST_STRPTR)FWI_ENV_NAME, (STRPTR)fwEnv, sizeof(fwEnv), GVF_GLOBAL_ONLY);
+    if (fwEnvLen >= FWI_ENV_BUF - 1)
+        fwEnvLen = FWI_ENV_BUF;                     /* filled the buffer: cut off, refused */
+    fwSel = fwi_resolve(fwEnv, fwEnvLen, fi->fi_Dir);
+    if (fwSel == FWI_DIR_BAD)
+    {
+        fi->fi_Flags |= FWI_F_DIRBAD;
+        D(bug("[WiFi] ENV:%s is not a usable directory: firmware not loaded\n", (ULONG)FWI_ENV_NAME));
+        return FALSE;
+    }
+    if (fwSel == FWI_DIR_ALT)
+        fi->fi_Flags |= FWI_F_ALTDIR;
+    D(bug("[WiFi] Firmware directory: %s\n", (ULONG)fi->fi_Dir));
+#endif
+
     /* Firmware name shall never exceed total size of 256 bytes */
     STRPTR path = AllocVecPooled(WiFiBase->w_MemPool, 256);
     
@@ -293,10 +322,18 @@ BOOL LoadFirmware(struct Chip *chip)
 
                     D(bug("[WiFi] ChipID match\n"));
 
+#ifdef WIFIPI_FWINFO
+                    if (!fwi_join(fi->fi_Dir, (const char *)fw->binFile, (char *)path, 255))
+                    {
+                        D(bug("[WiFi] Firmware path does not fit\n"));
+                        return FALSE;
+                    }
+#else
                     /* Reset path */
                     AddPart(path, (CONST_STRPTR)"DEVS:Firmware", 255);
                     /* Add bin file to the path */
                     AddPart(path, fw->binFile, 255);
+#endif
 
                     file = Open(path, MODE_OLDFILE);
                     if (file == 0)
@@ -330,14 +367,26 @@ BOOL LoadFirmware(struct Chip *chip)
                     chip->c_FirmwareBase = AllocPooled(WiFiBase->w_MemPool, size);
                     CopyMem(buffer, chip->c_FirmwareBase, size);
                     chip->c_FirmwareSize = size;
+#ifdef WIFIPI_FWINFO
+                    fi->fi_FwSize = size;
+                    fi->fi_FwCrc32 = fwi_crc32(0, chip->c_FirmwareBase, size);
+#endif
 
                     /* If clm_blob file exists, load it */
                     if (fw->clmFile != NULL)
                     {
+#ifdef WIFIPI_FWINFO
+                        if (!fwi_join(fi->fi_Dir, (const char *)fw->clmFile, (char *)path, 255))
+                        {
+                            D(bug("[WiFi] Firmware path does not fit\n"));
+                            return FALSE;
+                        }
+#else
                         /* Reset path */
                         AddPart(path, (CONST_STRPTR)"DEVS:Firmware", 255);
                         /* Add bin file to the path */
                         AddPart(path, fw->clmFile, 255);
+#endif
 
                         file = Open(path, MODE_OLDFILE);
                         if (file == 0)
@@ -379,10 +428,18 @@ BOOL LoadFirmware(struct Chip *chip)
                     }
 
                     /* Load NVRAM file */
+#ifdef WIFIPI_FWINFO
+                    if (!fwi_join(fi->fi_Dir, (const char *)fw->txtFile, (char *)path, 255))
+                    {
+                        D(bug("[WiFi] Firmware path does not fit\n"));
+                        return FALSE;
+                    }
+#else
                     /* Reset path */
                     AddPart(path, (CONST_STRPTR)"DEVS:Firmware", 255);
                     /* Add bin file to the path */
                     AddPart(path, fw->txtFile, 255);
+#endif
 
                     file = Open(path, MODE_OLDFILE);
                     if (file == 0)
@@ -485,6 +542,9 @@ BOOL LoadFirmware(struct Chip *chip)
                     /* Get rid of temporary buffer */
                     FreeVecPooled(WiFiBase->w_MemPool, buffer);
                     FreeVecPooled(WiFiBase->w_MemPool, path);
+#ifdef WIFIPI_FWINFO
+                    fi->fi_Flags |= FWI_F_LOADED;
+#endif
                     
                     return TRUE;
                 }

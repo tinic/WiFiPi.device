@@ -16,6 +16,9 @@
 #include "sdio.h"
 #include "d11.h"
 #include "packet.h"
+#ifdef WIFIPI_FWINFO
+#include "fwinfo.h"
+#endif
 
 #define STR(s) #s
 #define XSTR(s) STR(s)
@@ -146,6 +149,9 @@ struct Chip {
 
     UBYTE               c_D11Type;
 
+#ifdef WIFIPI_FWINFO
+    struct FwInfo       c_FwInfo;   /* boot-time firmware record (#89), src/fwinfo.h */
+#endif
     struct Core *       (*GetCore)(struct Chip *chip, UWORD coreID);
     void                (*SetPassive)(struct Chip *);
     BOOL                (*SetActive)(struct Chip *, ULONG resetVector);

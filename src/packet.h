@@ -310,6 +310,9 @@ ULONG RtClock(struct SDIO *sdio);
 void RtPut(struct SDIO *sdio, UBYTE kind, UBYTE a, UWORD b, ULONG c, ULONG d);
 ULONG RtDump(struct SDIO *sdio, void *out, ULONG size);
 #define RT(sdio, k, a, b, c, d) RtPut((sdio), (k), (a), (b), (c), (d))
+#ifdef WIFIPI_FWINFO
+void FwInfoVer(struct SDIO *sdio, const char *ver, LONG rc);
+#endif
 #ifdef WIFIPI_WLSAMPLE
 int WsEnable(struct SDIO *sdio);
 void WsDisable(struct SDIO *sdio);

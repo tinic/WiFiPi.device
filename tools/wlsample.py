@@ -3,6 +3,7 @@
 
   wlsample.py samples DUMP MARKS [GAPS] [--gap START END]...
   wlsample.py btc DUMP                  the BT-coexistence records (hw34)
+  wlsample.py fwinfo DUMP               the boot-time firmware records (src/fwinfo.h)
 
 DUMP is a ringdump from a driver built with -DWIFIPI_WLSAMPLE
 -DWIFIPI_RINGTRACE after `wlsample ENABLE`; MARKS the peer's alignment pings
@@ -83,6 +84,9 @@ K_BTC = 29                                  # src/btc.h RT_BTC
 BTC_OP = {1: "get", 2: "set"}
 BTC_NAME = {1: "btc_mode", 2: "btc_flags", 3: "btc_dos_status"}
 BTC_RC_REFUSED = 0x7fff0100
+K_FWINFO = 30                               # src/fwinfo.h RT_FWINFO
+FWI_FLAGS = ((0x01, "altdir"), (0x02, "dirbad"), (0x04, "loaded"), (0x08, "clmsent"),
+             (0x10, "clmstatus"), (0x20, "ver"))
 BEACON_S = 0.1024
 LABEL = "label=descriptive_association_not_a_falsifier"
 
@@ -377,7 +381,28 @@ def cmd_btc(dump):
     return out
 
 
+def cmd_fwinfo(dump):
+    """one line per RT_FWINFO record: flags, clmload_status, firmware size and CRC-32"""
+    h, recs = rt.load(dump)
+    out = []
+    for r in recs:
+        if r["k"] != K_FWINFO:
+            continue
+        flags = ",".join(n for b, n in FWI_FLAGS if r["a"] & b) or "none"
+        st = r["b"]
+        meaning = ("not_asked" if not r["a"] & 0x10 else "zero" if st == 0
+                   else "chipid_mismatch" if st == 8 else "undocumented")
+        out.append("fwinfo t_us=%d clo=%d flags=%s clmload_status=%d clmload_status_meaning=%s "
+                   "fw_size=%d fw_crc32=0x%08x" % (r["t"], r["clo"], flags, st, meaning, r["c"], r["d"]))
+    out.append("fwinfo_records=%d" % len(out))
+    return out
+
+
 def main(argv):
+    if len(argv) == 2 and argv[0] == "fwinfo":
+        for line in cmd_fwinfo(argv[1]):
+            print(line)
+        return 0
     if len(argv) == 2 and argv[0] == "btc":
         for line in cmd_btc(argv[1]):
             print(line)
