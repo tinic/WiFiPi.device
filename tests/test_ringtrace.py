@@ -79,6 +79,7 @@ def txrc(t, status, first, count, us=300, irq=0):
 
 t = BASE
 put(t, 14, 0, 0, 0, 0)                              # orphan TXID2 (its TXID1 lapped out)
+txid(t, 0x4000, 1, 1, 0x10, 0, 1, 0x20); txrc(t, 3, 0x20, 1)   # EARLY: before the capture's start (--times)
 for s in range(5):
     ping(t + s * 100_000, s)
 t += 1_000_000
@@ -126,6 +127,8 @@ txid(G + 400_000, 0x1008, 9380, 1, 0x10, 0, 1, 0x3c)               # outside the
 t += 5_000_000                                                      # past the CLO wrap
 for s in range(5, 10):
     ping(t + (s - 5) * 100_000, s)
+txid(t + 500_000, 0x4001, 1, 1, 0x10, 0, 1, 0x21); txrc(t + 500_000, 3, 0x21, 1)   # LATE: its window outlasts the capture
+LATE_T = t + 500_000
 
 body = b"".join(struct.pack(">IBBHII", *r) for r in recs)
 hdr = struct.pack(">IHHIIIIII", 0x52544431, 1, 16, 1 << 22, len(recs) + 7, 7, len(recs), 7, (t + 900_000) & 0xFFFFFFFF)
@@ -145,11 +148,11 @@ h, rs = ringtrace.load(dump)
 expect(h["lost"] == 7 and h["count"] == len(recs), "header lost/count")
 expect(rs[-1]["t"] > 1 << 32, "CLO unwrapped past the wrap")
 fr = ringtrace.tx_frames(rs)
-expect(len(fr) == 11, "eleven TX TCP frames paired (orphan TXID2 skipped): %d" % len(fr))
-f0 = fr[0]
+expect(len(fr) == 13, "thirteen TX TCP frames paired (orphan TXID2 skipped): %d" % len(fr))
+f0 = fr[1]
 expect((f0["ipid"], f0["ack"], f0["flags"], f0["sport"], f0["dport"], f0["src"], f0["dst"], f0["sdpcm"], f0["idx"], f0["count"], f0["write"])
        == (0x1000, 5000, 0x10, 7502, 40462, 137, 136, 0x31, 0, 2, "ok"), "first frame fields")
-expect(fr[2]["len"] == 100 and ringtrace.flagstr(fr[2]["flags"]) == "PA" and fr[2]["write"] == "failed", "F3 fields, write failed")
+expect(fr[3]["len"] == 100 and ringtrace.flagstr(fr[3]["flags"]) == "PA" and fr[3]["write"] == "failed", "F3 fields, write failed")
 expect([ringtrace.txrc_state(a) for a in (3, 12, 15, 1, 4, 7, 13, 0)] == ["ok", "ok", "ok", "failed", "failed", "failed", "failed", "unknown"],
        "TXRC status decode")
 
@@ -167,7 +170,7 @@ print(out, end="")
 lines = out.splitlines()
 def line(ipid):
     return next((l for l in lines if " ip_id=%d " % ipid in l), "")
-expect(lines[-1] == "produced_at_host=10 seen=4 unseen=5 ambiguous=1", "summary")
+expect(lines[-1] == "produced_at_host=10 seen=4 unseen=5 ambiguous=1 censored=0", "summary")
 expect("SEEN" in line(0x1000) and "delay_ms=2.0" in line(0x1000) and "write=ok" in line(0x1000), "F1 seen 2 ms, write ok")
 expect("SEEN" in line(0x1001) and "delay_ms=150.0" in line(0x1001), "F2 seen 150 ms, not the other host's frame")
 expect(" UNSEEN to_dump_end_s=" in line(0x1002) and "write=failed" in line(0x1002), "F3 near miss in seq: unseen; write failed")
@@ -180,13 +183,27 @@ expect(" UNSEEN to_dump_end_s=" in line(0x1007) and "write=unknown" in line(0x10
 expect(line(0x1008) == "", "frame outside the gap not listed")
 expect("flow_map flow=.137:7502>.136:40462 pcap=192.168.1.137:7502>192.168.1.136:40462" in lines, "flow mapped to full addresses")
 expect(any(l.startswith("flow_map flow=.137:5555>.136:6666 UNMAPPED") for l in lines), "unmapped flow reported")
-expect("flow=.137:7502>.136:40462 produced_at_host=9 seen=4 unseen=4 ambiguous=1" in lines, "per-flow counts")
-expect("flow=.137:5555>.136:6666 produced_at_host=1 seen=0 unseen=1 ambiguous=0" in lines, "per-flow counts, unmapped flow")
+expect("flow=.137:7502>.136:40462 produced_at_host=9 seen=4 unseen=4 ambiguous=1 censored=0" in lines, "per-flow counts")
+expect("flow=.137:5555>.136:6666 produced_at_host=1 seen=0 unseen=1 ambiguous=0 censored=0" in lines, "per-flow counts, unmapped flow")
 expect("flow=.137:7502>.136:40462 write_ok=8 write_failed=1 write_unknown=0" in lines, "per-flow write results")
 expect(lines[0].startswith("window_s=") and "join_window=[host_t-" in lines[0] and "1.000 s]" in lines[0] and " covered=1 lost=7" in lines[0],
        "header: join window, covered with records lost")
 expect(any(l.startswith("note=UNSEEN means absent at the peer within the join window") for l in lines), "UNSEEN wording")
-expect(any(l.startswith("seen_delay_ms n=4 ") for l in lines), "SEEN delay distribution printed")
+expect(any(l.startswith("bound_ms=1.150 seen_delay_max_ms=150.050 seen_n=4 ") for l in lines), "bound and largest SEEN delay printed")
+expect(any(l.startswith("sensitivity W=5.0 s: unseen_matching=1 unique=1 delays_ms=1500.") for l in lines), "F6 turns SEEN only at W=5 s")
+expect(" UNSEEN to_dump_end_s=" in line(0x1005), "F6 still UNSEEN at W=1 s")
+
+# censoring: a frame before the capture's start (from the times file), and one whose window outlasts it
+tf = os.path.join(d, "tr_T.times")
+open(tf, "w").write("capture_start %.6f\ncapture_stop_req %.6f\n" % (peer(BASE) + 0.01, peer(t) + 100))
+cs = subprocess.run([sys.executable, TOOL, "txjoin", dump, pcap, "%.6f" % (peer(BASE) - 0.001), "%.6f" % (peer(BASE) + 0.001), "--times", tf],
+                    capture_output=True, text=True).stdout.splitlines()
+print("\n".join(l for l in cs if "ip_id=16384" in l or l.startswith("produced")))
+expect(any("ip_id=16384 " in l and " CENSORED to_dump_end_s=" in l for l in cs) and cs[-1].endswith("censored=1"), "early frame CENSORED (capture_start)")
+ce = subprocess.run([sys.executable, TOOL, "txjoin", dump, pcap, "%.6f" % (peer(LATE_T) - 0.001), "%.6f" % (peer(LATE_T) + 0.001)],
+                    capture_output=True, text=True).stdout.splitlines()
+print("\n".join(l for l in ce if "ip_id=16385" in l or l.startswith("produced")))
+expect(any("ip_id=16385 " in l and " CENSORED " in l for l in ce) and ce[-1].endswith("unseen=0 ambiguous=0 censored=1"), "late frame CENSORED (last packet)")
 end_s = float(line(0x1002).split("to_dump_end_s=")[1])
 expect(abs(end_s - (ringtrace.to_peer(ringtrace.model(ringtrace.pings(rs, pm)), h["t_dump"] / 1e6) - float(line(0x1002).split()[0].split("=")[1]))) < 1e-3,
        "to_dump_end_s is the dump end minus the frame's time")

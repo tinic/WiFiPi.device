@@ -6,8 +6,9 @@ what the driver did inside a silence.
   ringtrace.py pcapmarks PCAP > MARKS            the alignment pings in a peer capture
   ringtrace.py align  DUMP MARKS                 clock model from paired pings
   ringtrace.py window DUMP MARKS START END       records and verdicts for a gap
-  ringtrace.py txjoin DUMP PCAP START END [W]    each TX TCP frame the host produced in
-                                                 the gap: SEEN / UNSEEN / AMBIGUOUS at the peer
+  ringtrace.py txjoin DUMP PCAP START END [W] [--times TIMES]
+                                                 each TX TCP frame the host produced in the gap:
+                                                 SEEN / UNSEEN / AMBIGUOUS / CENSORED at the peer
   ringtrace.py gaps   PCAP PORT [GAP_MS]         peer-capture silences (data and ACK) > GAP_MS
 
 MARKS is the peer capture's alignment pings (ICMP echo, IP length 1139,
@@ -210,11 +211,15 @@ def txkey(x):
 
 
 FLAGS = "FSRPAUEC"
-# Join window W: the clock bound plus the host-copy-to-peer delay of SEEN frames.
-# Until a first run calibrates it (txjoin prints the SEEN delay p50/p99/max), 1 s,
-# about 2.1x the longest silence measured (464 ms, hw20); never below 0.5 s.
+# Join window W, PROVISIONAL at 1 s.  It should be the clock bound plus the
+# host-copy-to-peer delay, which no run has measured yet: delays of frames
+# matched inside W are truncated at W and do not calibrate it.  (The 464 ms of
+# hw20 is the longest inter-arrival silence, not a latency bound.)  txjoin
+# prints the bound, the largest SEEN delay and how many UNSEEN frames would
+# match with W = 5 s; W is never below 0.5 s.
 TXJOIN_W = 1.0
 TXJOIN_W_MIN = 0.5
+TXJOIN_W_WIDE = 5.0
 
 
 def flagstr(v):
@@ -225,23 +230,41 @@ def ipstr(b):
     return ".".join(str(x) for x in b)
 
 
-def cmd_txjoin(dump, pcap, start, end, w=TXJOIN_W):
+def capture_span(peer_first, peer_last, times=None):
+    """The time the capture certainly covers: its first to last packet, cut to
+    ph3cap.sh's capture_start .. capture_stop_req when the times file is given"""
+    lo, hi = peer_first, peer_last
+    if times:
+        for line in open(times):
+            f = line.split()
+            if len(f) >= 2 and f[0] == "capture_start":
+                lo = max(lo, float(f[1]))
+            elif len(f) >= 2 and f[0] == "capture_stop_req":
+                hi = min(hi, float(f[1]))
+    return lo, hi
+
+
+def cmd_txjoin(dump, pcap, start, end, w=TXJOIN_W, times=None):
     """SEEN: exactly one peer frame with every recorded field equal, at peer time in
-    [host_t - bound, host_t + w]; UNSEEN: none; AMBIGUOUS: more than one."""
+    [host_t - bound, host_t + w]; AMBIGUOUS: more than one; UNSEEN: none, with that
+    whole window inside the capture; CENSORED: none, the window not all captured."""
     h, recs = load(dump)
     m = model(pings(recs, marks_from_pcap(pcap)))
     lo, hi, w = float(start), float(end), max(float(w), TXJOIN_W_MIN)
     t_end = to_peer(m, h["t_dump"] / 1e6)
+    eps = [sec + us / 1e6 for sec, us, _ in pcap_frames(pcap)]
+    c_lo, c_hi = capture_span(min(eps), max(eps), times)
     peer = peer_tcp(pcap)
     byk = {}
     for p in peer:
         byk.setdefault(txkey(p), []).append(p)
     first_t = to_peer(m, recs[0]["t"] / 1e6) if recs else None
     covered = h["lost"] == 0 or (first_t is not None and first_t < lo - m["bound"])
-    print("window_s=%.6f..%.6f bound_ms=%.3f join_window=[host_t-%.3f ms, host_t+%.3f s] covered=%d lost=%d dump_end=%.6f" % (
-        lo, hi, m["bound"] * 1e3, m["bound"] * 1e3, w, covered, h["lost"], t_end))
+    print("window_s=%.6f..%.6f bound_ms=%.3f join_window=[host_t-%.3f ms, host_t+%.3f s] (W provisional) "
+          "capture=%.6f..%.6f covered=%d lost=%d dump_end=%.6f" % (
+              lo, hi, m["bound"] * 1e3, m["bound"] * 1e3, w, c_lo, c_hi, covered, h["lost"], t_end))
     print("note=UNSEEN means absent at the peer within the join window after the host write shown; "
-          "with write=ok it does not locate where the frame was lost")
+          "with write=ok it does not locate where the frame was lost.  CENSORED: the window is not all in the capture")
     frames = [fr for fr in tx_frames(recs) if lo <= to_peer(m, fr["t"] / 1e6) <= hi]
     # endpoint mapping: recorded octets and ports -> the capture's full addresses
     pflows = {}
@@ -256,21 +279,33 @@ def cmd_txjoin(dump, pcap, start, end, w=TXJOIN_W):
             print("flow_map %s UNMAPPED (no capture flow has these octets and ports)" % tag)
         for f in full:
             print("flow_map %s pcap=%s:%d>%s:%d%s" % (tag, f[0], f[2], f[1], f[3], " AMBIGUOUS_MAP" if len(full) > 1 else ""))
-    stats, tot, wstats, delays = {}, [0, 0, 0, 0], {}, []
+    K = {"SEEN": 1, "UNSEEN": 2, "AMBIGUOUS": 3, "CENSORED": 4}
+    stats, tot, wstats, delays, wide = {}, [0, 0, 0, 0, 0], {}, [], []
     for fr in frames:
         pt = to_peer(m, fr["t"] / 1e6)
-        cand = [p for p in byk.get(txkey(fr), []) if pt - m["bound"] <= p["ep"] <= pt + w]
-        cls = "SEEN" if len(cand) == 1 else ("UNSEEN" if not cand else "AMBIGUOUS")
+        cands = byk.get(txkey(fr), [])
+        cand = [p for p in cands if pt - m["bound"] <= p["ep"] <= pt + w]
+        if len(cand) == 1:
+            cls = "SEEN"
+        elif cand:
+            cls = "AMBIGUOUS"
+        elif c_lo <= pt - m["bound"] and pt + w <= c_hi:
+            cls = "UNSEEN"
+        else:
+            cls = "CENSORED"
         what = cls + (" peer_t=%.6f delay_ms=%.3f" % (cand[0]["ep"], (cand[0]["ep"] - pt) * 1e3) if cls == "SEEN"
                       else " candidates=%d" % len(cand) if cls == "AMBIGUOUS"
                       else " to_dump_end_s=%.3f" % (t_end - pt))
         if cls == "SEEN":
             delays.append((cand[0]["ep"] - pt) * 1e3)
+        if cls == "UNSEEN":
+            late = [p for p in cands if pt - m["bound"] <= p["ep"] <= pt + TXJOIN_W_WIDE]
+            if late:
+                wide.append((len(late), (late[0]["ep"] - pt) * 1e3))
         flow = ".%d:%d>.%d:%d" % (fr["src"], fr["sport"], fr["dst"], fr["dport"])
-        st = stats.setdefault(flow, [0, 0, 0, 0])
-        k = {"SEEN": 1, "UNSEEN": 2, "AMBIGUOUS": 3}[cls]
+        st = stats.setdefault(flow, [0, 0, 0, 0, 0])
         for a in (st, tot):
-            a[0] += 1; a[k] += 1
+            a[0] += 1; a[K[cls]] += 1
         wr = fr["write"] + ("" if fr["write_us"] is None else " write_us=%d" % fr["write_us"])
         print("host_t=%.6f flow=%s ip_id=%d ack=%d seq=%d flags=%s len=%d sdpcm=%d glom=%d/%d write=%s %s" % (
             pt, flow, fr["ipid"], fr["ack"], fr["seq"], flagstr(fr["flags"]), fr["len"],
@@ -279,13 +314,13 @@ def cmd_txjoin(dump, pcap, start, end, w=TXJOIN_W):
         wst[fr["write"]] += 1
     for flow, st in sorted(stats.items()):
         print("flow=%s write_ok=%d write_failed=%d write_unknown=%d" % (flow, wstats[flow]["ok"], wstats[flow]["failed"], wstats[flow]["unknown"]))
-        print("flow=%s produced_at_host=%d seen=%d unseen=%d ambiguous=%d" % ((flow,) + tuple(st)))
-    if delays:
-        d = sorted(delays)
-        q = lambda x: d[min(len(d) - 1, int(x * len(d)))]
-        print("seen_delay_ms n=%d p50=%.3f p99=%.3f max=%.3f (calibrates W: bound + p99, at least %.1f s)" % (
-            len(d), q(.5), q(.99), d[-1], TXJOIN_W_MIN))
-    print("produced_at_host=%d seen=%d unseen=%d ambiguous=%d" % tuple(tot))
+        print("flow=%s produced_at_host=%d seen=%d unseen=%d ambiguous=%d censored=%d" % ((flow,) + tuple(st)))
+    print("bound_ms=%.3f seen_delay_max_ms=%s seen_n=%d (delays inside W only: not a calibration of W)" % (
+        m["bound"] * 1e3, "%.3f" % max(delays) if delays else "none", len(delays)))
+    print("sensitivity W=%.1f s: unseen_matching=%d unique=%d delays_ms=%s" % (
+        TXJOIN_W_WIDE, len(wide), sum(1 for n, _ in wide if n == 1),
+        ",".join("%.1f" % d for _, d in wide) or "-"))
+    print("produced_at_host=%d seen=%d unseen=%d ambiguous=%d censored=%d" % tuple(tot))
 
 
 def cmd_gaps(pcap, port, gap_ms=150.0):
@@ -418,8 +453,12 @@ def main():
         cmd_align(sys.argv[2], sys.argv[3])
     elif len(sys.argv) in (4, 5) and sys.argv[1] == "gaps":
         cmd_gaps(*sys.argv[2:])
-    elif len(sys.argv) in (6, 7) and sys.argv[1] == "txjoin":
-        cmd_txjoin(*sys.argv[2:])
+    elif len(sys.argv) >= 6 and sys.argv[1] == "txjoin":
+        a = sys.argv[2:]
+        times = None
+        if "--times" in a:
+            i = a.index("--times"); times = a[i + 1]; del a[i:i + 2]
+        cmd_txjoin(*a, times=times)
     elif len(sys.argv) == 6 and sys.argv[1] == "window":
         cmd_window(*sys.argv[2:6])
     else:
