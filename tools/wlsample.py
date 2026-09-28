@@ -31,6 +31,13 @@ falsifier: there are no verdicts and nothing is counted across gaps.
                     sampler's own SDIO traffic -- request frame bytes (REQ d)
                     plus reply frame bytes (REP, LATE d>>16) -- over the span
                     from the first REQ to the last sample record
+  gap ... wide      22-field dumps: eligible windows, and how many clamped
+  baseline_median   22-field dumps: medians over the out-of-hold windows of
+                    obss = rxdfrmucastobss + rxbeaconobss and rxstrt_other =
+                    rxstrt - (rxdfrmucastmbss + rxmfrmucastmbss + rxbeaconmbss
+                    + rxackucast), the latter approx (the subsets are not
+                    proven disjoint) and clamped at 0; eligible and baseline
+                    lines carry both per window
   summary ...       samples_total, skips by reason, lost, late, eligible per gap
 
 Every time here is a recorded CLO: eligibility and coverage use each
@@ -48,6 +55,11 @@ import ringtrace as rt  # noqa: E402
 
 FIELDS = ("tbtt", "rxbeaconmbss", "rxframe", "rxcrsglitch", "rxbadplcp",
           "txframe", "txretrans", "txnoack", "rxnobuf", "rxtoolate")
+# -DWIFIPI_WLSAMPLE_WIDE: the ten, then these; a dump is read by the count it carries
+WIDE_FIELDS = FIELDS + ("rxstrt", "rxdfrmucastobss", "rxbeaconobss", "rxdfrmucastmbss",
+                        "rxmfrmucastmbss", "rxackucast", "txallfrm", "txackfrm", "rxrsptmout",
+                        "txrts", "txnocts", "txexptime")
+FIELD_SETS = {len(FIELDS): FIELDS, len(WIDE_FIELDS): WIDE_FIELDS}
 (K_REQ, K_REP, K_VAL, K_SKIP, K_LOST, K_LATE, K_STOP, K_REFUSED, K_ENABLE) = range(20, 29)
 REP_STATUS = {0: "ok", 1: "bad_layout", 2: "fw_error"}
 SKIP_REASON = {1: "slot_busy", 2: "ctrl_busy", 3: "nomem", 4: "stopped", 5: "no_credit"}
@@ -80,10 +92,10 @@ def collect(recs):
                      length=r["d"] & 0xFFFF)
             sdio_bytes += r["d"] >> 16              # the reply frame
             last_t = r["t"]
-        elif k == K_VAL and r["b"] in by_id and r["a"] < len(FIELDS):
+        elif k == K_VAL and r["b"] in by_id and r["a"] < len(WIDE_FIELDS):
             s = by_id[r["b"]]
             if s["status"] == 0:
-                s["vals"][FIELDS[r["a"]]] = r["c"]
+                s["vals"][WIDE_FIELDS[r["a"]]] = r["c"]
         elif k == K_SKIP:
             skips.append((r["t"], SKIP_REASON.get(r["a"], str(r["a"]))))
         elif k == K_LOST:
@@ -117,7 +129,8 @@ def cadence(reqs):
 
 
 def valid(s):
-    return (s["rep"] is not None and s["status"] == 0 and len(s["vals"]) == len(FIELDS)
+    return (s["rep"] is not None and s["status"] == 0 and s["vals"] and
+            tuple(s["vals"]) == FIELD_SETS.get(len(s["vals"]))
             and s["lost"] is None and not s["late"])
 
 
@@ -126,16 +139,17 @@ def intervals(samples, peer):
     (list, overlaps excluded, pairs with an invalid end)"""
     out, overlap, invalid = [], 0, 0
     for a, b in zip(samples, samples[1:]):
-        if not (valid(a) and valid(b)):
+        if not (valid(a) and valid(b)) or len(a["vals"]) != len(b["vals"]):
             invalid += 1
             continue
         if a["rep"] > b["req"]:
             overlap += 1
             continue
         lo, hi = peer(a["req"]), peer(b["rep"])
-        out.append({"a": a, "b": b, "lo": lo, "hi": hi,
-                    "d": {f: (b["vals"][f] - a["vals"][f]) & 0xFFFFFFFF for f in FIELDS},
-                    "wrap": [f for f in FIELDS if b["vals"][f] < a["vals"][f]]})
+        fs = FIELD_SETS[len(a["vals"])]
+        out.append({"a": a, "b": b, "lo": lo, "hi": hi, "f": fs,
+                    "d": {f: (b["vals"][f] - a["vals"][f]) & 0xFFFFFFFF for f in fs},
+                    "wrap": [f for f in fs if b["vals"][f] < a["vals"][f]]})
     return out, overlap, invalid
 
 
@@ -162,7 +176,31 @@ def status_of(s):
 
 
 def deltas(iv):
-    return " ".join("delta.%s=%d" % (f, iv["d"][f]) for f in FIELDS)
+    return " ".join("delta.%s=%d" % (f, iv["d"][f]) for f in iv["f"])
+
+
+def derived(iv):
+    """wide windows: obss, and rxstrt_other = rxstrt - (the four MBSS subsets),
+    approx (WHD does not prove the subsets disjoint), clamped at 0.
+    (obss, rxstrt_other, clamped) or None for a ten-field window."""
+    d = iv["d"]
+    if "rxstrt" not in d:
+        return None
+    other = d["rxstrt"] - (d["rxdfrmucastmbss"] + d["rxmfrmucastmbss"] + d["rxbeaconmbss"] + d["rxackucast"])
+    return d["rxdfrmucastobss"] + d["rxbeaconobss"], max(other, 0), other < 0
+
+
+def derived_str(iv):
+    x = derived(iv)
+    if x is None:
+        return ""
+    return " obss=%d rxstrt_other=%d rxstrt_other_approx=1 rxstrt_other_clamped=%d" % (x[0], x[1], x[2])
+
+
+def median(v):
+    v = sorted(v)
+    n = len(v)
+    return None if not n else (v[n // 2] if n % 2 else (v[n // 2 - 1] + v[n // 2]) / 2)
 
 
 def beacons(iv):
@@ -210,20 +248,36 @@ def cmd_samples(dump, marks, gaps_path=None, extra=()):
             out.append("gap=%d eligible from_id=%d to_id=%d window_start=%.6f window_end=%.6f window_ms=%.3f "
                        "%s %s wrapped=%s %s" % (
                            g, iv["a"]["id"], iv["b"]["id"], iv["lo"], iv["hi"], (iv["hi"] - iv["lo"]) * 1e3,
-                           deltas(iv), beacons(iv), ",".join(iv["wrap"]) or "none", LABEL))
+                           deltas(iv) + derived_str(iv), beacons(iv), ",".join(iv["wrap"]) or "none", LABEL))
+        wide = [derived(iv) for iv in inside if derived(iv) is not None]
+        if wide:
+            out.append("gap=%d wide eligible=%d rxstrt_other_clamped_count=%d %s" % (
+                g, len(wide), sum(1 for x in wide if x[2]), LABEL))
         for s in samples:
             if lo <= peer(s["req"]) <= hi:
                 lat = s["lat"] if s["rep"] is not None else (
                     s["late"][0][2] if s["late"] and s["late"][0][1] else None)
                 out.append("gap=%d latency id=%d req_peer=%.6f status=%s latency_us=%s %s" % (
                     g, s["id"], peer(s["req"]), status_of(s), "unknown" if lat is None else lat, LABEL))
+    base = []
     for iv in ivs:
         if all(iv["hi"] < lo or iv["lo"] > hi for lo, hi, _ in gaps):
+            base.append(iv)
             w = iv["hi"] - iv["lo"]
             out.append("baseline from_id=%d to_id=%d window_start=%.6f window_end=%.6f window_ms=%.3f %s %s %s %s" % (
-                iv["a"]["id"], iv["b"]["id"], iv["lo"], iv["hi"], w * 1e3, deltas(iv),
-                " ".join("rate_per_s.%s=%.3f" % (f, iv["d"][f] / w) for f in FIELDS) if w > 0 else "rate=undefined",
+                iv["a"]["id"], iv["b"]["id"], iv["lo"], iv["hi"], w * 1e3, deltas(iv) + derived_str(iv),
+                " ".join("rate_per_s.%s=%.3f" % (f, iv["d"][f] / w) for f in iv["f"]) if w > 0 else "rate=undefined",
                 beacons(iv), LABEL))
+    bw = [(derived(iv), iv["hi"] - iv["lo"]) for iv in base if derived(iv) is not None]
+    if bw:
+        def fmt(v):
+            return "none" if v is None else "%.3f" % v
+        out.append("baseline_median windows=%d obss_median=%s rxstrt_other_median=%s obss_per_s_median=%s "
+                   "rxstrt_other_per_s_median=%s rxstrt_other_approx=1 rxstrt_other_clamped_count=%d %s" % (
+                       len(bw), fmt(median([x[0] for x, _ in bw])), fmt(median([x[1] for x, _ in bw])),
+                       fmt(median([x[0] / w for x, w in bw if w > 0])),
+                       fmt(median([x[1] / w for x, w in bw if w > 0])),
+                       sum(1 for x, _ in bw if x[2]), LABEL))
     span = (last_t - samples[0]["req"]) / 1e6 if samples and last_t is not None else 0.0
     out.append("leg samples=%d %s %s sdio_bytes=%d span_s=%.3f sdio_bytes_per_s=%s" % (
         len(samples), cadence([s["req"] for s in samples]), skip_counts(skips), sdio_bytes, span,

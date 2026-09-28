@@ -35,11 +35,17 @@ def expect(ok, what):
 hdr = open(os.path.join(HERE, "..", "src", "wlsample.h")).read()
 coff = {m.group(1).lower(): int(m.group(2)) for m in re.finditer(r"#define WS_OFF_(\w+)\s+(\d+)", hdr)}
 v10 = {n: o for n, o, w in wlcnt.V10_FIELDS}
-expect(set(coff) == set(wlsample.FIELDS), "C and decoder name the same ten fields")
-expect(all(coff[f] == v10[f] for f in wlsample.FIELDS), "every C offset is wlcnt.py's v10 offset")
+expect(set(coff) == set(wlsample.WIDE_FIELDS), "C and decoder name the same 22 fields: %s" % sorted(coff))
+expect(all(coff[f] == v10[f] for f in wlsample.WIDE_FIELDS), "every C offset is wlcnt.py's v10 offset")
+expect("txphycrs" not in coff, "txphycrs is not sampled")
 order = re.search(r"off\[WS_NFIELDS\] = \{(.*?)\};", hdr, re.S).group(1)
-expect([x.strip()[7:].lower() for x in order.split(",") if x.strip()] == list(wlsample.FIELDS),
-       "VAL index order in C is the decoder's")
+narrow, _, wide_part = order.partition("#ifdef WIFIPI_WLSAMPLE_WIDE")
+names = lambda t: [x.strip()[7:].lower() for x in t.replace("#endif", "").split(",") if x.strip()]   # noqa: E731
+expect(names(narrow) == list(wlsample.FIELDS), "VAL index order in C is the decoder's (the ten)")
+expect(names(narrow) + names(wide_part) == list(wlsample.WIDE_FIELDS), "VAL index order, wide: the ten first")
+expect(wlsample.WIDE_FIELDS[:10] == wlsample.FIELDS and len(wlsample.WIDE_FIELDS) == 22, "wide extends, order stable")
+expect(re.search(r"#ifdef WIFIPI_WLSAMPLE_WIDE\s*#define WS_NFIELDS\s+22\s*#else\s*#define WS_NFIELDS\s+10", hdr) is not None,
+       "WS_NFIELDS 22 wide, 10 without")
 kinds = {m.group(1): int(m.group(2)) for m in re.finditer(r"RT_(SAMPLE\w*|SAMPLER\w*)\s*=\s*(\d+)", hdr)}
 expect(kinds == {"SAMPLE_REQ": 20, "SAMPLE_REP": 21, "SAMPLE_VAL": 22, "SAMPLE_SKIP": 23, "SAMPLE_LOST": 24,
                  "SAMPLE_LATE": 25, "SAMPLER_STOP": 26, "SAMPLER_REFUSED": 27, "SAMPLER_ENABLE": 28},
@@ -159,6 +165,9 @@ out = r.stdout.splitlines()
 expect(r.returncode == 0, "exit 0: %s" % r.stderr)
 
 
+LABEL_S = "label=descriptive_association_not_a_falsifier"
+
+
 def kv(line):
     return dict(t.split("=", 1) for t in line.split() if "=" in t)
 
@@ -262,6 +271,97 @@ rb0 = subprocess.run([sys.executable, TOOL, "btc", dump], capture_output=True, t
 expect(rb0.stdout == "btc_records=0\n", "no BTC records: btc_records=0")
 bh = open(os.path.join(HERE, "..", "src", "btc.h")).read()
 expect(re.search(r"#define RT_BTC\s+29\b", bh) is not None and wlsample.K_BTC == 29, "RT_BTC is kind 29 on both sides")
+
+# --- a ten-field dump decodes as the 792bc57 decoder decoded it ------------
+FX = os.path.join(HERE, "fixtures", "wlsample10")
+lo3, hi3 = open(os.path.join(FX, "gap3.txt")).read().split()
+rf = subprocess.run([sys.executable, TOOL, "samples", os.path.join(FX, "ring.bin"), os.path.join(FX, "marks.txt"),
+                     os.path.join(FX, "gaps.txt"), "--gap", lo3, hi3], capture_output=True, text=True)
+expect(rf.returncode == 0 and rf.stdout == open(os.path.join(FX, "expected.txt")).read(),
+       "ten-field fixture: byte-identical to the 792bc57 decoder's output")
+
+# --- a 22-field dump: obss, rxstrt_other (approx, clamped), baseline medians --
+recs, marks = [], []
+state = {"n": 0, "id": 500, "c": {f: 0 for f in wlsample.WIDE_FIELDS}}
+
+
+def wsample(t, rise):
+    state["n"] += 1
+    state["id"] += 1
+    i = state["id"]
+    put(t, 20, 0, i, state["n"], REQ_BYTES)
+    for f, v in rise.items():
+        state["c"][f] += v
+    put(t + 2000, 21, 0 | (10 << 2), i, 2000, (REP_BYTES << 16) | 848)
+    for k, f in enumerate(wlsample.WIDE_FIELDS):
+        put(t + 2000, 22, k, i, state["c"][f], 0)
+
+
+for s_ in range(5):
+    ping(1_000_000 + s_ * 100_000, s_)
+t = 2_000_000
+# baseline windows: obss 3,5,7,9,0; rxstrt_other 40,50,60,70 and one clamped (mbss subsets 20 each)
+base_rises = [(1, 2, 60, 10, 5, 3, 2), (2, 3, 70, 10, 5, 3, 2), (3, 4, 80, 10, 5, 3, 2), (4, 5, 90, 10, 5, 3, 2),
+              (0, 0, 10, 10, 5, 3, 2)]
+wsample(t, {}); t += 50_000
+for ob_d, ob_b, strt, dmb, mmb, bmb, ack in base_rises:
+    wsample(t, {"rxdfrmucastobss": ob_d, "rxbeaconobss": ob_b, "rxstrt": strt, "rxdfrmucastmbss": dmb,
+                "rxmfrmucastmbss": mmb, "rxbeaconmbss": bmb, "rxackucast": ack})
+    t += 50_000
+WG_LO = peer(t) - 0.001
+wsample(t, {}); t += 50_000                 # the gap: one window with others, one clamped
+wsample(t, {"rxdfrmucastobss": 6, "rxbeaconobss": 1, "rxstrt": 100, "rxdfrmucastmbss": 40,
+            "rxmfrmucastmbss": 5, "rxbeaconmbss": 0, "rxackucast": 20})
+t += 50_000
+wsample(t, {"rxstrt": 5, "rxdfrmucastmbss": 9})
+WG_HI = peer(t) + 0.010
+t += 1_000_000
+for s_ in range(5, 10):
+    ping(t + (s_ - 5) * 100_000, s_)
+recs.sort(key=lambda r: r[0])
+dw = os.path.join(tmp, "wide.bin")
+with open(dw, "wb") as f:
+    f.write(struct.pack(">IHHIIIIII", 0x52544431, 1, 16, 1 << 22, len(recs), 0, len(recs), 0, recs[-1][0])
+            + b"".join(struct.pack(">IBBHII", *r) for r in recs))
+mw = os.path.join(tmp, "wmarks.txt")
+with open(mw, "w") as f:
+    for ep, typ, s_ in marks:
+        f.write("%.6f %d 0x4242 %d\n" % (ep, typ, s_))
+rw = subprocess.run([sys.executable, TOOL, "samples", dw, mw, "--gap", "%.6f" % WG_LO, "%.6f" % WG_HI],
+                    capture_output=True, text=True)
+wo = rw.stdout.splitlines()
+expect(rw.returncode == 0, "wide dump decodes: %s" % rw.stderr)
+we = [kv(x) for x in wo if " eligible " in x]
+expect(len(we) == 2, "wide gap: two eligible windows")
+expect(we[0]["obss"] == "7" and we[0]["rxstrt_other"] == "35" and we[0]["rxstrt_other_clamped"] == "0"
+       and we[0]["rxstrt_other_approx"] == "1", "obss = 6+1, rxstrt_other = 100-(40+5+0+20) = 35: %s" % we[0])
+expect(we[1]["rxstrt_other"] == "0" and we[1]["rxstrt_other_clamped"] == "1" and we[1]["obss"] == "0",
+       "5-9 < 0: clamped at 0 and flagged")
+expect(all(("delta." + f) in we[0] for f in wlsample.WIDE_FIELDS), "all 22 deltas per window")
+gw = kv([x for x in wo if x.startswith("gap=0 wide")][0])
+expect(gw["eligible"] == "2" and gw["rxstrt_other_clamped_count"] == "1", "per gap: clamps counted")
+bm = kv([x for x in wo if x.startswith("baseline_median")][0])
+# baseline windows: first..fifth rise (the gap's opening window straddles and is out)
+expect(bm["windows"] == "5", "baseline windows: %s" % bm)
+expect(bm["obss_median"] == "5.000" and bm["rxstrt_other_median"] == "50.000"
+       and bm["rxstrt_other_clamped_count"] == "1",
+       "medians of obss (3,5,7,9,0) and rxstrt_other (60,70,80,90,10 less 20 each; -10 clamped): %s" % bm)
+expect(all(x.endswith(LABEL_S) for x in wo if x.startswith(("gap=", "baseline"))), "wide readings labelled")
+expect(not any("obss" in x for x in rf.stdout.splitlines()), "ten-field output carries no wide keys")
+
+# --- ring capacity: a 180 s leg at hw33's rate with 20 samples/s ------------
+rh = open(os.path.join(HERE, "..", "src", "ringtrace.h")).read()
+cap = 1 << int(re.search(r"#define WIFIPI_RINGTRACE_LOG2\s+(\d+)", rh).group(1))
+per_sample = 2 + len(wlsample.WIDE_FIELDS)                 # REQ, REP, one VAL a field
+HW33_RECORDS, HW33_SPAN_S, LEG_S = 1402206, 226.874, 180.0  # hw33-ring24 G: whole dump, first to last record
+traffic = HW33_RECORDS / LEG_S                              # all of it inside the leg: the high bound
+samp = 20 * per_sample
+leg = (traffic + samp) * LEG_S
+print("RING capacity=%d per_sample=%d sample_records_per_s=%d traffic_records_per_s=%.1f "
+      "(hw33 %d over %.0f s taken as %.0f s) leg_records=%d fill=%.1f%% seconds_to_full=%.1f" % (
+          cap, per_sample, samp, traffic, HW33_RECORDS, HW33_SPAN_S, LEG_S, leg, 100 * leg / cap,
+          cap / (traffic + samp)))
+expect(leg <= 0.9 * cap, "a 180 s leg stays within 90%% of the ring (%.1f%%)" % (100 * leg / cap))
 
 print("RESULT test_wlsample checks=%d failures=%d" % (checks, failures))
 sys.exit(1 if failures else 0)

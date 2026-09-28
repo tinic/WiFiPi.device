@@ -227,9 +227,11 @@ int main(void)
     e = last(RT_SAMPLE_REP);
     EXPECT(e && e->r_A == (WS_REP_OK | (10 << 2)) && e->r_B == s1 && e->r_C == now - req
            && e->r_D == ((REPLY_FRAME << 16) | 848));
-    EXPECT(count(RT_SAMPLE_VAL) == 10 && count(0) == 11);
+    EXPECT(count(RT_SAMPLE_VAL) == WS_NFIELDS && count(0) == WS_NFIELDS + 1);
     {
-        static const ULONG want[10] = { 184, 344, 64, 280, 276, 4, 12, 456, 80, 244 };
+        /* tools/wlcnt.py V10 offsets, in VAL index order (tests/test_wlsample.py checks the names) */
+        static const ULONG want[22] = { 184, 344, 64, 280, 276, 4, 12, 456, 80, 244,
+                                        284, 348, 352, 288, 292, 308, 196, 208, 356, 448, 452, 672 };
         int i = 0, ok = 1;
         for (ULONG s = mark; s < ring->rt_Seq; s++)
         {
@@ -238,7 +240,7 @@ int main(void)
             if (v->r_A != i || v->r_C != want[i] * 1000 + 3 || v->r_B != s1) ok = 0;
             i++;
         }
-        EXPECT(ok && i == 10);
+        EXPECT(ok && i == WS_NFIELDS);
     }
     EXPECT(!ws->ws_SlotLive);
 
@@ -276,7 +278,7 @@ int main(void)
     EXPECT(reply(sy, WS_GET_VAR, 848) == WAITER);          /* the waiter's */
     EXPECT(count(0) == 0 && ws->ws_SlotLive);
     EXPECT(reply(s1, WS_GET_VAR, 848) == WS_R_TAKEN);      /* the sampler's */
-    EXPECT(count(RT_SAMPLE_VAL) == 10);
+    EXPECT(count(RT_SAMPLE_VAL) == WS_NFIELDS);
     /* the slot's id with another command is not the slot's */
     now += 50000;
     EXPECT(tick(0, &s2));
@@ -489,7 +491,7 @@ int main(void)
     sy = sync_req(WS_GET_VAR);                      /* 3003, while the sample is out */
     view();
     EXPECT(reply(sy, WS_GET_VAR, 848) == WAITER && count(0) == 0 && ws->ws_SlotLive);
-    EXPECT(reply(s1, WS_GET_VAR, 848) == WS_R_TAKEN && count(RT_SAMPLE_VAL) == 10);
+    EXPECT(reply(s1, WS_GET_VAR, 848) == WS_R_TAKEN && count(RT_SAMPLE_VAL) == WS_NFIELDS);
     now += 50000;
     view();
     EXPECT(!tick(0, &s1) && last(RT_SAMPLE_SKIP)->r_A == WS_SKIP_NO_CREDIT && cmdID == 3003);
@@ -645,6 +647,12 @@ int main(void)
     EXPECT(!tick(0, &s1) && count(0) == 0);
 
     EXPECT(sizeof(struct RtRec) == 16);
+#ifdef WIFIPI_WLSAMPLE_WIDE
+    EXPECT(WS_NFIELDS == 22);
+    printf("RESULT host_wlsample_wide checks=%d failures=%d\n", checks, failures);
+#else
+    EXPECT(WS_NFIELDS == 10);
     printf("RESULT host_wlsample checks=%d failures=%d\n", checks, failures);
+#endif
     return failures != 0;
 }

@@ -52,7 +52,12 @@
 #define WS_ID_CAP       60000UL
 #define WS_TOMBS        16              /* latency lookup only; evicted freely */
 #define WS_GET_VAR      262             /* BRCMF_C_GET_VAR */
+/* -DWIFIPI_WLSAMPLE_WIDE: 22 fields, the first 10 as without it */
+#ifdef WIFIPI_WLSAMPLE_WIDE
+#define WS_NFIELDS      22
+#else
 #define WS_NFIELDS      10
+#endif
 
 /* wl_cnt v10 (tools/wlcnt.py V10_FIELDS: WHD wl_cnt_ver_ten_t) */
 #define WS_V10_VERSION  10
@@ -67,6 +72,20 @@
 #define WS_OFF_TXNOACK      456
 #define WS_OFF_RXNOBUF      80
 #define WS_OFF_RXTOOLATE    244
+#ifdef WIFIPI_WLSAMPLE_WIDE
+#define WS_OFF_RXSTRT           284
+#define WS_OFF_RXDFRMUCASTOBSS  348
+#define WS_OFF_RXBEACONOBSS     352
+#define WS_OFF_RXDFRMUCASTMBSS  288
+#define WS_OFF_RXMFRMUCASTMBSS  292
+#define WS_OFF_RXACKUCAST       308
+#define WS_OFF_TXALLFRM         196
+#define WS_OFF_TXACKFRM         208
+#define WS_OFF_RXRSPTMOUT       356
+#define WS_OFF_TXRTS            448
+#define WS_OFF_TXNOCTS          452
+#define WS_OFF_TXEXPTIME        672
+#endif
 
 _Static_assert(WS_V10_LEN == 848, "wl_cnt v10 is 848 bytes");
 _Static_assert(WS_OFF_TBTT % 4 == 0 && WS_OFF_TBTT + 4 <= WS_V10_LEN, "tbtt inside v10");
@@ -79,6 +98,20 @@ _Static_assert(WS_OFF_TXRETRANS % 4 == 0 && WS_OFF_TXRETRANS + 4 <= WS_V10_LEN, 
 _Static_assert(WS_OFF_TXNOACK % 4 == 0 && WS_OFF_TXNOACK + 4 <= WS_V10_LEN, "txnoack inside v10");
 _Static_assert(WS_OFF_RXNOBUF % 4 == 0 && WS_OFF_RXNOBUF + 4 <= WS_V10_LEN, "rxnobuf inside v10");
 _Static_assert(WS_OFF_RXTOOLATE % 4 == 0 && WS_OFF_RXTOOLATE + 4 <= WS_V10_LEN, "rxtoolate inside v10");
+#ifdef WIFIPI_WLSAMPLE_WIDE
+_Static_assert(WS_OFF_RXSTRT % 4 == 0 && WS_OFF_RXSTRT + 4 <= WS_V10_LEN, "rxstrt inside v10");
+_Static_assert(WS_OFF_RXDFRMUCASTOBSS % 4 == 0 && WS_OFF_RXDFRMUCASTOBSS + 4 <= WS_V10_LEN, "rxdfrmucastobss inside v10");
+_Static_assert(WS_OFF_RXBEACONOBSS % 4 == 0 && WS_OFF_RXBEACONOBSS + 4 <= WS_V10_LEN, "rxbeaconobss inside v10");
+_Static_assert(WS_OFF_RXDFRMUCASTMBSS % 4 == 0 && WS_OFF_RXDFRMUCASTMBSS + 4 <= WS_V10_LEN, "rxdfrmucastmbss inside v10");
+_Static_assert(WS_OFF_RXMFRMUCASTMBSS % 4 == 0 && WS_OFF_RXMFRMUCASTMBSS + 4 <= WS_V10_LEN, "rxmfrmucastmbss inside v10");
+_Static_assert(WS_OFF_RXACKUCAST % 4 == 0 && WS_OFF_RXACKUCAST + 4 <= WS_V10_LEN, "rxackucast inside v10");
+_Static_assert(WS_OFF_TXALLFRM % 4 == 0 && WS_OFF_TXALLFRM + 4 <= WS_V10_LEN, "txallfrm inside v10");
+_Static_assert(WS_OFF_TXACKFRM % 4 == 0 && WS_OFF_TXACKFRM + 4 <= WS_V10_LEN, "txackfrm inside v10");
+_Static_assert(WS_OFF_RXRSPTMOUT % 4 == 0 && WS_OFF_RXRSPTMOUT + 4 <= WS_V10_LEN, "rxrsptmout inside v10");
+_Static_assert(WS_OFF_TXRTS % 4 == 0 && WS_OFF_TXRTS + 4 <= WS_V10_LEN, "txrts inside v10");
+_Static_assert(WS_OFF_TXNOCTS % 4 == 0 && WS_OFF_TXNOCTS + 4 <= WS_V10_LEN, "txnocts inside v10");
+_Static_assert(WS_OFF_TXEXPTIME % 4 == 0 && WS_OFF_TXEXPTIME + 4 <= WS_V10_LEN, "txexptime inside v10");
+#endif
 
 /* Ring records (struct RtRec: clo, kind, a, b, c, d) */
 enum {
@@ -342,7 +375,12 @@ static inline int ws_reply_slot(struct WsState *w, struct RtRing *r, ULONG clo, 
     /* SAMPLE_VAL a = index here; tools/wlsample.py names them in this order */
     static const UWORD off[WS_NFIELDS] = {
         WS_OFF_TBTT, WS_OFF_RXBEACONMBSS, WS_OFF_RXFRAME, WS_OFF_RXCRSGLITCH, WS_OFF_RXBADPLCP,
-        WS_OFF_TXFRAME, WS_OFF_TXRETRANS, WS_OFF_TXNOACK, WS_OFF_RXNOBUF, WS_OFF_RXTOOLATE
+        WS_OFF_TXFRAME, WS_OFF_TXRETRANS, WS_OFF_TXNOACK, WS_OFF_RXNOBUF, WS_OFF_RXTOOLATE,
+#ifdef WIFIPI_WLSAMPLE_WIDE
+        WS_OFF_RXSTRT, WS_OFF_RXDFRMUCASTOBSS, WS_OFF_RXBEACONOBSS, WS_OFF_RXDFRMUCASTMBSS,
+        WS_OFF_RXMFRMUCASTMBSS, WS_OFF_RXACKUCAST, WS_OFF_TXALLFRM, WS_OFF_TXACKFRM,
+        WS_OFF_RXRSPTMOUT, WS_OFF_TXRTS, WS_OFF_TXNOCTS, WS_OFF_TXEXPTIME
+#endif
     };
     ULONG i, lat;
 

@@ -301,6 +301,9 @@ struct VsTLV {
 struct VsTLV * FindWPAIE(UBYTE *data, ULONG len);
 struct TLV * brcmf_parse_tlvs(void *buf, ULONG buflen, UBYTE key);
 
+#if defined(WIFIPI_WLSAMPLE_WIDE) && !defined(WIFIPI_WLSAMPLE)
+#error "WIFIPI_WLSAMPLE_WIDE needs WIFIPI_WLSAMPLE"
+#endif
 #ifdef WIFIPI_RINGTRACE
 #include "ringtrace.h"
 ULONG RtClock(struct SDIO *sdio);
