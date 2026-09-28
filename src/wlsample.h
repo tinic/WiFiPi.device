@@ -69,21 +69,24 @@ _Static_assert(WS_OFF_RXTOOLATE % 4 == 0 && WS_OFF_RXTOOLATE + 4 <= WS_V10_LEN, 
 
 /* Ring records (struct RtRec: clo, kind, a, b, c, d) */
 enum {
-    RT_SAMPLE_REQ     = 20, /* clo REQ; a 0, b id, c sample number, d 0 */
-    RT_SAMPLE_REP     = 21, /* clo REP; a status, b id, c latency us (REP - REQ),
-                               d version<<16 | length as read (0 on fw_error: d = firmware status) */
+    RT_SAMPLE_REQ     = 20, /* clo REQ; a 0, b id, c sample number, d frame bytes sent */
+    RT_SAMPLE_REP     = 21, /* clo REP; a status | min(version, 63)<<2, b id, c latency us
+                               (REP - REQ), d reply frame bytes<<16 | length as read
+                               (fw_error: | the firmware status & 0xffff) */
     RT_SAMPLE_VAL     = 22, /* clo REP; a field index, b id, c value, d 0 (after an ok REP only) */
     RT_SAMPLE_SKIP    = 23, /* clo; a reason, b live slot id or 0, c 0, d 0 */
     RT_SAMPLE_LOST    = 24, /* clo; a 0, b id, c original REQ clo, d 0 */
     RT_SAMPLE_LATE    = 25, /* clo REP; a 1 latency known / 0 unknown, b id,
-                               c latency us or 0xffffffff, d firmware status */
+                               c latency us or 0xffffffff,
+                               d reply frame bytes<<16 | firmware status & 0xffff */
     RT_SAMPLER_STOP   = 26, /* clo; a reason, b id that was not taken (0: none), c E, d distance */
     RT_SAMPLER_REFUSED = 27, /* clo; a reason (1 used before), b state, c E, d 0 */
     RT_SAMPLER_ENABLE = 28  /* clo; a 0, b E, c 0, d 0 */
 };
 
 enum { WS_REP_OK = 0, WS_REP_BAD_LAYOUT = 1, WS_REP_FW_ERROR = 2 };
-enum { WS_SKIP_SLOT_BUSY = 1, WS_SKIP_CTRL_BUSY = 2, WS_SKIP_NOMEM = 3, WS_SKIP_STOPPED = 4 };
+enum { WS_SKIP_SLOT_BUSY = 1, WS_SKIP_CTRL_BUSY = 2, WS_SKIP_NOMEM = 3, WS_SKIP_STOPPED = 4,
+       WS_SKIP_NO_CREDIT = 5 };
 enum { WS_STOP_IDCAP = 1, WS_STOP_DISABLED = 2, WS_STOP_WRAP = 3 };
 enum { WS_IDLE = 0, WS_LIVE = 1, WS_STOPPED = 2 };
 enum { WS_R_NOTMINE = 0, WS_R_TAKEN = 1, WS_R_LATE = 2 };
@@ -165,8 +168,12 @@ static inline void ws_disable(struct WsState *w, struct RtRing *r, ULONG clo)
 }
 
 /* Receiver tick: the slot deadline first, then whether a sample is due.
-   1: build one now (then ws_take_id, ws_sent). */
-static inline int ws_tick(struct WsState *w, struct RtRing *r, ULONG clo, int ctrlBusy)
+   ctrlBusy: s_CtrlWaitList not empty; credit: PacketTxCredit() (#99), the
+   window every frame the receiver sends is held to.  A skip of any kind
+   takes no id, makes no REQ and no slot, and uses the period up: the next
+   try is WS_PERIOD_US on, never a catch-up.  1: build one now (then
+   ws_take_id, ws_sent). */
+static inline int ws_tick(struct WsState *w, struct RtRing *r, ULONG clo, int ctrlBusy, UBYTE credit)
 {
     if (w->ws_SlotLive && (ULONG)(clo - w->ws_SlotReqClo) >= WS_DEADLINE_US)
     {
@@ -198,6 +205,11 @@ static inline int ws_tick(struct WsState *w, struct RtRing *r, ULONG clo, int ct
     if (ctrlBusy)
     {
         ws_log(r, clo, RT_SAMPLE_SKIP, WS_SKIP_CTRL_BUSY, 0, 0, 0);
+        return 0;
+    }
+    if (credit == 0)
+    {
+        ws_log(r, clo, RT_SAMPLE_SKIP, WS_SKIP_NO_CREDIT, 0, 0, 0);
         return 0;
     }
     return 1;
@@ -253,12 +265,24 @@ static inline int ws_take_id(struct WsState *w, struct RtRing *r, ULONG clo, UWO
     return 1;
 }
 
-/* The request with this id has gone out */
-static inline void ws_sent(struct WsState *w, struct RtRing *r, ULONG clo, UWORD id)
+/* NextCmdID() handed id to another caller (under its Forbid()): it is no
+   longer a sample id, and a reply to it is never taken as a late sample */
+static inline void ws_realloc(struct WsState *w, UWORD id)
+{
+    ULONG i;
+
+    w->ws_Issued[id >> 3] &= (UBYTE)~(1 << (id & 7));
+    for (i = 0; i < WS_TOMBS; i++)
+        if (w->ws_TombId[i] == id)
+            w->ws_TombUsed[i] = 0;
+}
+
+/* The request with this id has gone out, bytes long */
+static inline void ws_sent(struct WsState *w, struct RtRing *r, ULONG clo, UWORD id, ULONG bytes)
 {
     w->ws_Issued[id >> 3] |= (UBYTE)(1 << (id & 7));
     w->ws_Samples++;
-    ws_log(r, clo, RT_SAMPLE_REQ, 0, id, w->ws_Samples, 0);
+    ws_log(r, clo, RT_SAMPLE_REQ, 0, id, w->ws_Samples, bytes);
     if (w->ws_State == WS_LIVE)
     {
         w->ws_SlotLive = 1;
@@ -269,56 +293,122 @@ static inline void ws_sent(struct WsState *w, struct RtRing *r, ULONG clo, UWORD
         ws_tomb(w, id, clo);        /* disabled while it was being built */
 }
 
-/* A control reply, before any synchronous waiter sees it.  data/copied: the
-   payload after the BCDC header, as far as it arrived and c_Length allows.
-   WS_R_NOTMINE: not a sample, the waiters' as before. */
-static inline int ws_reply(struct WsState *w, struct RtRing *r, ULONG clo, UWORD id, ULONG cmd,
-                           int fwError, ULONG fwStatus, const UBYTE *data, ULONG copied)
+/* A control reply, before the synchronous waiters: taken only if it is the
+   live slot's -- id, GET_VAR, slot live.  The live id cannot be a waiter's:
+   below the cap no id is handed out twice.  data/copied: the payload after
+   the BCDC header, as far as it arrived and c_Length allows; frame: the
+   reply's SDIO frame bytes.  WS_R_NOTMINE: the waiters' as before. */
+static inline int ws_reply_slot(struct WsState *w, struct RtRing *r, ULONG clo, UWORD id, ULONG cmd,
+                                int fwError, ULONG fwStatus, const UBYTE *data, ULONG copied, ULONG frame)
 {
     /* SAMPLE_VAL a = index here; tools/wlsample.py names them in this order */
     static const UWORD off[WS_NFIELDS] = {
         WS_OFF_TBTT, WS_OFF_RXBEACONMBSS, WS_OFF_RXFRAME, WS_OFF_RXCRSGLITCH, WS_OFF_RXBADPLCP,
         WS_OFF_TXFRAME, WS_OFF_TXRETRANS, WS_OFF_TXNOACK, WS_OFF_RXNOBUF, WS_OFF_RXTOOLATE
     };
-    ULONG i;
+    ULONG i, lat;
 
-    if (w->ws_State == WS_IDLE || cmd != WS_GET_VAR)
+    if (!w->ws_SlotLive || id != w->ws_SlotId || cmd != WS_GET_VAR)
         return WS_R_NOTMINE;
-    if (w->ws_SlotLive && id == w->ws_SlotId)
+    lat = clo - w->ws_SlotReqClo;
+    w->ws_SlotLive = 0;
+    if (fwError)
     {
-        ULONG lat = clo - w->ws_SlotReqClo;
-        w->ws_SlotLive = 0;
-        if (fwError)
-        {
-            ws_log(r, clo, RT_SAMPLE_REP, WS_REP_FW_ERROR, id, lat, fwStatus);
-            return WS_R_TAKEN;
-        }
-        {
-            ULONG ver = copied >= 2 ? (ULONG)data[0] | ((ULONG)data[1] << 8) : 0;
-            ULONG len = copied >= 4 ? (ULONG)data[2] | ((ULONG)data[3] << 8) : 0;
-            int ok = copied >= WS_V10_LEN && ver == WS_V10_VERSION && len == WS_V10_LEN;
-
-            ws_log(r, clo, RT_SAMPLE_REP, ok ? WS_REP_OK : WS_REP_BAD_LAYOUT, id, lat, (ver << 16) | len);
-            if (ok)
-                for (i = 0; i < WS_NFIELDS; i++)
-                    ws_log(r, clo, RT_SAMPLE_VAL, (UBYTE)i, id, ws_le32(data + off[i]), 0);
-        }
+        ws_log(r, clo, RT_SAMPLE_REP, WS_REP_FW_ERROR, id, lat, (frame << 16) | (fwStatus & 0xffff));
         return WS_R_TAKEN;
     }
-    if (ws_issued(w, id))
     {
-        ULONG lat = 0xffffffffUL;
-        UBYTE known = 0;
-        for (i = 0; i < WS_TOMBS; i++)
-            if (w->ws_TombUsed[i] && w->ws_TombId[i] == id)
-            {
-                lat = clo - w->ws_TombClo[i];
-                known = 1;
-            }
-        ws_log(r, clo, RT_SAMPLE_LATE, known, id, lat, fwError ? fwStatus : 0);
-        return WS_R_LATE;
+        ULONG ver = copied >= 2 ? (ULONG)data[0] | ((ULONG)data[1] << 8) : 0;
+        ULONG len = copied >= 4 ? (ULONG)data[2] | ((ULONG)data[3] << 8) : 0;
+        int ok = copied >= WS_V10_LEN && ver == WS_V10_VERSION && len == WS_V10_LEN;
+
+        ws_log(r, clo, RT_SAMPLE_REP, (UBYTE)((ok ? WS_REP_OK : WS_REP_BAD_LAYOUT) | ((ver > 63 ? 63 : ver) << 2)),
+               id, lat, (frame << 16) | (len & 0xffff));
+        if (ok)
+            for (i = 0; i < WS_NFIELDS; i++)
+                ws_log(r, clo, RT_SAMPLE_VAL, (UBYTE)i, id, ws_le32(data + off[i]), 0);
     }
-    return WS_R_NOTMINE;
+    return WS_R_TAKEN;
+}
+
+/* A control reply no waiter took: a sample's that came too late (its id
+   still a sample id: sent as one, never handed out since), logged LATE and
+   never read.  Nothing else is the sampler's. */
+static inline int ws_reply_late(struct WsState *w, struct RtRing *r, ULONG clo, UWORD id, ULONG cmd,
+                                int fwError, ULONG fwStatus, ULONG frame)
+{
+    ULONG i, lat = 0xffffffffUL;
+    UBYTE known = 0;
+
+    if (w->ws_State == WS_IDLE || cmd != WS_GET_VAR || !ws_issued(w, id))
+        return WS_R_NOTMINE;
+    for (i = 0; i < WS_TOMBS; i++)
+        if (w->ws_TombUsed[i] && w->ws_TombId[i] == id)
+        {
+            lat = clo - w->ws_TombClo[i];
+            known = 1;
+        }
+    ws_log(r, clo, RT_SAMPLE_LATE, known, id, lat, (frame << 16) | ((fwError ? fwStatus : 0) & 0xffff));
+    return WS_R_LATE;
+}
+
+static inline UWORD ws_le16(const UBYTE *p) { return (UWORD)(p[0] | (p[1] << 8)); }
+
+/* The same two, from the reply as it lies in the RX buffer: bcdc is the
+   16-byte BCDC header (struct PacketCmd), avail the bytes after it that
+   arrived, frame the SDPCM frame length.  PacketCtrlComplete() calls these. */
+static inline int ws_ctrl_slot(struct WsState *w, struct RtRing *r, ULONG clo, const UBYTE *bcdc,
+                               ULONG avail, ULONG frame)
+{
+    ULONG len = ws_le32(bcdc + 4);
+    return ws_reply_slot(w, r, clo, ws_le16(bcdc + 10), ws_le32(bcdc), ws_le16(bcdc + 8) & 1,
+                         ws_le32(bcdc + 12), bcdc + 16, avail < len ? avail : len, frame);
+}
+
+static inline int ws_ctrl_late(struct WsState *w, struct RtRing *r, ULONG clo, const UBYTE *bcdc, ULONG frame)
+{
+    return ws_reply_late(w, r, clo, ws_le16(bcdc + 10), ws_le32(bcdc), ws_le16(bcdc + 8) & 1,
+                         ws_le32(bcdc + 12), frame);
+}
+
+/* The GET 'counters' frame, as PacketSetVarAsync() lays one out: SDPCM
+   hardware header, glom header if glomming, software header (control
+   channel), BCDC header (GET_VAR, 848, get, id), the name, the zeroed rest.
+   pkt: ws_frame_len() bytes rounded up to 4, zeroed. */
+static inline ULONG ws_frame_len(int glom)
+{
+    return 4 + (glom ? 8 : 0) + 8 + 16 + WS_V10_LEN;
+}
+
+static inline void ws_put16(UBYTE *p, ULONG v) { p[0] = (UBYTE)v; p[1] = (UBYTE)(v >> 8); }
+static inline void ws_put32(UBYTE *p, ULONG v) { ws_put16(p, v); ws_put16(p + 2, v >> 16); }
+
+static inline void ws_build(UBYTE *pkt, int glom, UBYTE seq, UWORD id)
+{
+    static const char name[9] = "counters";
+    ULONG total = ws_frame_len(glom);
+    UBYTE *sw = pkt + (glom ? 12 : 4), *c = sw + 8;
+    ULONG i;
+
+    ws_put16(pkt, total);
+    ws_put16(pkt + 2, ~total);
+    if (glom)
+    {
+        ws_put16(pkt + 4, total - 4);
+        pkt[6] = 0;
+        pkt[7] = 1;                 /* last item */
+        ws_put16(pkt + 8, 0);
+        ws_put16(pkt + 10, (0UL - total) & 3);
+    }
+    sw[0] = seq;
+    sw[3] = (UBYTE)(12 + (glom ? 8 : 0));   /* data offset */
+    ws_put32(c, WS_GET_VAR);
+    ws_put32(c + 4, WS_V10_LEN);
+    ws_put16(c + 8, 0);                     /* get */
+    ws_put16(c + 10, id);
+    ws_put32(c + 12, 0);
+    for (i = 0; i < sizeof(name); i++)
+        c[16 + i] = (UBYTE)name[i];
 }
 
 #endif /* WIFIPI_WLSAMPLE_H */

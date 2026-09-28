@@ -921,30 +921,28 @@ void WsDisable(struct SDIO *sdio)
 }
 
 /* Receiver tick: the slot deadline, and one GET 'counters' of 848 bytes
-   when due -- built as PacketSetVarAsync() builds its frame, sent on the
-   same path, never waited for (#94: outside wu_Lock, AllocMem) */
+   when due and the TX window has room -- the frame laid out as
+   PacketSetVarAsync() lays one out, sent on the same path, never waited
+   for (#94: outside wu_Lock, AllocMem) */
 static void WsTick(struct SDIO *sdio)
 {
     BOOL glom = sdio->s_GlomEnabled;
     struct ExecBase *SysBase = sdio->s_SysBase;
     struct WsState *w = &sdio->s_Ws;
     ULONG clo = RtClock(sdio);
-    ULONG totalLen = sizeof(struct Packet) + sizeof(struct PacketCmd) + WS_V10_LEN;
-    ULONG allocLen;
+    ULONG totalLen = ws_frame_len(glom);
+    ULONG allocLen = (totalLen + 3) & ~3;
     UBYTE *pkt;
     UWORD id = 0;
     int go;
 
     Forbid();
     go = ws_tick(w, sdio->s_Ring, clo, sdio->s_CtrlWaitList != NULL &&
-                 !IsListEmpty((struct List *)sdio->s_CtrlWaitList));
+                 !IsListEmpty((struct List *)sdio->s_CtrlWaitList), PacketTxCredit(sdio));
     Permit();
     if (!go)
         return;
 
-    if (glom)
-        totalLen += 8;
-    allocLen = (totalLen + 3) & ~3;
     pkt = AllocMem(allocLen, MEMF_PUBLIC | MEMF_CLEAR);
     if (pkt == NULL)
     {
@@ -963,40 +961,14 @@ static void WsTick(struct SDIO *sdio)
         FreeMem(pkt, allocLen);
         return;
     }
-
-    struct PacketHeaderHW *hw = (APTR)&pkt[0];
-    struct GlomHeader *gl = (APTR)&pkt[4];
-    struct PacketHeaderSW *sw = glom ? (APTR)&pkt[12] : (APTR)&pkt[4];
-    struct PacketCmd *c = glom ? (APTR)&pkt[20] : (APTR)&pkt[12];
-
-    if (glom)
-    {
-        gl->gh_Length = LE16(totalLen - sizeof(struct PacketHeaderHW));
-        gl->gh_ReservedB = 0;
-        gl->gh_LastItem = 1;
-        gl->gh_ReservedW = 0;
-        gl->gh_TailPad = LE16((-totalLen) & 3);
-    }
-    hw->ph_Length = LE16(totalLen);
-    hw->ph_ChkSum = ~hw->ph_Length;
-    sw->c_DataOffset = sizeof(struct Packet);
-    if (glom) sw->c_DataOffset += sizeof(struct GlomHeader);
-    sw->c_FlowControl = 0;
-    sw->c_Seq = sdio->s_TXSeq++;
-
-    c->c_Command = LE32(WS_GET_VAR);
-    c->c_Length = LE32(WS_V10_LEN);
-    c->c_Flags = LE16(0);
-    c->c_ID = LE16(id);
-    c->c_Status = 0;
-    CopyMem("counters", (UBYTE *)c + sizeof(struct PacketCmd), 9);
+    ws_build(pkt, glom, sdio->s_TXSeq++, id);
 
     /* REQ is taken before the frame leaves: nothing the firmware counts
        for this answer can be older */
     clo = RtClock(sdio);
     sdio->SendPKT(pkt, totalLen, sdio);
     Forbid();
-    ws_sent(w, sdio->s_Ring, clo, id);
+    ws_sent(w, sdio->s_Ring, clo, id, totalLen);
     Permit();
     FreeMem(pkt, allocLen);
 }
@@ -2720,6 +2692,9 @@ static UWORD NextCmdID(struct SDIO *sdio)
             if (sdio->s_CtrlQuarantine[i] == id)
                 used = TRUE;
     } while (used);
+#ifdef WIFIPI_WLSAMPLE
+    ws_realloc(&sdio->s_Ws, id);            /* no longer a sample id (#89) */
+#endif
     Permit();
     return id;
 }
@@ -2965,15 +2940,14 @@ void PacketCtrlComplete(struct SDIO *sdio, struct Packet *pkt, ULONG pktLen)
     RT(sdio, RT_CTRL, 3, LE16(cmd->c_ID), LE32(cmd->c_Command), LE32(cmd->c_Status));
 
 #ifdef WIFIPI_WLSAMPLE
-    /* the sample slot first; a sample's reply never reaches a waiter */
+    /* the live sample slot first (its id is no waiter's); a late sample
+       only after every waiter has passed it by */
+    BOOL wsWaiter = FALSE;
     {
-        ULONG n = avail < LE32(cmd->c_Length) ? avail : LE32(cmd->c_Length);
         int taken;
 
         Forbid();
-        taken = ws_reply(&sdio->s_Ws, sdio->s_Ring, RtClock(sdio), LE16(cmd->c_ID), LE32(cmd->c_Command),
-                         (cmd->c_Flags & LE16(BCDC_DCMD_ERROR)) != 0, LE32(cmd->c_Status),
-                         (const UBYTE *)(cmd + 1), n);
+        taken = ws_ctrl_slot(&sdio->s_Ws, sdio->s_Ring, RtClock(sdio), (const UBYTE *)cmd, avail, pktLen);
         Permit();
         if (taken != WS_R_NOTMINE)
             return;
@@ -3008,9 +2982,16 @@ void PacketCtrlComplete(struct SDIO *sdio, struct Packet *pkt, ULONG pktLen)
                 m->pm_Copied = n;
             }
             ReplyMsg(&m->pm_Message);
+#ifdef WIFIPI_WLSAMPLE
+            wsWaiter = TRUE;
+#endif
             break;
         }
     }
+#ifdef WIFIPI_WLSAMPLE
+    if (!wsWaiter)
+        ws_ctrl_late(&sdio->s_Ws, sdio->s_Ring, RtClock(sdio), (const UBYTE *)cmd, pktLen);
+#endif
     Permit();
     CtrlFreeChain(sdio, chain);
 }

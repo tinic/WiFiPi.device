@@ -25,7 +25,17 @@ falsifier: there are no verdicts and nothing is counted across gaps.
   gap ... latency   samples whose REQ lies in the gap, descriptive only
   baseline ...      intervals wholly outside every gap, deltas and per-second
                     rate over their window
+  gap ... hold      per gap: REQ spacing (mean, max) and skips by reason
+  leg ...           the whole dump: REQ spacing, skips by reason, and the
+                    sampler's own SDIO traffic -- request frame bytes (REQ d)
+                    plus reply frame bytes (REP, LATE d>>16) -- over the span
+                    from the first REQ to the last sample record
   summary ...       samples_total, skips by reason, lost, late, eligible per gap
+
+Every time here is a recorded CLO: eligibility and coverage use each
+sample's own REQ and REP records (intervals(): a["req"], b["rep"]), the
+beacon expectation that window's length (beacons()), cadence the REQ
+records' spacing.  Nothing assumes the 50 ms target.
 
 tbtt is reported, never used as an anchor.  Record fields: src/wlsample.h.
 """
@@ -39,43 +49,66 @@ FIELDS = ("tbtt", "rxbeaconmbss", "rxframe", "rxcrsglitch", "rxbadplcp",
           "txframe", "txretrans", "txnoack", "rxnobuf", "rxtoolate")
 (K_REQ, K_REP, K_VAL, K_SKIP, K_LOST, K_LATE, K_STOP, K_REFUSED, K_ENABLE) = range(20, 29)
 REP_STATUS = {0: "ok", 1: "bad_layout", 2: "fw_error"}
-SKIP_REASON = {1: "slot_busy", 2: "ctrl_busy", 3: "nomem", 4: "stopped"}
+SKIP_REASON = {1: "slot_busy", 2: "ctrl_busy", 3: "nomem", 4: "stopped", 5: "no_credit"}
 STOP_REASON = {1: "idcap", 2: "disabled", 3: "wrap"}
 BEACON_S = 0.1024
 LABEL = "label=descriptive_association_not_a_falsifier"
 
 
 def collect(recs):
-    """(samples by REQ order, skips by reason, lost, late, other events)"""
-    by_id, order, skips, events = {}, [], {k: 0 for k in SKIP_REASON.values()}, []
-    lost = late = 0
+    """(samples by REQ order, skip records, lost, late, other events, SDIO bytes, last sample record t)"""
+    by_id, order, skips, events = {}, [], [], []
+    lost = late = sdio_bytes = 0
+    last_t = None
     for r in recs:
         k = r["k"]
         if k == K_REQ:
             s = {"id": r["b"], "n": r["c"], "req": r["t"], "req_clo": r["clo"], "rep": None,
                  "status": None, "lat": None, "vals": {}, "lost": None, "late": []}
+            sdio_bytes += r["d"]                    # the request frame
+            last_t = r["t"]
             by_id[r["b"]] = s
             order.append(s)
         elif k == K_REP and r["b"] in by_id:
             s = by_id[r["b"]]
-            s.update(rep=r["t"], rep_clo=r["clo"], status=r["a"], lat=r["c"], verlen=r["d"])
+            s.update(rep=r["t"], rep_clo=r["clo"], status=r["a"] & 3, version=r["a"] >> 2, lat=r["c"],
+                     length=r["d"] & 0xFFFF)
+            sdio_bytes += r["d"] >> 16              # the reply frame
+            last_t = r["t"]
         elif k == K_VAL and r["b"] in by_id and r["a"] < len(FIELDS):
             s = by_id[r["b"]]
             if s["status"] == 0:
                 s["vals"][FIELDS[r["a"]]] = r["c"]
         elif k == K_SKIP:
-            skips[SKIP_REASON.get(r["a"], str(r["a"]))] = skips.get(SKIP_REASON.get(r["a"], str(r["a"])), 0) + 1
+            skips.append((r["t"], SKIP_REASON.get(r["a"], str(r["a"]))))
         elif k == K_LOST:
             lost += 1
             if r["b"] in by_id:
                 by_id[r["b"]]["lost"] = r["t"]
         elif k == K_LATE:
             late += 1
+            sdio_bytes += r["d"] >> 16
+            last_t = r["t"]
             if r["b"] in by_id:
                 by_id[r["b"]]["late"].append((r["t"], r["a"], r["c"]))
         elif k in (K_STOP, K_REFUSED, K_ENABLE):
             events.append(r)
-    return order, skips, lost, late, events
+    return order, skips, lost, late, events, sdio_bytes, last_t
+
+
+def skip_counts(skips):
+    c = {k: 0 for k in SKIP_REASON.values()}
+    for _, reason in skips:
+        c[reason] = c.get(reason, 0) + 1
+    return " ".join("skipped_%s=%d" % kv for kv in sorted(c.items()))
+
+
+def cadence(reqs):
+    """mean and max REQ spacing in ms, from the recorded REQ CLOs (us)"""
+    d = [b - a for a, b in zip(reqs, reqs[1:])]
+    if not d:
+        return "cadence_mean_ms=none cadence_max_ms=none"
+    return "cadence_mean_ms=%.3f cadence_max_ms=%.3f" % (sum(d) / len(d) / 1e3, max(d) / 1e3)
 
 
 def valid(s):
@@ -138,7 +171,7 @@ def cmd_samples(dump, marks, gaps_path=None, extra=()):
     h, recs = rt.load(dump)
     m = rt.model(rt.pings(recs, rt.pcap_marks(marks)))
     peer = lambda t: rt.to_peer(m, t / 1e6)        # noqa: E731
-    samples, skips, lost, late, events = collect(recs)
+    samples, skips, lost, late, events, sdio_bytes, last_t = collect(recs)
     gaps = read_gaps(gaps_path, extra)
     out = ["align theta_s=%.6f theta_rate_ppm=%.3f bound_ms=%.3f ring_lost=%d" % (
         m["theta_s"], m["drift"] * 1e6, m["bound"] * 1e3, h["lost"])]
@@ -165,6 +198,9 @@ def cmd_samples(dump, marks, gaps_path=None, extra=()):
         eligible.append(len(inside))
         out.append("gap=%d dir=%s start=%.6f end=%.6f eligible_count=%d%s %s" % (
             g, d or "none", lo, hi, len(inside), " result=inconclusive" if not inside else "", LABEL))
+        reqs = [s["req"] for s in samples if lo <= peer(s["req"]) <= hi]
+        out.append("gap=%d hold samples=%d %s %s %s" % (
+            g, len(reqs), cadence(reqs), skip_counts([x for x in skips if lo <= peer(x[0]) <= hi]), LABEL))
         for iv in inside:
             out.append("gap=%d eligible from_id=%d to_id=%d window_start=%.6f window_end=%.6f window_ms=%.3f "
                        "%s %s wrapped=%s %s" % (
@@ -183,8 +219,12 @@ def cmd_samples(dump, marks, gaps_path=None, extra=()):
                 iv["a"]["id"], iv["b"]["id"], iv["lo"], iv["hi"], w * 1e3, deltas(iv),
                 " ".join("rate_per_s.%s=%.3f" % (f, iv["d"][f] / w) for f in FIELDS) if w > 0 else "rate=undefined",
                 beacons(iv), LABEL))
+    span = (last_t - samples[0]["req"]) / 1e6 if samples and last_t is not None else 0.0
+    out.append("leg samples=%d %s %s sdio_bytes=%d span_s=%.3f sdio_bytes_per_s=%s" % (
+        len(samples), cadence([s["req"] for s in samples]), skip_counts(skips), sdio_bytes, span,
+        "%.1f" % (sdio_bytes / span) if span > 0 else "undefined"))
     out.append("summary samples_total=%d %s lost=%d late=%d valid=%d overlap_excluded=%d invalid_end_excluded=%d eligible_per_gap=%s" % (
-        len(samples), " ".join("skipped_%s=%d" % kv for kv in sorted(skips.items())), lost, late,
+        len(samples), skip_counts(skips), lost, late,
         len([s for s in samples if valid(s)]), overlap, invalid, ",".join(str(n) for n in eligible) or "none"))
     return out
 

@@ -45,6 +45,9 @@ expect(kinds == {"SAMPLE_REQ": 20, "SAMPLE_REP": 21, "SAMPLE_VAL": 22, "SAMPLE_S
                  "SAMPLE_LATE": 25, "SAMPLER_STOP": 26, "SAMPLER_REFUSED": 27, "SAMPLER_ENABLE": 28},
        "record kinds as the decoder reads them: %s" % kinds)
 
+skips_c = {int(m.group(2)): m.group(1).lower() for m in re.finditer(r"WS_SKIP_(\w+)\s*=\s*(\d+)", hdr)}
+expect(skips_c == wlsample.SKIP_REASON, "skip reasons as the decoder names them: %s" % skips_c)
+
 # --- a synthetic run --------------------------------------------------------
 OFF = 1_790_000_000.0
 recs, marks = [], []
@@ -65,6 +68,7 @@ def ping(t, s):
     marks.append((peer(t + 300) + 0.0002, 0, s))
 
 
+REQ_BYTES, REP_BYTES = 876, 880
 state = {"n": 0, "id": 100, "c": {f: 1000 * i for i, f in enumerate(wlsample.FIELDS)}}
 
 
@@ -73,15 +77,15 @@ def sample(t, lat=2000, status=0, lost=False, late=None, rise=None, vals=True):
     state["n"] += 1
     state["id"] += 1
     i = state["id"]
-    put(t, 20, 0, i, state["n"], 0)
+    put(t, 20, 0, i, state["n"], REQ_BYTES)
     for f, v in (rise or {}).items():
         state["c"][f] = (state["c"][f] + v) & 0xFFFFFFFF
     if lost:
         put(t + 500_000, 24, 0, i, t & 0xFFFFFFFF, 0)
         if late is not None:
-            put(t + late, 25, 1, i, late, 0)
+            put(t + late, 25, 1, i, late, REP_BYTES << 16)
         return i
-    put(t + lat, 21, status, i, lat, (10 << 16) | 848)
+    put(t + lat, 21, status | (10 << 2), i, lat, (REP_BYTES << 16) | 848)
     if status == 0 and vals:
         for k, f in enumerate(wlsample.FIELDS):
             put(t + lat, 22, k, i, state["c"][f], 0)
@@ -101,6 +105,9 @@ for k in range(10):
 GAP_LO = peer(t) - 0.010                    # the gap opens 10 ms before sample 10's REQ
 for k in range(10):                         # 10..19 inside the gap, beacons stop
     sample(t, rise={"rxcrsglitch": 7, "rxnobuf": 3 if k == 4 else 0})
+    if k == 5:
+        put(t + 50_000, 23, 5, 0, 0, 0)     # no_credit at the next boundary: that period taken
+        t += 60_000                         # ... and the tick that follows is 60 ms on
     t += 50_000
 GAP_HI = peer(t - 50_000) + 0.020           # closes 20 ms after sample 19's REQ: its REP (2 ms) inside
 SIDX = state["id"]
@@ -207,6 +214,29 @@ expect(summ["eligible_per_gap"] == "9,1,0", "summary eligible per gap")
 expect(any(x.startswith("event=enable") and "E=99" in x for x in out)
        and any("event=stop" in x and "reason=disabled" in x for x in out), "enable and stop events")
 expect(not any("verdict" in x or "rose" in x for x in out), "no verdicts")
+
+# cadence and skips per hold, from the recorded REQ CLOs
+hold0 = kv([x for x in out if x.startswith("gap=0 hold")][0])
+expect(hold0["samples"] == "10" and hold0["cadence_mean_ms"] == "%.3f" % ((8 * 50 + 110) / 9)
+       and hold0["cadence_max_ms"] == "110.000", "gap 0 hold: cadence from REQ spacing: %s" % hold0)
+expect(hold0["skipped_no_credit"] == "1" and hold0["skipped_slot_busy"] == "0", "gap 0 hold: skips by reason")
+hold2 = kv([x for x in out if x.startswith("gap=2 hold")][0])
+expect(hold2["samples"] == "1" and hold2["cadence_mean_ms"] == "none", "one REQ: no cadence")
+# the leg: overall cadence, skips, and SDIO bytes from the records themselves
+leg = kv([x for x in out if x.startswith("leg ")][0])
+reqs = sorted(r[0] for r in recs if r[1] == 20)
+sp = [b - a for a, b in zip(reqs, reqs[1:])]
+nrep = len([r for r in recs if r[1] == 21])
+nlate = len([r for r in recs if r[1] == 25])
+last = max(r[0] for r in recs if r[1] in (20, 21, 25))
+want = len(reqs) * REQ_BYTES + (nrep + nlate) * REP_BYTES
+expect(leg["cadence_mean_ms"] == "%.3f" % (sum(sp) / len(sp) / 1e3) and leg["cadence_max_ms"] == "%.3f" % (max(sp) / 1e3),
+       "leg cadence: %s" % leg)
+expect(leg["skipped_no_credit"] == "1" and leg["skipped_ctrl_busy"] == "2" and leg["skipped_slot_busy"] == "1",
+       "leg skips by reason")
+expect(leg["sdio_bytes"] == str(want) and leg["span_s"] == "%.3f" % ((last - reqs[0]) / 1e6)
+       and leg["sdio_bytes_per_s"] == "%.1f" % (want / ((last - reqs[0]) / 1e6)), "leg SDIO bytes from the records")
+expect(summ["skipped_no_credit"] == "1", "summary carries no_credit")
 
 print("RESULT test_wlsample checks=%d failures=%d" % (checks, failures))
 sys.exit(1 if failures else 0)

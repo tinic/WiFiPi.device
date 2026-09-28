@@ -28,6 +28,10 @@ static UWORD cmdID;                 /* s_CmdID */
 static UWORD quar[32];              /* s_CtrlQuarantine */
 static ULONG now;                   /* CLO */
 static ULONG mark;                  /* ring seq at the last reset of the view */
+static UBYTE txSeq, maxSeq = 0x40;  /* s_TXSeq, s_MaxTXSeq */
+static int glom;
+#define MAXW 8
+static struct { UWORD id; ULONG cmd; int live; } waiters[MAXW];   /* sync waiters on s_CtrlWaitList */
 
 static void fresh(UWORD startID)
 {
@@ -41,6 +45,8 @@ static void fresh(UWORD startID)
     cmdID = startID;
     now = 1000000;
     mark = 0;
+    txSeq = 0; maxSeq = 0x40; glom = 0;
+    memset(waiters, 0, sizeof(waiters));
 }
 
 /* records written since the last view(), of kind k (0: any) */
@@ -64,25 +70,66 @@ static const struct RtRec *last(UBYTE k)
 
 static void view(void) { mark = ring->rt_Seq; }
 
-/* NextCmdID() for another caller (a sync or async control) */
+/*
+ * The driver around wlsample.h, line for line where it decides anything:
+ *   other_id()   NextCmdID(): ws_next_id's walk, then ws_realloc under Forbid
+ *   credit()     PacketTxCredit() (#99), copied
+ *   tick()       WsTick(): ws_tick(ctrlBusy, credit), ws_take_id, ws_build
+ *                with s_TXSeq++, ws_sent(frame bytes)
+ *   dispatch()   PacketCtrlComplete(): ws_ctrl_slot on the raw BCDC reply,
+ *                then the wait list (id and command), then ws_ctrl_late
+ * Exec (Forbid, AllocMem, SendPKT, ReplyMsg) is what stays out.
+ */
+static UBYTE lastFrame[2048];
+static ULONG lastFrameLen;
+
+static UBYTE credit(void)
+{
+    UBYTE d = (UBYTE)(maxSeq - txSeq);
+    return (d & 0x80) ? 0 : d;
+}
+
 static UWORD other_id(void)
 {
     cmdID = ws_next_id(cmdID, quar);
+    ws_realloc(ws, cmdID);
     return cmdID;
 }
 
-/* The receiver tick: 1 and the id if a sample went out */
+/* a sync control: its id from NextCmdID, on the wait list until answered */
+static UWORD sync_req(ULONG cmd)
+{
+    UWORD id = other_id();
+    for (int i = 0; i < MAXW; i++)
+        if (!waiters[i].live)
+        {
+            waiters[i].id = id; waiters[i].cmd = cmd; waiters[i].live = 1;
+            break;
+        }
+    return id;
+}
+
+static int waiting(void)
+{
+    for (int i = 0; i < MAXW; i++)
+        if (waiters[i].live) return 1;
+    return 0;
+}
+
 static int tick(int ctrlBusy, UWORD *id)
 {
-    if (!ws_tick(ws, ring, now, ctrlBusy))
+    if (!ws_tick(ws, ring, now, ctrlBusy || waiting(), credit()))
         return 0;
     if (!ws_take_id(ws, ring, now, &cmdID, quar, id))
         return 0;
-    ws_sent(ws, ring, now, *id);
+    lastFrameLen = ws_frame_len(glom);
+    memset(lastFrame, 0, sizeof(lastFrame));
+    ws_build(lastFrame, glom, txSeq++, *id);
+    ws_sent(ws, ring, now, *id, lastFrameLen);
     return 1;
 }
 
-/* A v10 answer: every counter its offset, tbtt 7 */
+/* A v10 answer: every counter its offset * 1000 + 3 */
 static UBYTE answer[2048];
 static void v10(UWORD version, UWORD length)
 {
@@ -96,9 +143,31 @@ static void v10(UWORD version, UWORD length)
     }
 }
 
+enum { NONE = WS_R_NOTMINE, WAITER = 3 };
+#define REPLY_FRAME 900
+
+/* the reply as the firmware sends it: BCDC header, then `copied` bytes of the answer */
+static int dispatch(UWORD id, ULONG cmd, int fwError, ULONG status, ULONG copied)
+{
+    static UBYTE b[16 + 2048];
+    memset(b, 0, sizeof(b));
+    ws_put32(b, cmd); ws_put32(b + 4, WS_V10_LEN);
+    ws_put16(b + 8, fwError ? 1 : 0); ws_put16(b + 10, id); ws_put32(b + 12, status);
+    memcpy(b + 16, answer, copied);
+    if (ws_ctrl_slot(ws, ring, now, b, copied, REPLY_FRAME) != WS_R_NOTMINE)
+        return WS_R_TAKEN;
+    for (int i = 0; i < MAXW; i++)
+        if (waiters[i].live && waiters[i].id == id && waiters[i].cmd == cmd)
+        {
+            waiters[i].live = 0;
+            return WAITER;
+        }
+    return ws_ctrl_late(ws, ring, now, b, REPLY_FRAME) == WS_R_LATE ? WS_R_LATE : NONE;
+}
+
 static int reply(UWORD id, ULONG cmd, ULONG copied)
 {
-    return ws_reply(ws, ring, now, id, cmd, 0, 0, answer, copied);
+    return dispatch(id, cmd, 0, 0, copied);
 }
 
 int main(void)
@@ -153,7 +222,8 @@ int main(void)
     v10(10, 848);
     EXPECT(reply(s1, WS_GET_VAR, 848) == WS_R_TAKEN);
     e = last(RT_SAMPLE_REP);
-    EXPECT(e && e->r_A == WS_REP_OK && e->r_B == s1 && e->r_C == now - req && e->r_D == ((10u << 16) | 848));
+    EXPECT(e && e->r_A == (WS_REP_OK | (10 << 2)) && e->r_B == s1 && e->r_C == now - req
+           && e->r_D == ((REPLY_FRAME << 16) | 848));
     EXPECT(count(RT_SAMPLE_VAL) == 10 && count(0) == 11);
     {
         static const ULONG want[10] = { 184, 344, 64, 280, 276, 4, 12, 456, 80, 244 };
@@ -181,34 +251,36 @@ int main(void)
             view();
             v10(bad[i].ver, bad[i].len);
             EXPECT(reply(s1, WS_GET_VAR, bad[i].copied) == WS_R_TAKEN);
-            EXPECT(last(RT_SAMPLE_REP)->r_A == WS_REP_BAD_LAYOUT && count(RT_SAMPLE_VAL) == 0);
+            EXPECT((last(RT_SAMPLE_REP)->r_A & 3) == WS_REP_BAD_LAYOUT && count(RT_SAMPLE_VAL) == 0);
+            EXPECT(last(RT_SAMPLE_REP)->r_A >> 2 == (bad[i].copied >= 2 ? bad[i].ver : 0));
             now += 50000;
         }
         EXPECT(tick(0, &s1));
         view();
-        EXPECT(ws_reply(ws, ring, now, s1, WS_GET_VAR, 1, 0xffffffe9u, answer, 0) == WS_R_TAKEN);
-        EXPECT(last(RT_SAMPLE_REP)->r_A == WS_REP_FW_ERROR && last(RT_SAMPLE_REP)->r_D == 0xffffffe9u
-               && count(RT_SAMPLE_VAL) == 0);
+        EXPECT(dispatch(s1, WS_GET_VAR, 1, 0xffffffe9u, 0) == WS_R_TAKEN);
+        EXPECT(last(RT_SAMPLE_REP)->r_A == WS_REP_FW_ERROR
+               && last(RT_SAMPLE_REP)->r_D == ((REPLY_FRAME << 16) | 0xffe9u) && count(RT_SAMPLE_VAL) == 0);
     }
 
     /* ---- SYNC-DURING-SAMPLE: each reply goes to its owner --------------- */
     fresh(400);
     ws_enable(ws, ring, cmdID, now);
     EXPECT(tick(0, &s1));
-    sy = other_id();                                /* a sync GET_VAR queued behind it */
+    sy = sync_req(WS_GET_VAR);                      /* a sync GET_VAR queued behind it */
     EXPECT(sy == s1 + 1);
     view();
     v10(10, 848);
-    EXPECT(reply(sy, WS_GET_VAR, 848) == WS_R_NOTMINE);    /* the waiter's */
+    EXPECT(reply(sy, WS_GET_VAR, 848) == WAITER);          /* the waiter's */
     EXPECT(count(0) == 0 && ws->ws_SlotLive);
     EXPECT(reply(s1, WS_GET_VAR, 848) == WS_R_TAKEN);      /* the sampler's */
     EXPECT(count(RT_SAMPLE_VAL) == 10);
     /* the slot's id with another command is not the slot's */
     now += 50000;
     EXPECT(tick(0, &s2));
-    EXPECT(reply(s2, 263, 848) == WS_R_NOTMINE && ws->ws_SlotLive);
-    /* a stale sync reply for an id the sampler never issued stays the waiters' */
-    EXPECT(reply(sy, WS_GET_VAR, 848) == WS_R_NOTMINE);
+    EXPECT(reply(s2, 263, 848) == NONE && ws->ws_SlotLive);
+    /* a stale sync reply for an id the sampler never issued is never a late sample */
+    view();
+    EXPECT(reply(sy, WS_GET_VAR, 848) == NONE && count(0) == 0);
 
     /* ---- LATE-AFTER-TMO: values dropped, latency kept ------------------- */
     fresh(500);
@@ -242,9 +314,9 @@ int main(void)
     now += 500000;
     tick(1, &s2);                                   /* LOST; a sync is waiting, so no new sample */
     EXPECT(!ws->ws_SlotLive && last(RT_SAMPLE_LOST) && last(RT_SAMPLE_SKIP)->r_A == WS_SKIP_CTRL_BUSY);
-    sy = other_id();
+    sy = sync_req(WS_GET_VAR);
     view();
-    EXPECT(reply(sy, WS_GET_VAR, 848) == WS_R_NOTMINE);    /* the sync gets its own */
+    EXPECT(reply(sy, WS_GET_VAR, 848) == WAITER);          /* the sync gets its own */
     now += 1000;
     EXPECT(reply(s1, WS_GET_VAR, 848) == WS_R_LATE);
     EXPECT(last(RT_SAMPLE_LATE)->r_C == now - req && count(RT_SAMPLE_VAL) == 0);
@@ -319,16 +391,181 @@ int main(void)
     /* disabled while a request was being built: it goes out, its reply is late */
     fresh(800);
     ws_enable(ws, ring, cmdID, now);
-    EXPECT(ws_tick(ws, ring, now, 0) && ws_take_id(ws, ring, now, &cmdID, quar, &s1));
+    EXPECT(ws_tick(ws, ring, now, 0, credit()) && ws_take_id(ws, ring, now, &cmdID, quar, &s1));
     ws_disable(ws, ring, now);
-    ws_sent(ws, ring, now, s1);
+    ws_sent(ws, ring, now, s1, ws_frame_len(0));
     EXPECT(!ws->ws_SlotLive);
     view();
     EXPECT(reply(s1, WS_GET_VAR, 848) == WS_R_LATE && count(RT_SAMPLE_VAL) == 0);
 
+    /* ---- the frame: as PacketSetVarAsync lays one out, REQ carries its bytes */
+    for (int g = 0; g <= 1; g++)
+    {
+        fresh(0x1233);
+        glom = g;
+        ws_enable(ws, ring, cmdID, now);
+        txSeq = 0x5a; maxSeq = 0x7a;
+        view();
+        EXPECT(tick(0, &s1) && s1 == 0x1234 && txSeq == 0x5b);
+        ULONG tot = glom ? 884 : 876, h = glom ? 12 : 4;
+        UBYTE *c = lastFrame + h + 8;
+        EXPECT(lastFrameLen == tot && last(RT_SAMPLE_REQ)->r_D == tot);
+        EXPECT(lastFrame[0] == (tot & 0xff) && lastFrame[1] == tot >> 8
+               && lastFrame[2] == (UBYTE)~tot && lastFrame[3] == (UBYTE)(~tot >> 8));
+        if (glom)
+            EXPECT(lastFrame[4] == ((tot - 4) & 0xff) && lastFrame[5] == (tot - 4) >> 8 && lastFrame[6] == 0
+                   && lastFrame[7] == 1 && lastFrame[8] == 0 && lastFrame[9] == 0
+                   && lastFrame[10] == ((0u - tot) & 3) && lastFrame[11] == 0);
+        EXPECT(lastFrame[h] == 0x5a && lastFrame[h + 1] == 0 && lastFrame[h + 2] == 0
+               && lastFrame[h + 3] == (glom ? 20 : 12) && lastFrame[h + 4] == 0 && lastFrame[h + 5] == 0);
+        EXPECT(ws_le32(c) == 262 && ws_le32(c + 4) == 848 && ws_le16(c + 8) == 0 && ws_le16(c + 10) == 0x1234
+               && ws_le32(c + 12) == 0 && memcmp(c + 16, "counters", 9) == 0);
+        int zero = 1;
+        for (ULONG i = h + 8 + 16 + 9; i < sizeof(lastFrame); i++)
+            if (lastFrame[i]) zero = 0;
+        EXPECT(zero);
+    }
+    glom = 0;
+
+    /* ---- NO-CREDIT: skip, no id, no REQ, no slot; recovery on cadence, no burst */
+    fresh(2000);
+    ws_enable(ws, ring, cmdID, now);
+    maxSeq = txSeq;                                 /* window closed */
+    view();
+    EXPECT(!tick(0, &s1));
+    e = last(RT_SAMPLE_SKIP);
+    EXPECT(e && e->r_A == WS_SKIP_NO_CREDIT && e->r_Clo == now);
+    EXPECT(cmdID == 2000 && count(RT_SAMPLE_REQ) == 0 && !ws->ws_SlotLive && ws->ws_Samples == 0);
+    ULONG t0 = now;
+    for (int i = 1; i <= 5; i++)                    /* five more periods closed, ticks every 10 ms */
+        for (int k = 0; k < 5; k++)
+        {
+            now += 10000;
+            tick(0, &s1);
+        }
+    EXPECT(count(RT_SAMPLE_SKIP) == 6 && count(RT_SAMPLE_REQ) == 0 && cmdID == 2000);
+    maxSeq = txSeq + 0x20;                          /* credit back mid-period */
+    now += 5000;
+    EXPECT(!tick(0, &s1) && count(RT_SAMPLE_REQ) == 0);           /* waits for its boundary */
+    now = t0 + 6 * 50000;
+    EXPECT(tick(0, &s1) && s1 == 2001 && count(RT_SAMPLE_REQ) == 1);
+    reply(s1, WS_GET_VAR, 848);
+    for (int k = 0; k < 4; k++)                     /* no catch-up: nothing before the next boundary */
+    {
+        now += 10000;
+        EXPECT(!tick(0, &s2));
+    }
+    EXPECT(count(RT_SAMPLE_REQ) == 1);
+    now += 10000;
+    EXPECT(tick(0, &s2) && s2 == 2002 && count(RT_SAMPLE_REQ) == 2);
+    reply(s2, WS_GET_VAR, 848);
+    /* a window that points behind the next number is closed too */
+    maxSeq = txSeq - 1;
+    now += 50000;
+    view();
+    EXPECT(!tick(0, &s2) && last(RT_SAMPLE_SKIP)->r_A == WS_SKIP_NO_CREDIT && cmdID == 2002);
+    /* the sample's own frame takes the last credit; the next finds none */
+    maxSeq = txSeq + 1;
+    now += 50000;
+    EXPECT(tick(0, &s2) && credit() == 0);
+    reply(s2, WS_GET_VAR, 848);
+    now += 50000;
+    view();
+    EXPECT(!tick(0, &s2) && last(RT_SAMPLE_SKIP)->r_A == WS_SKIP_NO_CREDIT);
+
+    /* ---- low credit with a sync control: the sync goes first, replies to owners */
+    fresh(3000);
+    ws_enable(ws, ring, cmdID, now);
+    maxSeq = txSeq + 1;
+    sy = sync_req(WS_GET_VAR);                      /* 3001, waiting */
+    view();
+    EXPECT(!tick(0, &s1) && last(RT_SAMPLE_SKIP)->r_A == WS_SKIP_CTRL_BUSY && cmdID == 3001);
+    EXPECT(reply(sy, WS_GET_VAR, 848) == WAITER);
+    now += 50000;
+    EXPECT(tick(0, &s1) && s1 == 3002 && credit() == 0);
+    sy = sync_req(WS_GET_VAR);                      /* 3003, while the sample is out */
+    view();
+    EXPECT(reply(sy, WS_GET_VAR, 848) == WAITER && count(0) == 0 && ws->ws_SlotLive);
+    EXPECT(reply(s1, WS_GET_VAR, 848) == WS_R_TAKEN && count(RT_SAMPLE_VAL) == 10);
+    now += 50000;
+    view();
+    EXPECT(!tick(0, &s1) && last(RT_SAMPLE_SKIP)->r_A == WS_SKIP_NO_CREDIT && cmdID == 3003);
+
+    /* ---- ID-CAP exact with skips in between: a skip takes no id ---------- */
+    fresh(4000);
+    ws_enable(ws, ring, cmdID, now);
+    cmdID = (UWORD)(4000 + 59998);
+    maxSeq = txSeq;
+    for (int k = 0; k < 3; k++) { now += 50000; tick(0, &s1); }   /* no_credit */
+    sy = sync_req(WS_GET_VAR);                      /* E+59999 goes to a sync caller */
+    now += 50000;
+    view();
+    EXPECT(!tick(0, &s1) && last(RT_SAMPLE_SKIP)->r_A == WS_SKIP_CTRL_BUSY);
+    EXPECT(sy == (UWORD)(4000 + 59999) && cmdID == sy);
+    reply(sy, WS_GET_VAR, 848);
+    maxSeq = txSeq + 8;
+    now += 50000;
+    view();
+    EXPECT(!tick(0, &s1));                          /* E+60000 would be next: stop, not taken */
+    e = last(RT_SAMPLER_STOP);
+    EXPECT(e && e->r_A == WS_STOP_IDCAP && e->r_B == (UWORD)(4000 + 60000) && e->r_D == 60000);
+    EXPECT(cmdID == (UWORD)(4000 + 59999) && count(RT_SAMPLE_REQ) == 0);
+
+    /* ---- LAP-AFTER-STOP: a former sample id, handed to a sync caller ----- */
+    fresh(5000);
+    ws_enable(ws, ring, cmdID, now);
+    EXPECT(tick(0, &s1));                           /* 5001, answered */
+    reply(s1, WS_GET_VAR, 848);
+    now += 50000;
+    EXPECT(tick(0, &s2));                           /* 5002, never answered */
+    req = now;
+    now += 500000;
+    tick(0, &sy);                                   /* LOST, tombstoned */
+    ws_disable(ws, ring, now);
+    EXPECT(ws_issued(ws, s1) && ws_issued(ws, s2));
+    for (ULONG n = 0; n < 65536; n++)               /* sync callers go all the way round */
+        other_id();
+    while (cmdID != (UWORD)(s1 - 1))
+        other_id();
+    view();
+    sy = sync_req(WS_GET_VAR);
+    EXPECT(sy == s1 && !ws_issued(ws, s1));         /* handing it out cleared the mark */
+    EXPECT(reply(sy, WS_GET_VAR, 848) == WAITER && count(RT_SAMPLE_LATE) == 0 && count(0) == 0);
+
+    /* ---- a late reply before its id is handed out again: LATE, values dropped */
+    fresh(6000);
+    ws_enable(ws, ring, cmdID, now);
+    EXPECT(tick(0, &s1));
+    req = now;
+    now += 500000;
+    tick(1, &s2);                                   /* LOST */
+    for (int k = 0; k < 100; k++)
+        other_id();                                 /* others move on, nowhere near s1 again */
+    now += 7000;
+    view();
+    EXPECT(reply(s1, WS_GET_VAR, 848) == WS_R_LATE && count(RT_SAMPLE_VAL) == 0);
+    EXPECT(last(RT_SAMPLE_LATE)->r_C == now - req && last(RT_SAMPLE_LATE)->r_D == (REPLY_FRAME << 16));
+
+    /* ---- a late sample reply after its id went to a sync waiter with the
+       same command: the waiter takes it.  The base driver has this exposure
+       already (a reply delayed past 65,504 later ids); zz9k accepted it: the
+       waiter's own id/command match governs. */
+    fresh(7000);
+    ws_enable(ws, ring, cmdID, now);
+    EXPECT(tick(0, &s1));
+    now += 500000;
+    tick(1, &s2);                                   /* LOST */
+    ws_disable(ws, ring, now);
+    while (cmdID != (UWORD)(s1 - 1))
+        other_id();
+    sy = sync_req(WS_GET_VAR);
+    EXPECT(sy == s1);
+    view();
+    EXPECT(reply(s1, WS_GET_VAR, 848) == WAITER && count(0) == 0);   /* the old sample's answer */
+
     /* ---- never enabled: every reply is the waiters' --------------------- */
     fresh(900);
-    EXPECT(reply(901, WS_GET_VAR, 848) == WS_R_NOTMINE && count(0) == 0);
+    EXPECT(reply(901, WS_GET_VAR, 848) == NONE && count(0) == 0);
     EXPECT(!tick(0, &s1) && count(0) == 0);
 
     EXPECT(sizeof(struct RtRec) == 16);
