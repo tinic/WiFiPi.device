@@ -49,7 +49,19 @@ offset is ever guessed.
     any other id is listed as skipped, not read.
 
 A delta is (post - pre) mod 2^32; post < pre is flagged wrap.NAME=1 (a u32
-wrap and a firmware counter reset look the same).
+wrap and a firmware counter reset look the same).  delta refuses (exit 2,
+nothing else printed) unless both snapshots are whole: a GET that failed or
+timed out, fewer bytes than the layout, or a bad header is refused.
+
+delta groups the listed fields (every field still gets delta.NAME=):
+  ambient_rf  PHY/CRC-class errors (AMBIENT_*): ambient_rf_delta.NAME and
+              ambient_rf_rate.NAME per second over elapsed_us, then
+              ambient_rf_verdict=descriptive_only -- no verdict either way
+  host_drop   overflow, no-buffer, DMA, reset/reinit (DROP_*):
+              host_drop_delta.NAME, host_drop_rose=0/1, host_drop_rose_fields=
+  other       listed, no verdict
+Snapshots are pre and post a leg only: the command holds the unit lock for
+up to the 2.5 s GET deadline.
 """
 import struct
 import sys
@@ -300,15 +312,18 @@ RX_V10 = (
     "rxmulti", "rxcrc", "rxundec", "decsuccess", "tkipreplay", "ccmpreplay", "ccmpundec",
     "psmwds", "phywatchdog", "bphy_rxcrsglitch", "bphy_badplcp", "rxdrop20s", "dma_hang",
     "reinit", "rxrtry")
-# ... of which a rise is RX error/drop evidence
-RX_ERR_V10 = (
-    "rxerror", "rxnobuf", "rxnondata", "rxbadds", "rxbadcm", "rxfragerr", "rxrunt", "rxgiant",
-    "rxnoscb", "rxbadproto", "rxbadsrcmac", "rxbadda", "rxoflo", "rxuflo_0", "rxuflo_1",
-    "rxuflo_2", "rxuflo_3", "rxuflo_4", "rxuflo_5", "dmade", "dmada", "dmape", "reset",
-    "rxtoolate", "rxfrmtoolong", "rxfrmtooshrt", "rxinvmachdr", "rxbadfcs", "rxbadplcp",
-    "rxf0ovfl", "rxf1ovfl", "rxf2ovfl", "pmqovfl", "rxcrc", "rxundec", "tkipreplay",
-    "ccmpreplay", "ccmpundec", "psmwds", "phywatchdog", "bphy_badplcp", "rxdrop20s",
-    "dma_hang", "reinit")
+# Two groups of the list above; every other listed field gets a delta, no verdict.
+# ambient_rf: PHY/CRC-class errors that any radio in range produces on every
+# leg -- descriptive only, never a verdict.  host_drop: the chip dropping or
+# overflowing on its way to the host, or resetting -- host_drop_rose is 1 if
+# any rose.
+AMBIENT_V10 = (
+    "rxcrc", "rxbadfcs", "rxbadplcp", "bphy_badplcp", "rxcrsglitch", "bphy_rxcrsglitch",
+    "rxfrmtooshrt", "rxfrmtoolong", "rxinvmachdr")
+DROP_V10 = (
+    "rxf0ovfl", "rxf1ovfl", "rxf2ovfl", "rxnobuf", "rxoflo", "rxuflo_0", "rxuflo_1", "rxuflo_2",
+    "rxuflo_3", "rxuflo_4", "rxuflo_5", "pmqovfl", "rxtoolate", "dmade", "dmada", "dmape",
+    "dma_hang", "reinit", "reset", "psmwds", "phywatchdog")
 # XTLV: wlc.NAME from block 0x100, mcst.NAME from whichever MACSTAT block came
 RX_XTLV = tuple("wlc." + n for n in (
     "rxframe", "rxbyte", "rxerror", "rxctl", "rxnobuf", "rxnondata", "rxbadds", "rxbadcm",
@@ -321,16 +336,16 @@ RX_XTLV = tuple("wlc." + n for n in (
     "rxcrsglitch", "rxstrt", "rxdtucastmbss", "rxdfrmucastmbss", "rxackucast", "rxbeaconmbss",
     "rxbeaconobss", "rxrsptmout", "rxnodelim", "rxf0ovfl", "rxf1ovfl", "rxf2ovfl", "rxhlovfl",
     "pmqovfl", "rxback", "rxtoolate", "rxdrop20s", "bphy_rxcrsglitch", "bphy_badplcp"))
-RX_ERR_XTLV = tuple("wlc." + n for n in (
-    "rxerror", "rxnobuf", "rxnondata", "rxbadds", "rxbadcm", "rxfragerr", "rxrunt", "rxgiant",
-    "rxnoscb", "rxbadproto", "rxbadsrcmac", "rxbadda", "rxoflo", "rxuflo_0", "rxuflo_1",
-    "rxuflo_2", "rxuflo_3", "rxuflo_4", "rxuflo_5", "dmade", "dmada", "dmape", "reset", "rxcrc",
-    "rxundec", "tkipreplay", "ccmpreplay", "ccmpundec", "psmwds", "phywatchdog", "dma_hang",
-    "reinit")) + tuple("mcst." + n for n in (
-    "rxfrmtoolong", "rxfrmtooshrt", "rxanyerr", "rxinvmachdr", "rxbadfcs", "rxbadplcp",
-    "rxf0ovfl", "rxf1ovfl", "rxf2ovfl", "rxhlovfl", "pmqovfl", "rxtoolate", "rxdrop20s",
-    "bphy_badplcp"))
-assert set(RX_ERR_V10) <= set(RX_V10) and set(RX_ERR_XTLV) <= set(RX_XTLV)
+AMBIENT_XTLV = ("wlc.rxcrc",) + tuple("mcst." + n for n in (
+    "rxbadfcs", "rxbadplcp", "bphy_badplcp", "rxcrsglitch", "bphy_rxcrsglitch", "rxfrmtooshrt",
+    "rxfrmtoolong", "rxinvmachdr"))
+DROP_XTLV = tuple("wlc." + n for n in (
+    "rxnobuf", "rxoflo", "rxuflo_0", "rxuflo_1", "rxuflo_2", "rxuflo_3", "rxuflo_4", "rxuflo_5",
+    "dmade", "dmada", "dmape", "dma_hang", "reinit", "reset", "psmwds", "phywatchdog")) + \
+    tuple("mcst." + n for n in (
+        "rxf0ovfl", "rxf1ovfl", "rxf2ovfl", "rxhlovfl", "pmqovfl", "rxtoolate"))
+assert set(AMBIENT_V10) | set(DROP_V10) <= set(RX_V10) and not set(AMBIENT_V10) & set(DROP_V10)
+assert set(AMBIENT_XTLV) | set(DROP_XTLV) <= set(RX_XTLV) and not set(AMBIENT_XTLV) & set(DROP_XTLV)
 assert set(RX_V10) <= set(n for n, _, _ in V10_FIELDS)
 assert set(n[4:] for n in RX_XTLV if n.startswith("wlc.")) <= set(n for n, _, _ in WLC_FIELDS)
 assert set(n[5:] for n in RX_XTLV if n.startswith("mcst.")) <= \
@@ -456,7 +471,13 @@ def cmd_show(path):
     return out
 
 
+SNAPSHOT_RULE = "snapshot_rule=pre_and_post_only (Do_WlCnt holds wu_Lock; never mid-leg)"
+
+
 def cmd_delta(pre_path, post_path, every=False):
+    # fail closed: load() refuses a failed or lost GET and a bad header,
+    # decode() an answer shorter than its layout; nothing is printed before
+    # both snapshots have passed
     h0, d0 = load(pre_path)
     h1, d1 = load(post_path)
     l0, v0 = decode(d0, h0["copied"])
@@ -465,12 +486,18 @@ def cmd_delta(pre_path, post_path, every=False):
         raise Refused("layouts differ: pre %s, post %s" % (l0, l1), d1[:h1["copied"]])
     legacy = not l0.startswith("xtlv")
     names = [k for k in v0] if every else list(RX_V10 if legacy else RX_XTLV)
-    errs = RX_ERR_V10 if legacy else RX_ERR_XTLV
+    ambient = [n for n in (AMBIENT_V10 if legacy else AMBIENT_XTLV) if n in names]
+    drops = [n for n in (DROP_V10 if legacy else DROP_XTLV) if n in names]
+    other = [n for n in names if n not in ambient and n not in drops]
+    elapsed = (h1["clo_before"] - h0["clo_after"]) & 0xFFFFFFFF
     d = delta(v0, v1)
-    out = ["layout=%s" % l0,
+    out = ["layout=%s" % l0, SNAPSHOT_RULE,
            "pre.clo_after=%d" % h0["clo_after"], "post.clo_before=%d" % h1["clo_before"],
-           "elapsed_us=%d" % ((h1["clo_before"] - h0["clo_after"]) & 0xFFFFFFFF),
-           "fields=%s" % ",".join(names)]
+           "elapsed_us=%d" % elapsed,
+           "fields=%s" % ",".join(names),
+           "ambient_rf_fields=%s" % ",".join(ambient),
+           "host_drop_fields=%s" % ",".join(drops),
+           "other_fields=%s" % ",".join(other)]
     wrapped, rose = [], []
     for n in names:
         if n not in d:
@@ -481,12 +508,24 @@ def cmd_delta(pre_path, post_path, every=False):
         if w:
             wrapped.append(n)
             out.append("wrap.%s=1" % n)
-        if n in errs and v:
-            rose.append(n)
     out.append("wrapped=%s" % (",".join(wrapped) or "none"))
-    out.append("rx_error_fields=%s" % ",".join(e for e in errs if e in names))
-    out.append("rx_errors_rose=%d" % (1 if rose else 0))
-    out.append("rx_errors_rose_fields=%s" % (",".join(rose) or "none"))
+    for n in ambient:
+        if n not in d:
+            out.append("ambient_rf_delta.%s=absent" % n)
+            continue
+        out.append("ambient_rf_delta.%s=%d" % (n, d[n][0]))
+        out.append("ambient_rf_rate.%s=%s" % (
+            n, "%.3f" % (d[n][0] * 1e6 / elapsed) if elapsed else "undefined"))
+    out.append("ambient_rf_verdict=descriptive_only")
+    for n in drops:
+        if n not in d:
+            out.append("host_drop_delta.%s=absent" % n)
+            continue
+        out.append("host_drop_delta.%s=%d" % (n, d[n][0]))
+        if d[n][0]:
+            rose.append(n)
+    out.append("host_drop_rose=%d" % (1 if rose else 0))
+    out.append("host_drop_rose_fields=%s" % (",".join(rose) or "none"))
     return out
 
 

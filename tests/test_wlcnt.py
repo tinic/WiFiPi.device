@@ -169,14 +169,43 @@ expect(kv.get("delta.rxf0ovfl") == "0", "delta: flat field is 0")
 expect(kv.get("wrapped") == "rxbadfcs", "delta: wrapped list")
 expect(kv.get("elapsed_us") == "512", "delta: CLO elapsed across its wrap")
 expect(kv.get("fields") == ",".join(wlcnt.RX_V10), "delta: the explicit field list")
-expect(kv.get("rx_errors_rose") == "1" and "rxbadfcs" in kv.get("rx_errors_rose_fields", ""),
-       "delta: RX error rise reported")
+expect(kv.get("snapshot_rule") == "pre_and_post_only (Do_WlCnt holds wu_Lock; never mid-leg)",
+       "delta: snapshot rule line")
+expect(kv.get("ambient_rf_fields") == ",".join(wlcnt.AMBIENT_V10)
+       and kv.get("host_drop_fields") == ",".join(wlcnt.DROP_V10), "delta: both group lists printed")
+expect(kv.get("other_fields", "").split(",") ==
+       [n for n in wlcnt.RX_V10 if n not in wlcnt.AMBIENT_V10 + wlcnt.DROP_V10],
+       "delta: the rest listed, no verdict")
 expect(all(("delta." + n) in kv for n in wlcnt.RX_V10), "delta: every listed field printed")
+# ambient-only rise (rxbadfcs +32 over 512 us): descriptive, no drop verdict
+expect(kv.get("ambient_rf_delta.rxbadfcs") == "32" and kv.get("ambient_rf_rate.rxbadfcs") == "62500.000",
+       "delta: ambient delta and per-second rate")
+expect(kv.get("ambient_rf_verdict") == "descriptive_only", "ambient-only rise: descriptive_only")
+expect(kv.get("host_drop_rose") == "0" and kv.get("host_drop_rose_fields") == "none",
+       "ambient-only rise: host_drop_rose=0")
+expect(not any(k.startswith(("ambient_rf_excess", "rx_errors", "baseline")) for k in kv),
+       "delta: no excess, no baseline, no combined verdict")
+
+# a host drop rise
+dpre, _ = legacy(10, 848, seed=4, override={"rxnobuf": 10, "rxf0ovfl": 2})
+dpost, _ = legacy(10, 848, seed=4, override={"rxnobuf": 17, "rxf0ovfl": 2})
+rc, kv, _ = run("delta", put("dpre.bin", dump(dpre)), put("dpost.bin", dump(dpost)))
+expect(rc == 0 and kv.get("host_drop_rose") == "1" and kv.get("host_drop_rose_fields") == "rxnobuf"
+       and kv.get("host_drop_delta.rxnobuf") == "7" and kv.get("host_drop_delta.rxf0ovfl") == "0",
+       "drop rise: host_drop_rose=1, exact field deltas")
+
+# fail closed: a timed-out or short snapshot on either side prints no delta
+rc, kv, out = run("delta", put("tmo.bin", dump(b"", copied=0, err=0x7FFF0001)), put("dpost2.bin", dump(dpost)))
+expect(rc == 2 and "error 0x7fff0001" in kv.get("refused", "") and "delta." not in out,
+       "delta: timed-out pre snapshot refused")
+rc, kv, out = run("delta", put("dpre2.bin", dump(dpre)), put("dshort.bin", dump(dpost, copied=700)))
+expect(rc == 2 and "short" in kv.get("refused", "") and "delta." not in out,
+       "delta: short post copy refused")
 
 flat, _ = legacy(10, 848, seed=3, override={"rxbadfcs": 0x10, "rxframe": 350, "rxf0ovfl": 5,
                                             "rxnobuf": 0, "rxcrc": 0})
 rc, kv, _ = run("delta", put("post2.bin", dump(post)), put("flat.bin", dump(flat)))
-expect(rc == 0 and kv.get("rx_errors_rose") == "0" and kv.get("wrapped") == "none",
+expect(rc == 0 and kv.get("host_drop_rose") == "0" and kv.get("wrapped") == "none",
        "delta: identical snapshots are flat")
 rc, kv, _ = run("delta", put("a844.bin", dump(blob844)), put("b848.bin", dump(post)))
 expect(rc == 2 and "layouts differ" in kv.get("refused", ""), "delta: layouts must match")
@@ -224,7 +253,10 @@ rc, kv, _ = run("delta", put("xpre.bin", dump(xpre)), put("xpost.bin", dump(xpos
 expect(rc == 0 and kv.get("delta.wlc.rxnobuf") == "2" and kv.get("delta.mcst.rxbadfcs") == "3",
        "xtlv delta: WLC and MACSTAT fields")
 expect(kv.get("delta.mcst.rxinvmachdr") == "absent", "xtlv delta: a field the block lacks is absent")
-expect(kv.get("rx_errors_rose") == "1", "xtlv delta: rise reported")
+expect(kv.get("host_drop_rose") == "1" and kv.get("host_drop_rose_fields") == "wlc.rxnobuf",
+       "xtlv delta: host drop rise reported")
+expect(kv.get("ambient_rf_delta.mcst.rxbadfcs") == "3" and kv.get("ambient_rf_verdict") == "descriptive_only",
+       "xtlv delta: ambient group descriptive")
 
 print("RESULT test_wlcnt checks=%d failures=%d" % (checks, failures))
 sys.exit(1 if failures else 0)

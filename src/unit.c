@@ -1516,7 +1516,11 @@ static int Do_RingDump(struct IOSana2Req *io)
    answer as the firmware sent it, into ios2_Data; ios2_DataLength is the
    room given and comes back as the bytes written.  On demand only: one
    bounded control transaction, nothing decoded here.  A firmware refusal or
-   a lost reply is still a dump, with wd_Error saying which. */
+   a lost reply is still a dump, with wd_Error saying which.
+   HandleRequest runs it under wu_Lock, held for up to the 2.5 s GET
+   deadline, so every other command on the unit waits: take it before and
+   after a leg, never during one.  Its only caller is the private-command
+   case in HandleRequest; nothing in the driver issues it by itself. */
 static int Do_WlCnt(struct IOSana2Req *io)
 {
     struct WiFiUnit *unit = (struct WiFiUnit *)io->ios2_Req.io_Unit;
