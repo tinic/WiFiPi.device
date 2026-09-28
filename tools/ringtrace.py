@@ -3,12 +3,14 @@
 what the driver did inside a silence.
 
   ringtrace.py decode DUMP                       one line per record
+  ringtrace.py pcapmarks PCAP > MARKS            the alignment pings in a peer capture
   ringtrace.py align  DUMP MARKS                 clock model from paired pings
   ringtrace.py window DUMP MARKS START END       records and verdicts for a gap
 
-MARKS is the peer capture's alignment pings, one per line, as
-  tshark -r peer.pcap -Y 'icmp && ip.len==1139' \\
-         -T fields -e frame.time_epoch -e icmp.type -e icmp.ident -e icmp.seq
+MARKS is the peer capture's alignment pings (ICMP echo, IP length 1139,
+ping -s 1111), one per line: epoch type id seq.  pcapmarks writes it from a
+classic Ethernet pcap; tshark -Y 'icmp && ip.len==1139' -T fields -e
+frame.time_epoch -e icmp.type -e icmp.ident -e icmp.seq gives the same.
 START and END are peer epoch seconds.  Output is key=value, one fact a line.
 
 Record fields (r_A, r_B, r_C, r_D) per kind:
@@ -82,6 +84,31 @@ def pcap_marks(path):
         ident, sq = int(f[2].split(",")[0], 0), int(f[3].split(",")[0], 0)
         m.setdefault((ident, sq), {})[typ] = ep
     return m
+
+
+def cmd_pcapmarks(path):
+    b = open(path, "rb").read()
+    magic = b[:4]
+    if magic in (b"\xd4\xc3\xb2\xa1", b"\x4d\x3c\xb2\xa1"):
+        e = "<"
+    elif magic in (b"\xa1\xb2\xc3\xd4", b"\xa1\xb2\x3c\x4d"):
+        e = ">"
+    else:
+        sys.exit("ringtrace=fail reason=not_a_pcap")
+    frac = 1e9 if magic in (b"\x4d\x3c\xb2\xa1", b"\xa1\xb2\x3c\x4d") else 1e6
+    if struct.unpack(e + "I", b[20:24])[0] != 1:
+        sys.exit("ringtrace=fail reason=not_ethernet")
+    o = 24
+    while o + 16 <= len(b):
+        sec, sub, incl, _ = struct.unpack(e + "IIII", b[o:o + 16])
+        f = b[o + 16:o + 16 + incl]
+        o += 16 + incl
+        if len(f) < 42 or f[12:14] != b"\x08\x00" or f[14] != 0x45 or f[23] != 1:
+            continue
+        if struct.unpack(">H", f[16:18])[0] != 1139 or f[34] not in (0, 8):
+            continue
+        ident, sq = struct.unpack(">HH", f[38:42])
+        print("%d.%06d\t%d\t%d\t%d" % (sec, int(sub * 1e6 / frac), f[34], ident, sq))
 
 
 def pings(recs, pm):
@@ -191,6 +218,8 @@ def main():
             h["cap"], h["seq"], h["first"], h["count"], h["lost"], h["clo"], h["t_dump"]))
         for r in recs:
             print(fmt(r))
+    elif len(sys.argv) == 3 and sys.argv[1] == "pcapmarks":
+        cmd_pcapmarks(sys.argv[2])
     elif len(sys.argv) == 4 and sys.argv[1] == "align":
         cmd_align(sys.argv[2], sys.argv[3])
     elif len(sys.argv) == 6 and sys.argv[1] == "window":
