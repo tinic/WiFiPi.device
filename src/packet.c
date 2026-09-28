@@ -18,6 +18,7 @@
 #include "sdio.h"
 #include "brcm.h"
 #include "wifipi.h"
+#include "ackprio.h"
 #include "packet.h"
 #include "brcm_wifi.h"
 #include <aminetxduo/anxs2ext.h>
@@ -2269,6 +2270,9 @@ int SendGlomDataPacket(struct SDIO *sdio, struct IOSana2Req **ioList, UBYTE coun
         UBYTE *ptr = (UBYTE *)hdr + sizeof(struct PacketHeaderSW);
 
         /* BDC Header */
+#ifdef WIFIPI_ACKPRIO
+        UBYTE *bdc = ptr;
+#endif
         *ptr++ = 0x20;
         *ptr++ = 0;
         *ptr++ = 0;
@@ -2291,6 +2295,11 @@ int SendGlomDataPacket(struct SDIO *sdio, struct IOSana2Req **ioList, UBYTE coun
         {
             // Copy packet contents
             opener->o_TXFunc(ptr, io->ios2_Data, io->ios2_DataLength);
+#ifdef WIFIPI_ACKPRIO
+            if ((io->ios2_Req.io_Flags & SANA2IOF_RAW) == 0 &&
+                (io->ios2_PacketType == 0x0800 || io->ios2_PacketType == 0x86dd))
+                bdc[1] = ackprio_of(ptr, io->ios2_DataLength);
+#endif
 #ifdef WIFIPI_RINGTRACE
             if ((io->ios2_Req.io_Flags & SANA2IOF_RAW) == 0 && io->ios2_PacketType == 0x0800 &&
                 io->ios2_DataLength >= 28 && RtMarkPing(ptr, &rtIdSeq))
@@ -2411,6 +2420,9 @@ int SendDataPacket(struct SDIO *sdio, struct IOSana2Req *io)
     UBYTE *ptr = (UBYTE *)p + p->c_DataOffset;
 
     // BDC Header
+#ifdef WIFIPI_ACKPRIO
+    UBYTE *bdc = ptr;
+#endif
     *ptr++ = 0x20;
     *ptr++ = 0;
     *ptr++ = 0;
@@ -2433,6 +2445,11 @@ int SendDataPacket(struct SDIO *sdio, struct IOSana2Req *io)
     {
         // Copy packet contents
         opener->o_TXFunc(ptr, io->ios2_Data, io->ios2_DataLength);
+#ifdef WIFIPI_ACKPRIO
+        if ((io->ios2_Req.io_Flags & SANA2IOF_RAW) == 0 &&
+            (io->ios2_PacketType == 0x0800 || io->ios2_PacketType == 0x86dd))
+            bdc[1] = ackprio_of(ptr, io->ios2_DataLength);
+#endif
     }
     else
     {
