@@ -26,7 +26,7 @@
 #define BTC_NAME_MAX        20
 
 enum { BTC_OP_GET = 1, BTC_OP_SET = 2 };
-enum { BTC_NAME_MODE = 1, BTC_NAME_FLAGS = 2, BTC_NAME_DOS_STATUS = 3 };
+enum { BTC_NAME_MODE = 1, BTC_NAME_FLAGS = 2, BTC_NAME_DOS_STATUS = 3, BTC_NAME_ANTDT = 4, BTC_NAME_EXTGPIO = 5 };
 
 struct BtcReq {
     ULONG   br_Op;                  /* BTC_OP_GET / BTC_OP_SET */
@@ -39,8 +39,8 @@ _Static_assert(sizeof(struct BtcReq) == 32, "struct BtcReq is 32 bytes");
 
 static inline const char *btc_name(ULONG id)
 {
-    static const char *const names[4] = { 0, "btc_mode", "btc_flags", "btc_dos_status" };
-    return id >= 1 && id <= 3 ? names[id] : 0;
+    static const char *const names[6] = { 0, "btc_mode", "btc_flags", "btc_dos_status", "ant_dt", "ext_gpio" };
+    return id >= 1 && id <= 5 ? names[id] : 0;
 }
 
 /* The name's id if the op is allowed on it, else 0 */
@@ -50,7 +50,7 @@ static inline ULONG btc_check(ULONG op, const char *name)
 
     if (op != BTC_OP_GET && op != BTC_OP_SET)
         return 0;
-    for (id = 1; id <= 3; id++)
+    for (id = 1; id <= 5; id++)
     {
         const char *n = btc_name(id);
         for (i = 0; i < BTC_NAME_MAX && name[i] == n[i] && n[i]; i++)

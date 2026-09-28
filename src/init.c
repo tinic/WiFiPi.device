@@ -957,10 +957,14 @@ struct WiFiBase * WiFi_Init(REGARG(struct WiFiBase *base, "d0"), REGARG(BPTR seg
         set_extgpio_state(1, 0, WiFiBase);
         set_extgpio_state(1, 1, WiFiBase);
        
+        WiFiBase->w_AntDT = 0;
         APTR ant2_key = DT_OpenKey((CONST_STRPTR)"/soc/firmware/gpio/ant2");
         if (ant2_key)
         {
             const ULONG * ext_gpio = DT_GetPropValue(DT_FindProperty(ant2_key, (CONST_STRPTR)"gpios"));
+            WiFiBase->w_AntDT |= (1 << 1) | ((*ext_gpio & 0xff) << (16 + 8 * 1));
+            if (DT_FindProperty(ant2_key, (CONST_STRPTR)"output-high"))
+                WiFiBase->w_AntDT |= 1 << (8 + 1);
             if (DT_FindProperty(ant2_key, (CONST_STRPTR)"output-high"))
             {
                 D(bug("[WiFI] Setting ext GPIO %ld to 1\n", *ext_gpio));
@@ -977,6 +981,9 @@ struct WiFiBase * WiFi_Init(REGARG(struct WiFiBase *base, "d0"), REGARG(BPTR seg
         if (ant1_key)
         {
             const ULONG * ext_gpio = DT_GetPropValue(DT_FindProperty(ant1_key, (CONST_STRPTR)"gpios"));
+            WiFiBase->w_AntDT |= (1 << 0) | ((*ext_gpio & 0xff) << (16 + 8 * 0));
+            if (DT_FindProperty(ant1_key, (CONST_STRPTR)"output-high"))
+                WiFiBase->w_AntDT |= 1 << (8 + 0);
             if (DT_FindProperty(ant1_key, (CONST_STRPTR)"output-high"))
             {
                 D(bug("[WiFI] Setting ext GPIO %ld to 1\n", *ext_gpio));

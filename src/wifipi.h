@@ -74,6 +74,7 @@ struct WiFiBase
     APTR                w_MemPool;
     ULONG *             w_Request;
     ULONG               w_SDIOClock;
+    ULONG               w_AntDT;    /* #89 debug: ant1/ant2 DT result, see init.c (byte0 found, byte1 set, byte2 ant1 gpio, byte3 ant2 gpio) */
     ULONG               w_SDIOIRQ;          // the SDIO host's GIC interrupt number, 0 = none in the tree
     APTR                w_SysTimer;         // the Pi's 1 MHz system timer (CLO at +4), for the poller
     struct SDIO *       w_SDIO;

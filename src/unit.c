@@ -34,6 +34,7 @@
 #endif
 #ifdef WIFIPI_BTC
 #include "btc.h"
+#include "mbox.h"
 #endif
 
 #define D(x) x
@@ -1578,9 +1579,23 @@ static int Do_Btc(struct IOSana2Req *io)
     if (b->br_Op == BTC_OP_GET)
     {
         ULONG raw = 0;
-        rc = PacketGetVarMin(sdio, (char *)btc_name(id), &raw, 4, 4);
-        if (rc == 0)
-            v = LE32(raw);
+        if (id == BTC_NAME_ANTDT)           /* #89: what init read from the DT ant1/ant2 nodes */
+        {
+            v = unit->wu_Base->w_AntDT;
+            rc = 0;
+        }
+        else if (id == BTC_NAME_EXTGPIO)    /* #89: live expander GPIO 0..7, bit i = state of GPIO i */
+        {
+            for (ULONG g = 0; g < 8; g++)
+                v |= (get_extgpio_state(g, unit->wu_Base) & 1) << g;
+            rc = 0;
+        }
+        else
+        {
+            rc = PacketGetVarMin(sdio, (char *)btc_name(id), &raw, 4, 4);
+            if (rc == 0)
+                v = LE32(raw);
+        }
         b->br_Value = v;
     }
     else

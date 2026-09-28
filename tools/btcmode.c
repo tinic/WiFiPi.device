@@ -2,7 +2,7 @@
  * btcmode: read the firmware's BT-coexistence state, or set btc_mode
  * (AmiNetXDuo #89, hw34).  Only a driver built with -DWIFIPI_BTC answers.
  *
- *   btcmode GET NAME          NAME: btc_mode, btc_flags, btc_dos_status
+ *   btcmode GET NAME          NAME: btc_mode, btc_flags, btc_dos_status, ant_dt, ext_gpio
  *   btcmode SET btc_mode N
  *
  * One line out, key=value.  RC 0 ok, 5 the firmware refused (fwerror=),
