@@ -29,6 +29,9 @@
 #include "packet.h"
 #include "brcm.h"
 #include "brcm_wifi.h"
+#ifdef WIFIPI_WLCNT
+#include "wlcnt.h"
+#endif
 
 #define D(x) x
 #define UNIT_STACK_SIZE (32768 / sizeof(ULONG))
@@ -1508,6 +1511,41 @@ static int Do_RingDump(struct IOSana2Req *io)
 }
 #endif
 
+#ifdef WIFIPI_WLCNT
+/* Firmware counter snapshot (#89): struct WcDumpHeader, then the 'counters'
+   answer as the firmware sent it, into ios2_Data; ios2_DataLength is the
+   room given and comes back as the bytes written.  On demand only: one
+   bounded control transaction, nothing decoded here.  A firmware refusal or
+   a lost reply is still a dump, with wd_Error saying which. */
+static int Do_WlCnt(struct IOSana2Req *io)
+{
+    struct WiFiUnit *unit = (struct WiFiUnit *)io->ios2_Req.io_Unit;
+    struct WiFiBase *WiFiBase = unit->wu_Base;
+    struct WcDumpHeader *h = io->ios2_Data;
+    APTR t = WiFiBase->w_SysTimer;
+    ULONG copied = 0;
+
+    if (h == NULL || io->ios2_DataLength < sizeof(*h) + WC_GET_SIZE)
+    {
+        io->ios2_DataLength = 0;
+        io->ios2_Req.io_Error = S2ERR_BAD_ARGUMENT;
+        return 1;
+    }
+    h->wd_Magic = WC_DUMP_MAGIC;
+    h->wd_Version = WC_DUMP_VERSION;
+    h->wd_HeaderSize = sizeof(*h);
+    h->wd_Asked = WC_GET_SIZE;
+    h->wd_UnitFlags = unit->wu_Flags;
+    h->wd_CloBefore = t ? rd32(t, 4) : 0;
+    h->wd_Error = PacketGetVarCopied(WiFiBase->w_SDIO, "counters", h + 1, WC_GET_SIZE, 0, &copied);
+    h->wd_CloAfter = t ? rd32(t, 4) : 0;
+    h->wd_Copied = copied;
+    io->ios2_DataLength = sizeof(*h) + WC_GET_SIZE;
+    io->ios2_Req.io_Error = 0;
+    return 1;
+}
+#endif
+
 /* The receiver task's counters (struct SDIO s_Stat*), one record each */
 static int Do_S2_GETSPECIALSTATS(struct IOSana2Req *io)
 {
@@ -2011,6 +2049,11 @@ void HandleRequest(struct IOSana2Req *io)
 #ifdef WIFIPI_RINGTRACE
             case WIFIPI_CMD_RINGDUMP:
                 complete = Do_RingDump(io);
+                break;
+#endif
+#ifdef WIFIPI_WLCNT
+            case WIFIPI_CMD_WLCNT:
+                complete = Do_WlCnt(io);
                 break;
 #endif
 

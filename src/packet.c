@@ -3306,7 +3306,12 @@ int PacketCmdIntGet(struct SDIO *sdio, ULONG cmd, ULONG *cmdValue)
    'counters'), is copied as far as it goes and the rest zeroed -- success, as
    brcmf_proto_bcdc_query_dcmd() does.  A caller that needs an exact size
    (cur_etheraddr: 6) says so in minSize and gets PACKET_CTRL_SHORT below it. */
+#ifdef WIFIPI_WLCNT
+static int GetVarCore(struct SDIO *sdio, char *varName, void *getBuffer, int getSize, int minSize,
+                      ULONG *copiedOut)
+#else
 int PacketGetVarMin(struct SDIO *sdio, char *varName, void *getBuffer, int getSize, int minSize)
+#endif
 {
     /* read once: another task's S2_CONFIGINTERFACE may switch glomming on
        while this frame is being built, and every field must agree (#96) */
@@ -3384,6 +3389,10 @@ int PacketGetVarMin(struct SDIO *sdio, char *varName, void *getBuffer, int getSi
     ULONG copied;
 
     error_code = CtrlTransact(sdio, mpkt, port, &timer, &copied);
+#ifdef WIFIPI_WLCNT
+    if (copiedOut != NULL)
+        *copiedOut = copied;
+#endif
     /* No stale bytes behind a shorter answer: the rest is zeroed */
     if (error_code == 0 && copied < (ULONG)getSize)
     {
@@ -3398,6 +3407,19 @@ int PacketGetVarMin(struct SDIO *sdio, char *varName, void *getBuffer, int getSi
 
     return error_code;
 }
+
+#ifdef WIFIPI_WLCNT
+int PacketGetVarMin(struct SDIO *sdio, char *varName, void *getBuffer, int getSize, int minSize)
+{
+    return GetVarCore(sdio, varName, getBuffer, getSize, minSize, NULL);
+}
+
+int PacketGetVarCopied(struct SDIO *sdio, char *varName, void *getBuffer, int getSize, int minSize,
+                       ULONG *copiedOut)
+{
+    return GetVarCore(sdio, varName, getBuffer, getSize, minSize, copiedOut);
+}
+#endif
 
 int PacketGetVar(struct SDIO *sdio, char *varName, void *getBuffer, int getSize)
 {

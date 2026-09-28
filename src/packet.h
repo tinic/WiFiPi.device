@@ -165,6 +165,11 @@ void PacketSetVarIntAsync(struct SDIO *sdio, char *varName, ULONG varValue);
 void PacketCmdIntAsync(struct SDIO *sdio, ULONG cmd, ULONG cmdValue);
 int PacketGetVar(struct SDIO *sdio, char *varName, void *getBuffer, int getSize);
 int PacketGetVarMin(struct SDIO *sdio, char *varName, void *getBuffer, int getSize, int minSize);
+#ifdef WIFIPI_WLCNT
+/* PacketGetVarMin, and the bytes of the answer that arrived (#89 debug) */
+int PacketGetVarCopied(struct SDIO *sdio, char *varName, void *getBuffer, int getSize, int minSize,
+                       ULONG *copiedOut);
+#endif
 
 /* A synchronous control request that could not be completed: no reply
    within PACKET_CTRL_TIMEOUT_MS, or no timer/port/memory to wait with.
