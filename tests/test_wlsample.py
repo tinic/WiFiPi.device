@@ -280,74 +280,123 @@ rf = subprocess.run([sys.executable, TOOL, "samples", os.path.join(FX, "ring.bin
 expect(rf.returncode == 0 and rf.stdout == open(os.path.join(FX, "expected.txt")).read(),
        "ten-field fixture: byte-identical to the 792bc57 decoder's output")
 
-# --- a 22-field dump: obss, rxstrt_other (approx, clamped), baseline medians --
-recs, marks = [], []
-state = {"n": 0, "id": 500, "c": {f: 0 for f in wlsample.WIDE_FIELDS}}
+# --- 22-field dumps: the RTS readout, chip_init_tx ---------------------------
+def wide_leg(name, plan, gaps_of):
+    """plan: list of (spacing_us, rises) -- one sample each, REQ spacing before it;
+    gaps_of(times) -> [(lo, hi)] in peer seconds.  Returns the decoder's lines."""
+    global recs, marks
+    recs, marks = [], []
+    st = {"n": 0, "id": 500, "c": {f: 1000 for f in wlsample.WIDE_FIELDS}}
+    for s_ in range(5):
+        ping(1_000_000 + s_ * 100_000, s_)
+    t, times = 2_000_000, []
+    for sp, rise in plan:
+        t += sp
+        st["n"] += 1
+        st["id"] += 1
+        i = st["id"]
+        put(t, 20, 0, i, st["n"], REQ_BYTES)
+        for f, v in rise.items():
+            st["c"][f] += v
+        put(t + 2000, 21, 0 | (10 << 2), i, 2000, (REP_BYTES << 16) | 848)
+        for k, f in enumerate(wlsample.WIDE_FIELDS):
+            put(t + 2000, 22, k, i, st["c"][f], 0)
+        times.append(t)
+    for s_ in range(5, 10):
+        ping(t + 1_000_000 + (s_ - 5) * 100_000, s_)
+    recs.sort(key=lambda r: r[0])
+    dw = os.path.join(tmp, name + ".bin")
+    with open(dw, "wb") as f:
+        f.write(struct.pack(">IHHIIIIII", 0x52544431, 1, 16, 1 << 22, len(recs), 0, len(recs), 0, recs[-1][0])
+                + b"".join(struct.pack(">IBBHII", *r) for r in recs))
+    mw = os.path.join(tmp, name + ".marks")
+    with open(mw, "w") as f:
+        for ep, typ, s_ in marks:
+            f.write("%.6f %d 0x4242 %d\n" % (ep, typ, s_))
+    args = []
+    for lo, hi in gaps_of(times):
+        args += ["--gap", "%.6f" % lo, "%.6f" % hi]
+    rr = subprocess.run([sys.executable, TOOL, "samples", dw, mw] + args, capture_output=True, text=True)
+    expect(rr.returncode == 0, "%s decodes: %s" % (name, rr.stderr))
+    return rr.stdout.splitlines()
 
 
-def wsample(t, rise):
-    state["n"] += 1
-    state["id"] += 1
-    i = state["id"]
-    put(t, 20, 0, i, state["n"], REQ_BYTES)
-    for f, v in rise.items():
-        state["c"][f] += v
-    put(t + 2000, 21, 0 | (10 << 2), i, 2000, (REP_BYTES << 16) | 848)
-    for k, f in enumerate(wlsample.WIDE_FIELDS):
-        put(t + 2000, 22, k, i, state["c"][f], 0)
+def rts_line(out, g):
+    x = [kv(l) for l in out if l.startswith("gap=%d rts " % g)]
+    return x[0] if x else None
 
 
-for s_ in range(5):
-    ping(1_000_000 + s_ * 100_000, s_)
-t = 2_000_000
-# baseline windows: obss 3,5,7,9,0; rxstrt_other 40,50,60,70 and one clamped (mbss subsets 20 each)
-base_rises = [(1, 2, 60, 10, 5, 3, 2), (2, 3, 70, 10, 5, 3, 2), (3, 4, 80, 10, 5, 3, 2), (4, 5, 90, 10, 5, 3, 2),
-              (0, 0, 10, 10, 5, 3, 2)]
-wsample(t, {}); t += 50_000
-for ob_d, ob_b, strt, dmb, mmb, bmb, ack in base_rises:
-    wsample(t, {"rxdfrmucastobss": ob_d, "rxbeaconobss": ob_b, "rxstrt": strt, "rxdfrmucastmbss": dmb,
-                "rxmfrmucastmbss": mmb, "rxbeaconmbss": bmb, "rxackucast": ack})
-    t += 50_000
-WG_LO = peer(t) - 0.001
-wsample(t, {}); t += 50_000                 # the gap: one window with others, one clamped
-wsample(t, {"rxdfrmucastobss": 6, "rxbeaconobss": 1, "rxstrt": 100, "rxdfrmucastmbss": 40,
-            "rxmfrmucastmbss": 5, "rxbeaconmbss": 0, "rxackucast": 20})
-t += 50_000
-wsample(t, {"rxstrt": 5, "rxdfrmucastmbss": 9})
-WG_HI = peer(t) + 0.010
-t += 1_000_000
-for s_ in range(5, 10):
-    ping(t + (s_ - 5) * 100_000, s_)
-recs.sort(key=lambda r: r[0])
-dw = os.path.join(tmp, "wide.bin")
-with open(dw, "wb") as f:
-    f.write(struct.pack(">IHHIIIIII", 0x52544431, 1, 16, 1 << 22, len(recs), 0, len(recs), 0, recs[-1][0])
-            + b"".join(struct.pack(">IBBHII", *r) for r in recs))
-mw = os.path.join(tmp, "wmarks.txt")
-with open(mw, "w") as f:
-    for ep, typ, s_ in marks:
-        f.write("%.6f %d 0x4242 %d\n" % (ep, typ, s_))
-rw = subprocess.run([sys.executable, TOOL, "samples", dw, mw, "--gap", "%.6f" % WG_LO, "%.6f" % WG_HI],
-                    capture_output=True, text=True)
-wo = rw.stdout.splitlines()
-expect(rw.returncode == 0, "wide dump decodes: %s" % rw.stderr)
-we = [kv(x) for x in wo if " eligible " in x]
-expect(len(we) == 2, "wide gap: two eligible windows")
-expect(we[0]["obss"] == "7" and we[0]["rxstrt_other"] == "35" and we[0]["rxstrt_other_clamped"] == "0"
-       and we[0]["rxstrt_other_approx"] == "1", "obss = 6+1, rxstrt_other = 100-(40+5+0+20) = 35: %s" % we[0])
-expect(we[1]["rxstrt_other"] == "0" and we[1]["rxstrt_other_clamped"] == "1" and we[1]["obss"] == "0",
-       "5-9 < 0: clamped at 0 and flagged")
-expect(all(("delta." + f) in we[0] for f in wlsample.WIDE_FIELDS), "all 22 deltas per window")
-gw = kv([x for x in wo if x.startswith("gap=0 wide")][0])
-expect(gw["eligible"] == "2" and gw["rxstrt_other_clamped_count"] == "1", "per gap: clamps counted")
-bm = kv([x for x in wo if x.startswith("baseline_median")][0])
-# baseline windows: first..fifth rise (the gap's opening window straddles and is out)
-expect(bm["windows"] == "5", "baseline windows: %s" % bm)
-expect(bm["obss_median"] == "5.000" and bm["rxstrt_other_median"] == "50.000"
-       and bm["rxstrt_other_clamped_count"] == "1",
-       "medians of obss (3,5,7,9,0) and rxstrt_other (60,70,80,90,10 less 20 each; -10 clamped): %s" % bm)
-expect(all(x.endswith(LABEL_S) for x in wo if x.startswith(("gap=", "baseline"))), "wide readings labelled")
-expect(not any("obss" in x for x in rf.stdout.splitlines()), "ten-field output carries no wide keys")
+RTS_ON = {"txrts": 4, "txnocts": 1, "rxrsptmout": 2, "txallfrm": 30, "txackfrm": 10, "rxbeaconobss": 1}
+QUIET = {"txallfrm": 5, "txackfrm": 5}
+# 10 control windows of 50 ms (8 with RTS), gap A (3 windows with RTS), 5 more control, gap B (no RTS,
+# one window where txackfrm outruns txallfrm), 5 control
+plan = [(50_000, RTS_ON if k < 8 else QUIET) for k in range(11)]
+plan += [(50_000, {"txrts": 2, "txnocts": 1, "rxrsptmout": 1, "txallfrm": 40, "txackfrm": 12,
+                   "rxbeaconobss": 3}) for _ in range(3)]
+plan += [(50_000, RTS_ON) for _ in range(5)]
+plan += [(50_000, {"txallfrm": 3, "txackfrm": 3}), (50_000, {"txallfrm": 2, "txackfrm": 6})]
+plan += [(50_000, RTS_ON) for _ in range(5)]
+
+
+def gaps_ab(times):
+    return [(peer(times[10]) - 0.001, peer(times[13]) + 0.010),     # windows 10-11, 11-12, 12-13
+            (peer(times[18]) - 0.001, peer(times[20]) + 0.010)]     # windows 18-19, 19-20
+
+
+out_w = wide_leg("wideA", plan, gaps_ab)
+A, B = rts_line(out_w, 0), rts_line(out_w, 1)
+expect(A is not None and A["eligible"] == "3", "gap A: rts line over its 3 eligible windows")
+secsA = float(A["in_hold_ms"]) / 1e3
+expect(A["txrts"] == "6" and A["txnocts"] == "3" and A["rxrsptmout"] == "3", "gap A sums: %s" % A)
+expect(A["txrts_per_s"] == "%.3f" % (6 / secsA) and A["rxrsptmout_per_s"] == "%.3f" % (3 / secsA),
+       "gap A: per-second rates over the eligible windows' own lengths")
+expect(A["unanswered_fraction"] == "0.500", "unanswered = txnocts/txrts = 3/6")
+expect(A["rxrsptmout_note"] == "supporting_not_ap_attribution" and A["rxbeaconobss"] == "9"
+       and A["rxbeaconobss_note"] == "chip_hears_channel", "notes and rxbeaconobss reported only")
+# control: every out-of-hold window of matching length: 10 + 4 + 4 (edges straddle), 8+4+4 with RTS
+expect(A["rts_sensitivity"] == "ok" and float(A["control_txrts_positive_fraction"]) >= 0.5,
+       "control mostly with RTS: sensitivity ok (%s)" % A["control_txrts_positive_fraction"])
+expect(A["reading"] == "chip_attempted_channel_access_rules_out_complete_tx_silence_only"
+       and "txrts0_note" not in A, "txrts > 0: attempted channel access")
+expect(A["chip_init_tx"] == "84" and A["chip_init_tx_clamped"] == "0" and A["chip_init_tx_approx"] == "1"
+       and A["chip_init_tx_reading"] == "chip_mac_transmitted_non_ack_frames_in_hold_approx_may_include_cts_ba_responses",
+       "chip_init_tx = 3 x (40 - 12)")
+expect(A["control_chip_init_tx_per_s_median"] != "none", "chip_init_tx control median")
+expect(B is not None and B["txrts"] == "0" and B["unanswered_fraction"] == "n/a", "gap B: no RTS, unanswered n/a")
+expect(B["reading"] == "no_rts_cannot_distinguish_internal_hold_from_cca_backoff"
+       and B["txrts0_note"] == "cannot_separate_internal_hold_from_cca_deferral_deferral_precedes_rts",
+       "txrts = 0: reading and the deferral note")
+expect(B["chip_init_tx"] == "0" and B["chip_init_tx_clamped"] == "1" and B["chip_init_tx_reading"] == "none",
+       "2 - 6 < 0: clamped at 0 and counted")
+ew = [kv(x) for x in out_w if x.startswith("gap=1 eligible")]
+expect([e["chip_init_tx"] for e in ew] == ["0", "0"] and [e["chip_init_tx_clamped"] for e in ew] == ["0", "1"],
+       "per window chip_init_tx and clamp flag")
+bl = [kv(x) for x in out_w if x.startswith("baseline ")]
+expect(bl and all("chip_init_tx" in b and "obss" not in b and "rxstrt_other" not in b for b in bl),
+       "baseline windows carry chip_init_tx; no obss, no rxstrt_other anywhere")
+expect(not any("rxstrt_other" in x or " obss=" in x or "baseline_median" in x for x in out_w),
+       "the OBSS contention reading is gone")
+expect(all(x.endswith(LABEL_S) for x in out_w if x.startswith(("gap=", "baseline"))), "wide readings labelled")
+
+# sensitivity low: under half the control windows carry RTS
+plan_low = [(50_000, RTS_ON if k < 4 else QUIET) for k in range(11)] + \
+    [(50_000, {"txrts": 2, "txallfrm": 9, "txackfrm": 1}) for _ in range(3)] + [(50_000, QUIET) for _ in range(6)]
+out_l = wide_leg("wideLow", plan_low, lambda t: [(peer(t[10]) - 0.001, peer(t[13]) + 0.010)])
+L = rts_line(out_l, 0)
+expect(L["rts_sensitivity"] == "low" and L["reading"] == "none" and float(L["control_txrts_positive_fraction"]) < 0.5,
+       "under half the control with RTS: rts_sensitivity=low, no reading: %s" % L)
+expect(L["txrts"] == "6" and L["unanswered_fraction"] == "0.000", "the numbers are still printed")
+
+# no control of matching length: in-hold windows 150 ms, every other window 50 ms
+plan_nc = [(50_000, RTS_ON) for _ in range(11)] + [(150_000, RTS_ON) for _ in range(3)] + \
+    [(50_000, RTS_ON) for _ in range(6)]
+out_n = wide_leg("wideNC", plan_nc, lambda t: [(peer(t[11]) - 0.001, peer(t[13]) + 0.010)])
+N = rts_line(out_n, 0)
+expect(N["control_windows"] == "0" and N["rts_sensitivity"] == "no_control" and N["reading"] == "none",
+       "no duration-matched control: no reading: %s" % N)
+
+expect(not any(" rts " in x or "chip_init_tx" in x for x in rf.stdout.splitlines()),
+       "ten-field output carries no wide keys")
 
 # --- ring capacity: a 180 s leg at hw33's rate with 20 samples/s ------------
 rh = open(os.path.join(HERE, "..", "src", "ringtrace.h")).read()

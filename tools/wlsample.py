@@ -31,13 +31,26 @@ falsifier: there are no verdicts and nothing is counted across gaps.
                     sampler's own SDIO traffic -- request frame bytes (REQ d)
                     plus reply frame bytes (REP, LATE d>>16) -- over the span
                     from the first REQ to the last sample record
-  gap ... wide      22-field dumps: eligible windows, and how many clamped
-  baseline_median   22-field dumps: medians over the out-of-hold windows of
-                    obss = rxdfrmucastobss + rxbeaconobss and rxstrt_other =
-                    rxstrt - (rxdfrmucastmbss + rxmfrmucastmbss + rxbeaconmbss
-                    + rxackucast), the latter approx (the subsets are not
-                    proven disjoint) and clamped at 0; eligible and baseline
-                    lines carry both per window
+  gap ... rts       22-field dumps, per gap, over its eligible windows only:
+                    txrts, txnocts, rxrsptmout summed and per second;
+                    unanswered = txnocts / txrts only when txrts rose, else
+                    n/a; rxrsptmout is supporting, not AP attribution;
+                    rxbeaconobss reported only (the chip hears the channel).
+                    Control: the out-of-hold windows of this leg whose
+                    length lies within [0.8 x shortest, 1.2 x longest] of
+                    the gap's eligible windows -- their median rates and the
+                    fraction with txrts > 0.  Under half of them with
+                    txrts > 0 (or none at all): rts_sensitivity=low (or
+                    no_control) and no reading.  Otherwise txrts > 0 in the
+                    gap reads "chip attempted channel access" (rules out
+                    complete TX silence only, not every internal stall),
+                    txrts = 0 reads "no RTS: cannot tell an internal hold
+                    from CCA/backoff" (and says: CCA deferral precedes RTS).
+                    chip_init_tx = txallfrm - txackfrm, per window and per
+                    gap against the control median, approx (txallfrm also
+                    counts CTS and block-ack responses to received frames)
+                    and clamped at 0 with clamps counted; > 0 in the gap
+                    reads "chip MAC transmitted non-ACK frames".
   summary ...       samples_total, skips by reason, lost, late, eligible per gap
 
 Every time here is a recorded CLO: eligibility and coverage use each
@@ -179,22 +192,71 @@ def deltas(iv):
     return " ".join("delta.%s=%d" % (f, iv["d"][f]) for f in iv["f"])
 
 
-def derived(iv):
-    """wide windows: obss, and rxstrt_other = rxstrt - (the four MBSS subsets),
-    approx (WHD does not prove the subsets disjoint), clamped at 0.
-    (obss, rxstrt_other, clamped) or None for a ten-field window."""
+def chip_init_tx(iv):
+    """txallfrm - txackfrm, clamped at 0: (value, clamped), or None for ten
+    fields.  Approx: txallfrm also counts CTS and block-ack responses to
+    received frames, which are not host-queue TX."""
     d = iv["d"]
-    if "rxstrt" not in d:
+    if "txallfrm" not in d:
         return None
-    other = d["rxstrt"] - (d["rxdfrmucastmbss"] + d["rxmfrmucastmbss"] + d["rxbeaconmbss"] + d["rxackucast"])
-    return d["rxdfrmucastobss"] + d["rxbeaconobss"], max(other, 0), other < 0
+    v = d["txallfrm"] - d["txackfrm"]
+    return max(v, 0), v < 0
 
 
-def derived_str(iv):
-    x = derived(iv)
-    if x is None:
-        return ""
-    return " obss=%d rxstrt_other=%d rxstrt_other_approx=1 rxstrt_other_clamped=%d" % (x[0], x[1], x[2])
+def wide_str(iv):
+    x = chip_init_tx(iv)
+    return "" if x is None else " chip_init_tx=%d chip_init_tx_approx=1 chip_init_tx_clamped=%d" % x
+
+
+RTS_MATCH = (0.8, 1.2)           # control window length vs the gap's eligible windows
+RTS_SENSITIVE = 0.5              # control windows with txrts > 0, at least
+
+
+def rts_readout(g, inside, base):
+    """the gap=N rts line, or None for a ten-field dump"""
+    if not inside or "txrts" not in inside[0]["d"]:
+        return None
+    total = lambda f: sum(iv["d"][f] for iv in inside)          # noqa: E731
+    secs = sum(iv["hi"] - iv["lo"] for iv in inside)
+    rts, nocts, rsp = total("txrts"), total("txnocts"), total("rxrsptmout")
+    lens = [iv["hi"] - iv["lo"] for iv in inside]
+    lo, hi = min(lens) * RTS_MATCH[0], max(lens) * RTS_MATCH[1]
+    ctl = [iv for iv in base if "txrts" in iv["d"] and lo <= iv["hi"] - iv["lo"] <= hi and iv["hi"] > iv["lo"]]
+    rate = lambda iv, f: iv["d"][f] / (iv["hi"] - iv["lo"])      # noqa: E731
+
+    def med(f):
+        v = median([rate(iv, f) for iv in ctl])
+        return "none" if v is None else "%.3f" % v
+    pos = sum(1 for iv in ctl if iv["d"]["txrts"] > 0)
+    frac = pos / len(ctl) if ctl else None
+    cit = [chip_init_tx(iv) for iv in inside]
+    cit_sum = sum(x[0] for x in cit)
+    cit_ctl = median([chip_init_tx(iv)[0] / (iv["hi"] - iv["lo"]) for iv in ctl])
+    if not ctl:
+        sens, reading = "no_control", "none"
+    elif frac < RTS_SENSITIVE:
+        sens, reading = "low", "none"
+    else:
+        sens = "ok"
+        reading = ("chip_attempted_channel_access_rules_out_complete_tx_silence_only" if rts > 0
+                   else "no_rts_cannot_distinguish_internal_hold_from_cca_backoff")
+    return ("gap=%d rts eligible=%d in_hold_ms=%.3f txrts=%d txnocts=%d rxrsptmout=%d txrts_per_s=%.3f "
+            "txnocts_per_s=%.3f rxrsptmout_per_s=%.3f unanswered_fraction=%s "
+            "rxrsptmout_note=supporting_not_ap_attribution rxbeaconobss=%d rxbeaconobss_note=chip_hears_channel "
+            "control_windows=%d control_len_ms=%.3f..%.3f control_txrts_per_s_median=%s "
+            "control_txnocts_per_s_median=%s control_rxrsptmout_per_s_median=%s "
+            "control_txrts_positive_fraction=%s rts_sensitivity=%s reading=%s%s "
+            "chip_init_tx=%d chip_init_tx_per_s=%.3f chip_init_tx_approx=1 chip_init_tx_clamped=%d "
+            "control_chip_init_tx_per_s_median=%s control_chip_init_tx_clamped=%d chip_init_tx_reading=%s %s" % (
+                g, len(inside), secs * 1e3, rts, nocts, rsp, rts / secs, nocts / secs, rsp / secs,
+                "%.3f" % (nocts / rts) if rts > 0 else "n/a", total("rxbeaconobss"),
+                len(ctl), lo * 1e3, hi * 1e3, med("txrts"), med("txnocts"), med("rxrsptmout"),
+                "none" if frac is None else "%.3f" % frac, sens, reading,
+                " txrts0_note=cannot_separate_internal_hold_from_cca_deferral_deferral_precedes_rts" if rts == 0 else "",
+                cit_sum, cit_sum / secs, sum(1 for x in cit if x[1]),
+                "none" if cit_ctl is None else "%.3f" % cit_ctl, sum(1 for iv in ctl if chip_init_tx(iv)[1]),
+                "chip_mac_transmitted_non_ack_frames_in_hold_approx_may_include_cts_ba_responses" if cit_sum > 0
+                else "none", LABEL))
 
 
 def median(v):
@@ -235,6 +297,7 @@ def cmd_samples(dump, marks, gaps_path=None, extra=()):
             "%.6f" % peer(s["rep"]) if s["rep"] is not None else "none",
             status_of(s), "unknown" if lat is None else lat))
     ivs, overlap, invalid = intervals(samples, peer)
+    base = [iv for iv in ivs if all(iv["hi"] < lo or iv["lo"] > hi for lo, hi, _ in gaps)]
     eligible = []
     for g, (lo, hi, d) in enumerate(gaps):
         inside = [iv for iv in ivs if lo <= iv["lo"] and iv["hi"] <= hi]
@@ -248,36 +311,22 @@ def cmd_samples(dump, marks, gaps_path=None, extra=()):
             out.append("gap=%d eligible from_id=%d to_id=%d window_start=%.6f window_end=%.6f window_ms=%.3f "
                        "%s %s wrapped=%s %s" % (
                            g, iv["a"]["id"], iv["b"]["id"], iv["lo"], iv["hi"], (iv["hi"] - iv["lo"]) * 1e3,
-                           deltas(iv) + derived_str(iv), beacons(iv), ",".join(iv["wrap"]) or "none", LABEL))
-        wide = [derived(iv) for iv in inside if derived(iv) is not None]
-        if wide:
-            out.append("gap=%d wide eligible=%d rxstrt_other_clamped_count=%d %s" % (
-                g, len(wide), sum(1 for x in wide if x[2]), LABEL))
+                           deltas(iv) + wide_str(iv), beacons(iv), ",".join(iv["wrap"]) or "none", LABEL))
+        rl = rts_readout(g, inside, base)
+        if rl:
+            out.append(rl)
         for s in samples:
             if lo <= peer(s["req"]) <= hi:
                 lat = s["lat"] if s["rep"] is not None else (
                     s["late"][0][2] if s["late"] and s["late"][0][1] else None)
                 out.append("gap=%d latency id=%d req_peer=%.6f status=%s latency_us=%s %s" % (
                     g, s["id"], peer(s["req"]), status_of(s), "unknown" if lat is None else lat, LABEL))
-    base = []
-    for iv in ivs:
-        if all(iv["hi"] < lo or iv["lo"] > hi for lo, hi, _ in gaps):
-            base.append(iv)
-            w = iv["hi"] - iv["lo"]
-            out.append("baseline from_id=%d to_id=%d window_start=%.6f window_end=%.6f window_ms=%.3f %s %s %s %s" % (
-                iv["a"]["id"], iv["b"]["id"], iv["lo"], iv["hi"], w * 1e3, deltas(iv) + derived_str(iv),
-                " ".join("rate_per_s.%s=%.3f" % (f, iv["d"][f] / w) for f in iv["f"]) if w > 0 else "rate=undefined",
-                beacons(iv), LABEL))
-    bw = [(derived(iv), iv["hi"] - iv["lo"]) for iv in base if derived(iv) is not None]
-    if bw:
-        def fmt(v):
-            return "none" if v is None else "%.3f" % v
-        out.append("baseline_median windows=%d obss_median=%s rxstrt_other_median=%s obss_per_s_median=%s "
-                   "rxstrt_other_per_s_median=%s rxstrt_other_approx=1 rxstrt_other_clamped_count=%d %s" % (
-                       len(bw), fmt(median([x[0] for x, _ in bw])), fmt(median([x[1] for x, _ in bw])),
-                       fmt(median([x[0] / w for x, w in bw if w > 0])),
-                       fmt(median([x[1] / w for x, w in bw if w > 0])),
-                       sum(1 for x, _ in bw if x[2]), LABEL))
+    for iv in base:
+        w = iv["hi"] - iv["lo"]
+        out.append("baseline from_id=%d to_id=%d window_start=%.6f window_end=%.6f window_ms=%.3f %s %s %s %s" % (
+            iv["a"]["id"], iv["b"]["id"], iv["lo"], iv["hi"], w * 1e3, deltas(iv) + wide_str(iv),
+            " ".join("rate_per_s.%s=%.3f" % (f, iv["d"][f] / w) for f in iv["f"]) if w > 0 else "rate=undefined",
+            beacons(iv), LABEL))
     span = (last_t - samples[0]["req"]) / 1e6 if samples and last_t is not None else 0.0
     out.append("leg samples=%d %s %s sdio_bytes=%d span_s=%.3f sdio_bytes_per_s=%s" % (
         len(samples), cadence([s["req"] for s in samples]), skip_counts(skips), sdio_bytes, span,
