@@ -3,9 +3,10 @@
  * test in tests/test_glomsplit.c builds it with cc.
  *
  * In a glom of three or more frames whose first two are pure ACKs of one TCP
- * flow, the head ACK was absent from the peer's capture (A11: 21 of 21);
- * where it is lost after CMD53 is not established.  The driver sends the
- * head on its own and batches the rest as before.
+ * flow, the head ACK was absent from the peer's capture (A11: 21 of 21); in
+ * two-frame gloms of such a pair it was not (A11 0 of 44, G2 0 of 54).  Where
+ * it is lost after CMD53 is not established.  The driver never sends such a
+ * glom: it ends the glom after the pair, so a same-flow ACK run goes in pairs.
  *
  * Pure ACK: IPv4 (not a fragment, options allowed) or IPv6 (TCP as the first
  * next header), TCP with no payload, ACK set, SYN, FIN and RST clear.  TCP
@@ -70,6 +71,14 @@ static inline int wifipi_glom_head_split(const unsigned char *const *frames,
     for (i = 0; i < n0; i++) if (k0[i] != k1[i]) return 0;
     for (i = 0; i < 4; i++) if (p0[i] != p1[i]) return 0;
     return 1;
+}
+
+/* frames the next transfer takes from a queue of count */
+static inline unsigned long wifipi_glom_take(const unsigned char *const *frames,
+                                             const unsigned long *lens,
+                                             unsigned long count)
+{
+    return wifipi_glom_head_split(frames, lens, count) ? 2 : count;
 }
 
 #endif

@@ -1859,7 +1859,7 @@ void ProcessDataPacket(struct SDIO *sdio, UBYTE *packet, ULONG packetLength)
  */
 
 /* one transfer from the head of ioList; returns the frames it took */
-static UBYTE SendGlomOnce(struct SDIO *sdio, struct IOSana2Req **ioList, UBYTE count, BOOL maySplit)
+static UBYTE SendGlomOnce(struct SDIO *sdio, struct IOSana2Req **ioList, UBYTE count)
 {
     struct WiFiBase *WiFiBase = sdio->s_WiFiBase;
     struct ExecBase *SysBase = sdio->s_SysBase;
@@ -1966,16 +1966,12 @@ static UBYTE SendGlomOnce(struct SDIO *sdio, struct IOSana2Req **ioList, UBYTE c
             if (packetLength % 16 != 0) bug("\n");
         }
 #endif
-        /* two pure ACKs of one flow at the head of 3+: the firmware drops
-           the first, so it goes alone; the rest is one glom as before (#89) */
-        if (i == 1 && maySplit && wifipi_glom_head_split(head, headLen, count))
+        /* two pure ACKs of one flow never head 3+: end the glom here, as
+           wifipi_glom_take() says (#89) */
+        if (i == 1 && wifipi_glom_head_split(head, headLen, count))
         {
-            struct GlomHeader *firstGh = (APTR)(byteBuffer + sizeof(struct PacketHeaderHW));
-
-            sdio->s_TXSeq--;
-            firstGh->gh_LastItem = 1;
-            count = 1;
-            break;
+            gh->gh_LastItem = 1;
+            count = 2;
         }
 
         // Increase total length by packet length (aligned)
@@ -2025,13 +2021,10 @@ static UBYTE SendGlomOnce(struct SDIO *sdio, struct IOSana2Req **ioList, UBYTE c
 
 int SendGlomDataPacket(struct SDIO *sdio, struct IOSana2Req **ioList, UBYTE count)
 {
-    BOOL maySplit = TRUE;
-
     while (count)
     {
-        UBYTE n = SendGlomOnce(sdio, ioList, count, maySplit);
+        UBYTE n = SendGlomOnce(sdio, ioList, count);
 
-        maySplit = FALSE;
         ioList += n;
         count -= n;
     }

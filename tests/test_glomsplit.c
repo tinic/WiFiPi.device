@@ -67,6 +67,83 @@ static unsigned long ln[2];
 
 static int split(unsigned long count) { return wifipi_glom_head_split(fr, ln, count); }
 
+/* a queue as the driver sends it: glom sizes into sizes[], returns the count */
+#define MAXQ 33
+static unsigned char q[MAXQ][192];
+static const unsigned char *qf[MAXQ];
+static unsigned long ql[MAXQ];
+
+static int emit(unsigned long n, unsigned long *sizes)
+{
+    unsigned long h = 0;
+    int k = 0;
+
+    while (h < n)
+    {
+        unsigned long take = wifipi_glom_take(qf + h, ql + h, n - h);
+
+        /* nothing of 3+ leaves with a same-flow pure-ACK head pair */
+        if (take >= 3 && wifipi_glom_head_split(qf + h, ql + h, take)) return -1;
+        sizes[k++] = take;
+        h += take;
+    }
+    return k;
+}
+
+/* acks same-flow pure ACKs, then tail frames of data (1) or UDP (2) */
+static void queue(unsigned long acks, unsigned long tail, int kind)
+{
+    unsigned long i;
+
+    for (i = 0; i < acks + tail; i++)
+    {
+        ql[i] = v4(q[i], 10, 5001, 50000, ACK, 0, i < acks ? 0 : 100);
+        if (i >= acks && kind == 2) q[i][14 + 9] = 17;
+        qf[i] = q[i];
+    }
+}
+
+static void expect_emit(unsigned long n, const unsigned long *want, int wantk, const char *what)
+{
+    unsigned long got[MAXQ];
+    int k = emit(n, got), i, same = k == wantk;
+
+    for (i = 0; same && i < k; i++) same = got[i] == want[i];
+    expect(same, 1, what);
+    if (!same)
+    {
+        printf("   got");
+        for (i = 0; i < k; i++) printf(" %lu", got[i]);
+        printf(" (k=%d)\n", k);
+    }
+}
+
+static void runs(void)
+{
+    static const unsigned long r3[] = { 2, 1 }, r4[] = { 2, 2 }, r8[] = { 2, 2, 2, 2 };
+    static const unsigned long r3d[] = { 2, 2 }, r4d[] = { 2, 2, 1 }, r2d[] = { 2, 1 };
+    static const unsigned long d32[] = { 32 }, one2[] = { 2 }, a1d[] = { 3 };
+    unsigned long r32[16], r32d[17], mix[] = { 2, 31 };
+    int i;
+
+    for (i = 0; i < 16; i++) r32[i] = r32d[i] = 2;
+    r32d[16] = 1;
+
+    queue(3, 0, 0);  expect_emit(3, r3, 2, "run 3: 2+1");
+    queue(4, 0, 0);  expect_emit(4, r4, 2, "run 4: 2+2");
+    queue(8, 0, 0);  expect_emit(8, r8, 4, "run 8: 4 pairs");
+    queue(32, 0, 0); expect_emit(32, r32, 16, "run 32: 16 pairs");
+    queue(3, 1, 1);  expect_emit(4, r3d, 2, "run 3 + data: 2+2");
+    queue(4, 1, 1);  expect_emit(5, r4d, 3, "run 4 + data: 2+2+1");
+    queue(32, 1, 1); expect_emit(33, r32d, 17, "run 32 + data: 16 pairs + 1");
+    queue(2, 1, 2);  expect_emit(3, r2d, 2, "2 ACKs + UDP: 2+1");
+    queue(2, 0, 0);  expect_emit(2, one2, 1, "2 ACKs: one glom of 2");
+    queue(1, 2, 1);  expect_emit(3, a1d, 1, "ACK + 2 data: one glom of 3");
+    queue(0, 32, 1); expect_emit(32, d32, 1, "32 data frames: one glom of 32");
+    /* 2 ACKs, then 31 data frames: the pair goes alone, the bulk stays whole */
+    queue(2, 31, 1); expect_emit(33, mix, 2, "2 ACKs + 31 data: 2+31");
+}
+
 int main(void)
 {
     /* two same-flow pure ACKs heading 3 and 32 frames: split */
@@ -168,6 +245,8 @@ int main(void)
     ln[0] = v4(a, 10, 5001, 50000, ACK, 0, 0);
     ln[1] = v6(b, 10, 6, 5001, ACK, 0);
     expect(split(3), 0, "IPv4 then IPv6");
+
+    runs();
 
     printf("RESULT pass=%d fail=%d\n", checks - failures, failures);
     return failures != 0;
