@@ -151,7 +151,7 @@ struct Chip {
     UBYTE               c_D11Type;
 
     char                c_Country[4];   /* #89 debug: ENV:WiFiPi/Country, two letters, or empty */
-    LONG                c_CountryRc;    /* #89 debug: PacketSetVar("country") result, -1 = not sent */
+    LONG                c_CountryRc;    /* #89 debug: PacketSetVar("country") result, 0x7fff00ff = not sent */
 #ifdef WIFIPI_FWINFO
     struct FwInfo       c_FwInfo;   /* boot-time firmware record (#89), src/fwinfo.h */
 #endif

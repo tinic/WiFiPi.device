@@ -256,7 +256,7 @@ BOOL LoadFirmware(struct Chip *chip)
         char cc[8];
         LONG n = GetVar((CONST_STRPTR)"WiFiPi/Country", (STRPTR)cc, sizeof(cc), GVF_GLOBAL_ONLY);
         chip->c_Country[0] = 0;
-        chip->c_CountryRc = -1;
+        chip->c_CountryRc = 0x7fff00ff;     /* not sent; any other value is the SET result */
         if (n == 2 && cc[0] >= 'A' && cc[0] <= 'Z' && cc[1] >= 'A' && cc[1] <= 'Z')
         {
             chip->c_Country[0] = cc[0];
