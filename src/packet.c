@@ -1760,7 +1760,8 @@ int PacketSetVar(struct SDIO *sdio, char *varName, const void *setBuffer, int se
 
     totalLen += varSize;
 
-    mpkt = AllocPooledClear(WiFiBase->w_MemPool, totalLen);
+    /* sdio_sendpkt() reads a 4-byte-rounded length; keep the wire length logical. */
+    mpkt = AllocPooledClear(WiFiBase->w_MemPool, (totalLen + 3) & ~3UL);
     pkt = (APTR)&mpkt->pm_PacketHeader[0];
 
     mpkt->pm_Message.mn_ReplyPort = port;
@@ -1812,7 +1813,7 @@ int PacketSetVar(struct SDIO *sdio, char *varName, const void *setBuffer, int se
         D(bug("[WiFi] PacketSetVar ended with error. Code: %s", (ULONG)brcmf_fil_errstr[-error_code]));
     }
 
-    FreePooled(WiFiBase->w_MemPool, mpkt, totalLen);
+    FreePooled(WiFiBase->w_MemPool, mpkt, (totalLen + 3) & ~3UL);
     DeleteMsgPort(port);
 
     return error_code;
@@ -1832,7 +1833,7 @@ void PacketSetVarAsync(struct SDIO *sdio, char *varName, const void *setBuffer, 
 
     totalLen += varSize;
 
-    pkt = AllocPooledClear(WiFiBase->w_MemPool, totalLen);
+    pkt = AllocPooledClear(WiFiBase->w_MemPool, (totalLen + 3) & ~3UL);
 
     struct PacketHeaderHW *hw = (APTR)&pkt[0];
     struct GlomHeader *gl = (APTR)&pkt[4];
@@ -1869,7 +1870,7 @@ void PacketSetVarAsync(struct SDIO *sdio, char *varName, const void *setBuffer, 
     // Async - fire the packet and forget
     sdio->SendPKT(pkt, totalLen, sdio);
 
-    FreePooled(WiFiBase->w_MemPool, pkt, totalLen);
+    FreePooled(WiFiBase->w_MemPool, pkt, (totalLen + 3) & ~3UL);
 }
 
 int PacketSetVarInt(struct SDIO *sdio, char *varName, ULONG varValue)
@@ -1897,7 +1898,7 @@ int PacketCmdInt(struct SDIO *sdio, ULONG cmd, ULONG cmdValue)
     if (sdio->s_GlomEnabled)
         totalLen += 8;
 
-    mpkt = AllocPooledClear(WiFiBase->w_MemPool, totalLen);
+    mpkt = AllocPooledClear(WiFiBase->w_MemPool, (totalLen + 3) & ~3UL);
     pkt = (APTR)&mpkt->pm_PacketHeader[0];
 
     mpkt->pm_Message.mn_ReplyPort = port;
@@ -1949,7 +1950,7 @@ int PacketCmdInt(struct SDIO *sdio, ULONG cmd, ULONG cmdValue)
         D(bug("[WiFi] PacketCmdInt ended with error. Code: %s", (ULONG)brcmf_fil_errstr[-error_code]));
     }
 
-    FreePooled(WiFiBase->w_MemPool, mpkt, totalLen);
+    FreePooled(WiFiBase->w_MemPool, mpkt, (totalLen + 3) & ~3UL);
     DeleteMsgPort(port);
 
     return error_code;
@@ -1965,7 +1966,7 @@ void PacketCmdIntAsync(struct SDIO *sdio, ULONG cmd, ULONG cmdValue)
     if (sdio->s_GlomEnabled)
         totalLen += 8;
 
-    pkt = AllocPooledClear(WiFiBase->w_MemPool, totalLen);
+    pkt = AllocPooledClear(WiFiBase->w_MemPool, (totalLen + 3) & ~3UL);
     
     struct PacketHeaderHW *hw = (APTR)&pkt[0];
     struct GlomHeader *gl = (APTR)&pkt[4];
@@ -2002,7 +2003,7 @@ void PacketCmdIntAsync(struct SDIO *sdio, ULONG cmd, ULONG cmdValue)
     // Fire packet and forget it
     sdio->SendPKT(pkt, totalLen, sdio);
 
-    FreePooled(WiFiBase->w_MemPool, pkt, totalLen);
+    FreePooled(WiFiBase->w_MemPool, pkt, (totalLen + 3) & ~3UL);
 }
 
 int PacketCmdIntGet(struct SDIO *sdio, ULONG cmd, ULONG *cmdValue)
@@ -2022,7 +2023,7 @@ int PacketCmdIntGet(struct SDIO *sdio, ULONG cmd, ULONG *cmdValue)
         if (sdio->s_GlomEnabled)
             totalLen += 8;
 
-        mpkt = AllocPooledClear(WiFiBase->w_MemPool, totalLen);
+        mpkt = AllocPooledClear(WiFiBase->w_MemPool, (totalLen + 3) & ~3UL);
         pkt = (APTR)&mpkt->pm_PacketHeader[0];
 
         mpkt->pm_Message.mn_ReplyPort = port;
@@ -2078,7 +2079,7 @@ int PacketCmdIntGet(struct SDIO *sdio, ULONG cmd, ULONG *cmdValue)
             *cmdValue = LE32(*cmdValue);
         }
 
-        FreePooled(WiFiBase->w_MemPool, mpkt, totalLen);
+        FreePooled(WiFiBase->w_MemPool, mpkt, (totalLen + 3) & ~3UL);
         DeleteMsgPort(port);
     }
 
@@ -2105,7 +2106,7 @@ int PacketGetVar(struct SDIO *sdio, char *varName, void *getBuffer, int getSize)
     else
         totalLen += getSize;
 
-    mpkt = AllocPooledClear(WiFiBase->w_MemPool, totalLen);
+    mpkt = AllocPooledClear(WiFiBase->w_MemPool, (totalLen + 3) & ~3UL);
     pkt = (APTR)&mpkt->pm_PacketHeader[0];
 
     mpkt->pm_Message.mn_ReplyPort = port;
@@ -2162,7 +2163,7 @@ int PacketGetVar(struct SDIO *sdio, char *varName, void *getBuffer, int getSize)
         D(bug("[WiFi] PacketGetVar ended with error. Code: %s", (ULONG)brcmf_fil_errstr[-error_code]));
     }
 
-    FreePooled(WiFiBase->w_MemPool, mpkt, totalLen);
+    FreePooled(WiFiBase->w_MemPool, mpkt, (totalLen + 3) & ~3UL);
     DeleteMsgPort(port);
 
     return error_code;
