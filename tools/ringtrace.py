@@ -412,7 +412,9 @@ def cmd_rxjoin(dump, pcap, start, end, w=TXJOIN_W, times=None):
     sent more than once in the window, each copy listed with its delay), UNSEEN (none, the window inside the capture) or
     CENSORED.  A SEEN frame names its copy by send order among all the capture's copies
     of that key: original, or retx N (the original may lie outside the window).
-    The edge: the release ACK (first host ACK whose unique peer arrival is in (START, END]),
+    The edge: the release ACK (first host ACK arriving in (START, END] whose ack advances past
+    prior_ack, the highest Amiga ack the capture shows at or before START; unique peer copy;
+    it may have left the host before START),
     its trigger (latest SEEN host data read before it that it covers), their delays; the
     resume segment (the peer's frame at END) apart.  Exits no_rx_identity when the ring
     holds no RX identity records within [START - W, END + W]."""
@@ -494,25 +496,47 @@ def cmd_rxjoin(dump, pcap, start, end, w=TXJOIN_W, times=None):
     bms = m["bound"] * 1e3
     dflows = {(p["dst"][3], p["src"][3], p["dport"], p["sport"]) for p in segs if p["len"] > 0}
     ptx = byk_tx(peer)
-    rel, cand_rel = None, []
-    for a in sorted(tx_frames(recs), key=lambda f: f["t"]):
-        if not a["flags"] & 0x10 or (a["src"], a["dst"], a["sport"], a["dport"]) not in dflows:
+    # the release ACK must advance the cumulative ack past prior_ack: the highest ack in the
+    # Amiga's ACKs the PEER CAPTURE shows at or before START (not what the host had sent: an ACK
+    # sent before the gap and held until inside it is exactly a release).  A duplicate ACK or a
+    # window update is not a release.  The release may have left the host before START.
+    acks = [a for a in sorted(tx_frames(recs), key=lambda f: f["t"])
+            if a["flags"] & 0x10 and (a["src"], a["dst"], a["sport"], a["dport"]) in dflows]
+    prior = {}
+    for p in sorted(peer, key=lambda q: q["ep"]):
+        k = (p["src"][3], p["dst"][3], p["sport"], p["dport"])
+        if p["ep"] > lo or not p["flags"] & 0x10 or k not in dflows:
             continue
+        if k not in prior or (seq_after(p["ack"], prior[k]) and p["ack"] != prior[k]):
+            prior[k] = p["ack"]
+    rel, cand_rel, nonadv = None, [], 0
+    for a in acks:
         at = to_peer(m, a["t"] / 1e6)
         cand = [p for p in ptx.get(txkey(a), []) if at - m["bound"] <= p["ep"] <= at + w]
-        if any(lo < p["ep"] <= hi for p in cand):
-            rel, cand_rel = a, cand
-            break
+        if not any(lo < p["ep"] <= hi for p in cand):
+            continue
+        pa = prior.get((a["src"], a["dst"], a["sport"], a["dport"]))
+        if pa is not None and not (seq_after(a["ack"], pa) and a["ack"] != pa):
+            nonadv += 1
+            continue
+        rel, cand_rel = a, cand
+        break
     why = None
     if rel is None:
-        why = "no host ACK with a peer arrival in (START, END]"
+        why = ("no advancing ACK (%d non-advancing ACK(s) arriving in (START, END])" % nonadv if nonadv
+               else "no host ACK with a peer arrival in (START, END]")
     elif len(cand_rel) != 1:
         why = "release ACK ambiguous: %d peer copies of its identity in the join window" % len(cand_rel)
     else:
         at = to_peer(m, rel["t"] / 1e6)
-        print("release_ack host_tx_clo_us=%d host_tx_peer=%.6f ack=%d ip_id=%d peer_rx_peer=%.6f write=%s "
-              "unique=one peer copy of its full identity in [host_tx-bound, host_tx+W]; first host ACK arriving in (START, END]" % (
-                  rel["t"], at, rel["ack"], rel["ipid"], cand_rel[0]["ep"], rel["write"]))
+        pa = prior.get((rel["src"], rel["dst"], rel["sport"], rel["dport"]))
+        print("release_ack host_tx_clo_us=%d host_tx_peer=%.6f ack=%d prior_ack=%s ip_id=%d peer_rx_peer=%.6f write=%s "
+              "unique=one peer copy of its full identity in [host_tx-bound, host_tx+W]; first advancing host ACK "
+              "arriving in (START, END]%s" % (
+                  rel["t"], at, rel["ack"], "none (no Amiga ACK in the capture at or before START)" if pa is None else "%d" % pa,
+                  rel["ipid"], cand_rel[0]["ep"], rel["write"],
+                  ("; %d non-advancing ACK(s) skipped" % nonadv if nonadv else "") +
+                  ("; host_tx before START" if at < lo else "")))
         covd = [fr for fr in rxs if fr["len"] > 0 and fr["pt"] < at
                 and fr["src"] == rel["dst"] and fr["dst"] == rel["src"]
                 and fr["sport"] == rel["dport"] and fr["dport"] == rel["sport"]

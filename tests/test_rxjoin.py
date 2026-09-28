@@ -159,7 +159,24 @@ data(Q0, 1, 0xF00, 97000)
 data(Q0 + 1_000, 1, 0xF01, 98448, sent=False)
 ack(Q0 + 50_000, 0x505, 99896, 3)
 Q_END = Q0 + 54_000
-t = Q_END + 1_000_000
+# gap P: after the prior ACK (99896 from Q), a duplicate ACK arrives first, then the advancing one
+P0 = Q_END + 500_000
+data(P0, 1, 0x1100, 99896)                                 # trigger: 99896..101344
+ack(P0 + 20_000, 0x506, 99896, 3)                          # duplicate: no advance
+ack(P0 + 60_000, 0x507, 101344, 3)                         # the release
+P_END = P0 + 64_000
+# gap O: only a duplicate and a window update (the same ack) arrive: no release
+O0 = P_END + 500_000
+ack(O0 + 20_000, 0x508, 101344, 3)
+ack(O0 + 40_000, 0x509, 101344, 3)
+O_END = O0 + 44_000
+# gap H: the release ACK leaves the host before START and reaches the peer inside the gap
+H0 = O_END + 500_000
+data(H0, 1, 0x1200, 101344)                                # trigger: 101344..102792
+ack(H0 + 10_000, 0x50A, 102792, 200)                       # sent 10 ms after the read, at the peer 200 ms later
+H_START = H0 + 50_000                                      # after the host sent it
+H_END = H0 + 212_000
+t = H_END + 1_000_000
 for s in range(5, 10):
     ping(t + (s - 5) * 100_000, s)
 
@@ -175,7 +192,7 @@ open(pcap, "wb").write(b"".join(pk))
 
 h, rs = ringtrace.load(dump)
 rx = ringtrace.rx_frames(rs)
-expect(len(rx) == 21 and [f["outcome"] for f in rx[:3]] == ["read", "orphan", "dropped"], "RX pairs and outcomes decoded")
+expect(len(rx) == 23 and [f["outcome"] for f in rx[:3]] == ["read", "orphan", "dropped"], "RX pairs and outcomes decoded")
 
 
 def run(lo, hi):
@@ -292,6 +309,21 @@ rc, qq, err = run2(peer(Q0) - 0.01, peer(Q_END))
 print("\n".join(l for l in qq if "trigger" in l or "edge" in l))
 expect(rc == 3 and has(qq, "trigger_evidence", "other covered reads between it and the ACK: 1", "UNSEEN") and has(qq, "edge unavailable (trigger ambiguous"),
        "Q: an unmatched covered read after the SEEN one: trigger ambiguous, exit 3")
+rc, pp, _ = run2(peer(P0) - 0.01, peer(P_END))
+print("\n".join(l for l in pp if l.startswith(("release_ack", "trigger", "edge"))))
+expect(rc == 0 and has(pp, "release_ack host_tx_clo_us=", "ack=101344 prior_ack=99896", "1 non-advancing ACK(s) skipped"),
+       "P: the duplicate ACK is skipped, the advancing ACK is the release, prior_ack shown")
+expect(has(pp, "trigger_segment peer_tx_peer=", "seq=99896 len=1448") and num(pp, "ack_production_ms", "edge ", near=60.0),
+       "P: edge on the trigger, ACK production to the advancing ACK (60 ms)")
+rc, oo2, err = run2(peer(O0) - 0.01, peer(O_END))
+expect(rc == 3 and has(oo2, "edge unavailable (no advancing ACK (2 non-advancing ACK(s)") and "edge_unavailable" in err
+       and not has(oo2, "edge read_delay_ms="), "O: only duplicate/window-update ACKs: no advancing ACK, exit 3")
+rc, hh, _ = run2(peer(H_START), peer(H_END))
+print("\n".join(l for l in hh if l.startswith(("release_ack", "trigger", "edge"))))
+expect(rc == 0 and has(hh, "release_ack host_tx_clo_us=", "ack=102792 prior_ack=101344", "host_tx before START"),
+       "H: an ACK sent before START and delivered inside the gap is the release, prior_ack from the capture")
+expect(has(hh, "trigger_segment peer_tx_peer=", "seq=101344 len=1448") and num(hh, "ack_production_ms", "edge ", near=10.0),
+       "H: trigger read before START, ACK produced 10 ms later")
 norx = os.path.join(d, "norx.bin")                          # the same pings, no RX identity records
 kept = [r for r in recs if r[1] == 11]
 open(norx, "wb").write(struct.pack(">IHHIIIIII", 0x52544431, 1, 16, 1 << 22, len(kept), 0, len(kept), 0, (t + 900_000) & 0xFFFFFFFF)
