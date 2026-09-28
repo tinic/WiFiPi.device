@@ -3,8 +3,9 @@
  * test in tests/test_glomsplit.c builds it with cc.
  *
  * In a glom of three or more frames whose first two are pure ACKs of one TCP
- * flow, the firmware drops the head ACK.  The driver then sends the head on
- * its own and batches the rest as before.
+ * flow, the head ACK was absent from the peer's capture (A11: 21 of 21);
+ * where it is lost after CMD53 is not established.  The driver sends the
+ * head on its own and batches the rest as before.
  *
  * Pure ACK: IPv4 (not a fragment, options allowed) or IPv6 (TCP as the first
  * next header), TCP with no payload, ACK set, SYN, FIN and RST clear.  TCP
