@@ -8,6 +8,7 @@ what the driver did inside a silence.
   ringtrace.py window DUMP MARKS START END       records and verdicts for a gap
   ringtrace.py txjoin DUMP PCAP START END [W]    each TX TCP frame the host produced in
                                                  the gap: SEEN / UNSEEN / AMBIGUOUS at the peer
+  ringtrace.py gaps   PCAP PORT [GAP_MS]         peer-capture silences (data and ACK) > GAP_MS
 
 MARKS is the peer capture's alignment pings (ICMP echo, IP length 1139,
 ping -s 1111), one per line: epoch type id seq.  pcapmarks writes it from a
@@ -148,12 +149,19 @@ def txrc_state(a):
 
 
 def tx_frames(recs):
-    """TX TCP frames: a TXID1 and the TXID2 written right after it, each with the
-    result of its glom's write (the next TXRC whose SDPCM range holds it)"""
+    """TX TCP frames: a TXID1 and the TXID2 written right after it.  A frame takes
+    its glom's write result only from the FIRST TXRC after it in record order, and
+    only if that TXRC is its glom's: same frame count, SDPCM range holding its seq.
+    A glom ends at that TXRC, or at the next glom's first frame (index 0) when its
+    TXRC is missing; its frames then stay write=unknown, never a later glom's."""
     out, pending = [], []
     for i, r in enumerate(recs):
         n = recs[i + 1] if i + 1 < len(recs) else None
-        if r["k"] == 13 and n is not None and n["k"] == 14 and n["seq"] == r["seq"] + 1:
+        k = r["k"]
+        if (k == 13 and n is not None and n["k"] == 14 and n["seq"] == r["seq"] + 1 and n["a"] == 0) or \
+           (k == 15 and r["a"] == 0):
+            pending = []                    # a new glom call: the last one's TXRC never came
+        if k == 13 and n is not None and n["k"] == 14 and n["seq"] == r["seq"] + 1:
             fr = {"t": r["t"], "flags": r["a"], "ipid": r["b"], "ack": r["c"], "seq": r["d"],
                   "idx": n["a"], "count": n["b"] >> 8, "sdpcm": n["b"] & 0xff,
                   "sport": n["c"] >> 16, "dport": n["c"] & 0xffff,
@@ -161,10 +169,11 @@ def tx_frames(recs):
                   "write": "unknown", "write_us": None}
             out.append(fr)
             pending.append(fr)
-        elif r["k"] == 16:
+        elif k == 16:
             first, cnt = r["b"] >> 8, r["b"] & 0xff
             for fr in pending:
-                if (fr["sdpcm"] - first) & 0xff < cnt:
+                if fr["count"] == cnt and (fr["sdpcm"] - first) & 0xff < cnt and \
+                   (fr["sdpcm"] - first) & 0xff == fr["idx"]:
                     fr["write"], fr["write_us"] = txrc_state(r["a"]), r["c"]
             pending = []
     return out
@@ -201,7 +210,11 @@ def txkey(x):
 
 
 FLAGS = "FSRPAUEC"
+# Join window W: the clock bound plus the host-copy-to-peer delay of SEEN frames.
+# Until a first run calibrates it (txjoin prints the SEEN delay p50/p99/max), 1 s,
+# about 2.1x the longest silence measured (464 ms, hw20); never below 0.5 s.
 TXJOIN_W = 1.0
+TXJOIN_W_MIN = 0.5
 
 
 def flagstr(v):
@@ -217,15 +230,18 @@ def cmd_txjoin(dump, pcap, start, end, w=TXJOIN_W):
     [host_t - bound, host_t + w]; UNSEEN: none; AMBIGUOUS: more than one."""
     h, recs = load(dump)
     m = model(pings(recs, marks_from_pcap(pcap)))
-    lo, hi, w = float(start), float(end), float(w)
+    lo, hi, w = float(start), float(end), max(float(w), TXJOIN_W_MIN)
+    t_end = to_peer(m, h["t_dump"] / 1e6)
     peer = peer_tcp(pcap)
     byk = {}
     for p in peer:
         byk.setdefault(txkey(p), []).append(p)
     first_t = to_peer(m, recs[0]["t"] / 1e6) if recs else None
     covered = h["lost"] == 0 or (first_t is not None and first_t < lo - m["bound"])
-    print("window_s=%.6f..%.6f bound_ms=%.3f join_window=[host_t-%.3f ms, host_t+%.3f s] covered=%d lost=%d" % (
-        lo, hi, m["bound"] * 1e3, m["bound"] * 1e3, w, covered, h["lost"]))
+    print("window_s=%.6f..%.6f bound_ms=%.3f join_window=[host_t-%.3f ms, host_t+%.3f s] covered=%d lost=%d dump_end=%.6f" % (
+        lo, hi, m["bound"] * 1e3, m["bound"] * 1e3, w, covered, h["lost"], t_end))
+    print("note=UNSEEN means absent at the peer within the join window after the host write shown; "
+          "with write=ok it does not locate where the frame was lost")
     frames = [fr for fr in tx_frames(recs) if lo <= to_peer(m, fr["t"] / 1e6) <= hi]
     # endpoint mapping: recorded octets and ports -> the capture's full addresses
     pflows = {}
@@ -240,13 +256,16 @@ def cmd_txjoin(dump, pcap, start, end, w=TXJOIN_W):
             print("flow_map %s UNMAPPED (no capture flow has these octets and ports)" % tag)
         for f in full:
             print("flow_map %s pcap=%s:%d>%s:%d%s" % (tag, f[0], f[2], f[1], f[3], " AMBIGUOUS_MAP" if len(full) > 1 else ""))
-    stats, tot, wstats = {}, [0, 0, 0, 0], {}
+    stats, tot, wstats, delays = {}, [0, 0, 0, 0], {}, []
     for fr in frames:
         pt = to_peer(m, fr["t"] / 1e6)
         cand = [p for p in byk.get(txkey(fr), []) if pt - m["bound"] <= p["ep"] <= pt + w]
         cls = "SEEN" if len(cand) == 1 else ("UNSEEN" if not cand else "AMBIGUOUS")
         what = cls + (" peer_t=%.6f delay_ms=%.3f" % (cand[0]["ep"], (cand[0]["ep"] - pt) * 1e3) if cls == "SEEN"
-                      else " candidates=%d" % len(cand) if cls == "AMBIGUOUS" else "")
+                      else " candidates=%d" % len(cand) if cls == "AMBIGUOUS"
+                      else " to_dump_end_s=%.3f" % (t_end - pt))
+        if cls == "SEEN":
+            delays.append((cand[0]["ep"] - pt) * 1e3)
         flow = ".%d:%d>.%d:%d" % (fr["src"], fr["sport"], fr["dst"], fr["dport"])
         st = stats.setdefault(flow, [0, 0, 0, 0])
         k = {"SEEN": 1, "UNSEEN": 2, "AMBIGUOUS": 3}[cls]
@@ -261,7 +280,29 @@ def cmd_txjoin(dump, pcap, start, end, w=TXJOIN_W):
     for flow, st in sorted(stats.items()):
         print("flow=%s write_ok=%d write_failed=%d write_unknown=%d" % (flow, wstats[flow]["ok"], wstats[flow]["failed"], wstats[flow]["unknown"]))
         print("flow=%s produced_at_host=%d seen=%d unseen=%d ambiguous=%d" % ((flow,) + tuple(st)))
+    if delays:
+        d = sorted(delays)
+        q = lambda x: d[min(len(d) - 1, int(x * len(d)))]
+        print("seen_delay_ms n=%d p50=%.3f p99=%.3f max=%.3f (calibrates W: bound + p99, at least %.1f s)" % (
+            len(d), q(.5), q(.99), d[-1], TXJOIN_W_MIN))
     print("produced_at_host=%d seen=%d unseen=%d ambiguous=%d" % tuple(tot))
+
+
+def cmd_gaps(pcap, port, gap_ms=150.0):
+    """Silences in the peer capture, as ackab.py counts them: data = peer->Amiga TCP to
+    PORT with payload; ack = Amiga->peer TCP from PORT.  One line per gap > gap_ms."""
+    port, gap_ms = int(port), float(gap_ms)
+    t = {"data": [], "ack": []}
+    for p in peer_tcp(pcap):
+        if p["dport"] == port and p["len"] > 0:
+            t["data"].append(p["ep"])
+        elif p["sport"] == port and p["flags"] & 0x10:
+            t["ack"].append(p["ep"])
+    for d in ("data", "ack"):
+        v = sorted(t[d])
+        for a, b in zip(v, v[1:]):
+            if (b - a) * 1e3 > gap_ms:
+                print("gap dir=%s start=%.6f end=%.6f ms=%.1f" % (d, a, b, (b - a) * 1e3))
 
 
 def pings(recs, pm):
@@ -375,6 +416,8 @@ def main():
         cmd_pcapmarks(sys.argv[2])
     elif len(sys.argv) == 4 and sys.argv[1] == "align":
         cmd_align(sys.argv[2], sys.argv[3])
+    elif len(sys.argv) in (4, 5) and sys.argv[1] == "gaps":
+        cmd_gaps(*sys.argv[2:])
     elif len(sys.argv) in (6, 7) and sys.argv[1] == "txjoin":
         cmd_txjoin(*sys.argv[2:])
     elif len(sys.argv) == 6 and sys.argv[1] == "window":

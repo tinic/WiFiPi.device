@@ -118,6 +118,10 @@ tcp.append((peer(G + 80_000) + 0.300, tcp_frame(0x1006, 13760, 1, 0x10)))
 # F10 a flow the capture never had; no TXRC follows it (write unknown)
 txid(G + 90_000, 0x1007, 1, 1, 0x10, 0, 1, 0x3b, sport=5555, dport=6666)
 gap_end_t = G + 160_000
+# peer->Amiga data around the gap: every 10 ms up to G, again from G + 200 ms (a 200 ms data gap)
+for k in range(10):
+    tcp.append((peer(G) - 0.1 + k * 0.01 + 0.01, tcp_frame(0x2000 + k, 1, 1000 + k, 0x10, src=136, dst=137, sport=40462, dport=7502, plen=1448)))
+    tcp.append((peer(G) + 0.2 + k * 0.01, tcp_frame(0x3000 + k, 1, 2000 + k, 0x10, src=136, dst=137, sport=40462, dport=7502, plen=1448)))
 txid(G + 400_000, 0x1008, 9380, 1, 0x10, 0, 1, 0x3c)               # outside the window
 t += 5_000_000                                                      # past the CLO wrap
 for s in range(5, 10):
@@ -166,13 +170,13 @@ def line(ipid):
 expect(lines[-1] == "produced_at_host=10 seen=4 unseen=5 ambiguous=1", "summary")
 expect("SEEN" in line(0x1000) and "delay_ms=2.0" in line(0x1000) and "write=ok" in line(0x1000), "F1 seen 2 ms, write ok")
 expect("SEEN" in line(0x1001) and "delay_ms=150.0" in line(0x1001), "F2 seen 150 ms, not the other host's frame")
-expect(line(0x1002).endswith("UNSEEN") and "write=failed" in line(0x1002), "F3 near miss in seq: unseen; write failed")
-expect(line(0x1003).endswith("UNSEEN"), "F4 near miss in payload length: unseen")
-expect(line(0x1004).endswith("UNSEEN"), "F5 same id/ack/seq from another port: unseen")
-expect(line(0x1005).endswith("UNSEEN"), "F6 exact frame outside the window: unseen")
+expect(" UNSEEN to_dump_end_s=" in line(0x1002) and "write=failed" in line(0x1002), "F3 near miss in seq: unseen; write failed")
+expect(" UNSEEN to_dump_end_s=" in line(0x1003), "F4 near miss in payload length: unseen")
+expect(" UNSEEN to_dump_end_s=" in line(0x1004), "F5 same id/ack/seq from another port: unseen")
+expect(" UNSEEN to_dump_end_s=" in line(0x1005), "F6 exact frame outside the window: unseen")
 expect("SEEN" in line(0xFFFF) and "SEEN" in line(0x0000) and "delay_ms=4.0" in line(0x0000), "F7/F8 across the id wrap, older reuse ignored")
 expect("AMBIGUOUS candidates=2" in line(0x1006), "F9 two copies: ambiguous")
-expect(line(0x1007).endswith("UNSEEN") and "write=unknown" in line(0x1007), "F10 unseen, write unknown")
+expect(" UNSEEN to_dump_end_s=" in line(0x1007) and "write=unknown" in line(0x1007), "F10 unseen, write unknown")
 expect(line(0x1008) == "", "frame outside the gap not listed")
 expect("flow_map flow=.137:7502>.136:40462 pcap=192.168.1.137:7502>192.168.1.136:40462" in lines, "flow mapped to full addresses")
 expect(any(l.startswith("flow_map flow=.137:5555>.136:6666 UNMAPPED") for l in lines), "unmapped flow reported")
@@ -181,6 +185,40 @@ expect("flow=.137:5555>.136:6666 produced_at_host=1 seen=0 unseen=1 ambiguous=0"
 expect("flow=.137:7502>.136:40462 write_ok=8 write_failed=1 write_unknown=0" in lines, "per-flow write results")
 expect(lines[0].startswith("window_s=") and "join_window=[host_t-" in lines[0] and "1.000 s]" in lines[0] and " covered=1 lost=7" in lines[0],
        "header: join window, covered with records lost")
+expect(any(l.startswith("note=UNSEEN means absent at the peer within the join window") for l in lines), "UNSEEN wording")
+expect(any(l.startswith("seen_delay_ms n=4 ") for l in lines), "SEEN delay distribution printed")
+end_s = float(line(0x1002).split("to_dump_end_s=")[1])
+expect(abs(end_s - (ringtrace.to_peer(ringtrace.model(ringtrace.pings(rs, pm)), h["t_dump"] / 1e6) - float(line(0x1002).split()[0].split("=")[1]))) < 1e-3,
+       "to_dump_end_s is the dump end minus the frame's time")
+narrow = subprocess.run([sys.executable, TOOL, "txjoin", dump, pcap, "%.6f" % peer(gap_start_t), "%.6f" % peer(gap_end_t), "0.1"],
+                        capture_output=True, text=True).stdout.splitlines()
+expect("host_t+0.500 s]" in narrow[0], "W is never below 0.5 s")
+
+# gaps: the silences in the capture, both directions
+gl = subprocess.run([sys.executable, TOOL, "gaps", pcap, "7502"], capture_output=True, text=True).stdout.splitlines()
+print("\n".join(gl))
+dg = [l for l in gl if l.startswith("gap dir=data ")]
+expect(len(dg) == 1 and dg[0].endswith("ms=200.0"), "one 200 ms data gap")
+expect(any(l.startswith("gap dir=ack ") for l in gl), "ACK gaps listed")
+
+# TXRC association in record order (unit): seq reuse after a wrap, and a missing TXRC
+def pair(sq, sdpcm, idx=0, count=1, ipid=1):
+    return [dict(seq=sq, k=13, t=sq, a=0x10, b=ipid, c=1, d=1),
+            dict(seq=sq + 1, k=14, t=sq, a=idx, b=(count << 8) | sdpcm, c=(7502 << 16) | 40462, d=(137 << 24) | (136 << 16))]
+def rc(sq, status, first, count=1):
+    return [dict(seq=sq, k=16, t=sq, a=status, b=(first << 8) | count, c=300, d=0)]
+u = (pair(0, 0x40, ipid=1) + rc(2, 1, 0x40)            # A: seq 0x40, write failed
+     + pair(3, 0x40, ipid=2) + rc(5, 3, 0x40)          # B: 0x40 again after a wrap, write ok
+     + pair(6, 0x50, ipid=3)                           # C: 0x50, its TXRC missing
+     + pair(8, 0x50, ipid=4) + rc(10, 3, 0x50)         # D: 0x50 again, write ok (must not reach C)
+     + pair(11, 0x60, ipid=5) + rc(13, 3, 0x61)        # E: the next TXRC is not its glom's
+     + pair(14, 0x70, idx=0, count=2, ipid=6)          # F: first of two, the second frame is a TXO
+     + [dict(seq=16, k=15, t=16, a=1, b=(2 << 8) | 0x71, c=0, d=0)] + rc(17, 3, 0x70, 2))
+got = [(f["ipid"], f["write"]) for f in ringtrace.tx_frames(u)]
+print("   tx_frames:", got)
+expect(got == [(1, "failed"), (2, "ok"), (3, "unknown"), (4, "ok"), (5, "unknown"), (6, "ok")],
+       "write results by record order: reuse after wrap, missing TXRC, foreign TXRC")
+
 early = subprocess.run([sys.executable, TOOL, "txjoin", dump, pcap, "%.6f" % (peer(BASE) - 5), "%.6f" % peer(gap_end_t)],
                        capture_output=True, text=True).stdout.splitlines()
 expect(" covered=0 " in early[0], "not covered: the window starts before the first kept record")
