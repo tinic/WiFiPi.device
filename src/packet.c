@@ -20,6 +20,7 @@
 #include "wifipi.h"
 #include "packet.h"
 #include "brcm_wifi.h"
+#include "glomsplit.h"
 #include <aminetxduo/anxs2ext.h>
 
 #ifndef	PAD
@@ -1857,7 +1858,8 @@ void ProcessDataPacket(struct SDIO *sdio, UBYTE *packet, ULONG packetLength)
  * Byte 6~7: Reserved
  */
 
-int SendGlomDataPacket(struct SDIO *sdio, struct IOSana2Req **ioList, UBYTE count)
+/* one transfer from the head of ioList; returns the frames it took */
+static UBYTE SendGlomOnce(struct SDIO *sdio, struct IOSana2Req **ioList, UBYTE count, BOOL maySplit)
 {
     struct WiFiBase *WiFiBase = sdio->s_WiFiBase;
     struct ExecBase *SysBase = sdio->s_SysBase;
@@ -1867,6 +1869,8 @@ int SendGlomDataPacket(struct SDIO *sdio, struct IOSana2Req **ioList, UBYTE coun
     struct PacketHeaderHW *pktBase = sdio->s_TXBuffer;
     UBYTE *byteBuffer = sdio->s_TXBuffer;
     struct GlomHeader *lastGh = NULL;
+    const UBYTE *head[2];
+    ULONG headLen[2];
 
     for (UBYTE i = 0; i < count; i++)
     {
@@ -1915,6 +1919,12 @@ int SendGlomDataPacket(struct SDIO *sdio, struct IOSana2Req **ioList, UBYTE coun
         *ptr++ = 0;
         *ptr++ = 0;
 
+        if (i < 2)
+        {
+            head[i] = ptr;
+            headLen[i] = packetLength - sizeof(struct Packet) - sizeof(struct GlomHeader) - 4;
+        }
+
         if ((io->ios2_Req.io_Flags & SANA2IOF_RAW) == 0)
         {
             // Copy destination
@@ -1956,6 +1966,18 @@ int SendGlomDataPacket(struct SDIO *sdio, struct IOSana2Req **ioList, UBYTE coun
             if (packetLength % 16 != 0) bug("\n");
         }
 #endif
+        /* two pure ACKs of one flow at the head of 3+: the firmware drops
+           the first, so it goes alone; the rest is one glom as before (#89) */
+        if (i == 1 && maySplit && wifipi_glom_head_split(head, headLen, count))
+        {
+            struct GlomHeader *firstGh = (APTR)(byteBuffer + sizeof(struct PacketHeaderHW));
+
+            sdio->s_TXSeq--;
+            firstGh->gh_LastItem = 1;
+            count = 1;
+            break;
+        }
+
         // Increase total length by packet length (aligned)
         totalLength += (packetLength + 3) & ~3;
     }
@@ -1996,6 +2018,22 @@ int SendGlomDataPacket(struct SDIO *sdio, struct IOSana2Req **ioList, UBYTE coun
     for (UBYTE i = 0; i < count; i++) {
         ReplyMsg(&ioList[i]->ios2_Req.io_Message);
         unit->wu_Stats.PacketsSent++;
+    }
+
+    return count;
+}
+
+int SendGlomDataPacket(struct SDIO *sdio, struct IOSana2Req **ioList, UBYTE count)
+{
+    BOOL maySplit = TRUE;
+
+    while (count)
+    {
+        UBYTE n = SendGlomOnce(sdio, ioList, count, maySplit);
+
+        maySplit = FALSE;
+        ioList += n;
+        count -= n;
     }
 
     return 1;
