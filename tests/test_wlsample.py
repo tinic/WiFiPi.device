@@ -329,63 +329,86 @@ def rts_line(out, g):
 RTS_ON = {"txrts": 4, "txnocts": 1, "rxrsptmout": 2, "txallfrm": 30, "txackfrm": 10, "rxbeaconobss": 1}
 QUIET = {"txallfrm": 5, "txackfrm": 5}
 # 10 control windows of 50 ms (8 with RTS), gap A (3 windows with RTS), 5 more control, gap B (no RTS,
-# one window where txackfrm outruns txallfrm), 5 control
+# one window where txackfrm outruns txallfrm), 5 control, gap C (only unanswered RTS: 10 + 10), 5 control
 plan = [(50_000, RTS_ON if k < 8 else QUIET) for k in range(11)]
 plan += [(50_000, {"txrts": 2, "txnocts": 1, "rxrsptmout": 1, "txallfrm": 40, "txackfrm": 12,
                    "rxbeaconobss": 3}) for _ in range(3)]
 plan += [(50_000, RTS_ON) for _ in range(5)]
 plan += [(50_000, {"txallfrm": 3, "txackfrm": 3}), (50_000, {"txallfrm": 2, "txackfrm": 6})]
 plan += [(50_000, RTS_ON) for _ in range(5)]
+plan += [(50_000, {"txnocts": 10, "txallfrm": 4, "txackfrm": 1}) for _ in range(2)]
+plan += [(50_000, RTS_ON) for _ in range(5)]
 
 
-def gaps_ab(times):
+def gaps_abc(times):
     return [(peer(times[10]) - 0.001, peer(times[13]) + 0.010),     # windows 10-11, 11-12, 12-13
-            (peer(times[18]) - 0.001, peer(times[20]) + 0.010)]     # windows 18-19, 19-20
+            (peer(times[18]) - 0.001, peer(times[20]) + 0.010),     # windows 18-19, 19-20
+            (peer(times[25]) - 0.001, peer(times[27]) + 0.010)]     # windows 25-26, 26-27
 
 
-out_w = wide_leg("wideA", plan, gaps_ab)
-A, B = rts_line(out_w, 0), rts_line(out_w, 1)
+out_w = wide_leg("wideA", plan, gaps_abc)
+A, B, C = rts_line(out_w, 0), rts_line(out_w, 1), rts_line(out_w, 2)
 expect(A is not None and A["eligible"] == "3", "gap A: rts line over its 3 eligible windows")
 secsA = float(A["in_hold_ms"]) / 1e3
-expect(A["txrts"] == "6" and A["txnocts"] == "3" and A["rxrsptmout"] == "3", "gap A sums: %s" % A)
-expect(A["txrts_per_s"] == "%.3f" % (6 / secsA) and A["rxrsptmout_per_s"] == "%.3f" % (3 / secsA),
+expect(A["rts_attempts"] == "9" and A["rts_answered"] == "6" and A["rts_unanswered"] == "3"
+       and A["rxrsptmout"] == "3", "gap A: attempts = txrts + txnocts = 6 + 3: %s" % A)
+expect(A["rts_attempts_per_s"] == "%.3f" % (9 / secsA) and A["rts_answered_per_s"] == "%.3f" % (6 / secsA)
+       and A["rts_unanswered_per_s"] == "%.3f" % (3 / secsA) and A["rxrsptmout_per_s"] == "%.3f" % (3 / secsA),
        "gap A: per-second rates over the eligible windows' own lengths")
-expect(A["unanswered_fraction"] == "0.500", "unanswered = txnocts/txrts = 3/6")
+expect(A["unanswered_fraction"] == "0.333", "unanswered = txnocts / (txrts + txnocts) = 3/9")
 expect(A["rxrsptmout_note"] == "supporting_not_ap_attribution" and A["rxbeaconobss"] == "9"
        and A["rxbeaconobss_note"] == "chip_hears_channel", "notes and rxbeaconobss reported only")
-# control: every out-of-hold window of matching length: 10 + 4 + 4 (edges straddle), 8+4+4 with RTS
-expect(A["rts_sensitivity"] == "ok" and float(A["control_txrts_positive_fraction"]) >= 0.5,
-       "control mostly with RTS: sensitivity ok (%s)" % A["control_txrts_positive_fraction"])
-expect(A["reading"] == "chip_attempted_channel_access_rules_out_complete_tx_silence_only"
-       and "txrts0_note" not in A, "txrts > 0: attempted channel access")
+expect(A["rts_sensitivity"] == "ok" and float(A["control_rts_attempt_positive_fraction"]) >= 0.5,
+       "control mostly with attempts: sensitivity ok (%s)" % A["control_rts_attempt_positive_fraction"])
+expect(A["control_rts_attempts_per_s_median"] == "%.3f" % float(A["control_rts_attempts_per_s_median"])
+       and A["control_rts_unanswered_per_s_median"] != "none", "control medians of each")
+expect(A["reading"] == "chip_attempted_channel_access_rts_rules_out_complete_tx_silence_only"
+       and A["reading_unanswered"] == "3", "attempts > 0: attempted, 3 unanswered")
 expect(A["chip_init_tx"] == "84" and A["chip_init_tx_clamped"] == "0" and A["chip_init_tx_approx"] == "1"
        and A["chip_init_tx_reading"] == "chip_mac_transmitted_non_ack_frames_in_hold_approx_may_include_cts_ba_responses",
        "chip_init_tx = 3 x (40 - 12)")
 expect(A["control_chip_init_tx_per_s_median"] != "none", "chip_init_tx control median")
-expect(B is not None and B["txrts"] == "0" and B["unanswered_fraction"] == "n/a", "gap B: no RTS, unanswered n/a")
-expect(B["reading"] == "no_rts_cannot_distinguish_internal_hold_from_cca_backoff"
-       and B["txrts0_note"] == "cannot_separate_internal_hold_from_cca_deferral_deferral_precedes_rts",
-       "txrts = 0: reading and the deferral note")
+expect(B is not None and B["rts_attempts"] == "0" and B["unanswered_fraction"] == "n/a" and "reading_unanswered" not in B,
+       "gap B: no attempt, unanswered n/a")
+expect(B["reading"] == "no_rts_attempt_in_sampled_windows_cannot_distinguish_internal_hold_from_cca_deferral",
+       "attempts = 0: the no-attempt reading")
 expect(B["chip_init_tx"] == "0" and B["chip_init_tx_clamped"] == "1" and B["chip_init_tx_reading"] == "none",
        "2 - 6 < 0: clamped at 0 and counted")
+expect(C is not None and C["rts_attempts"] == "20" and C["rts_answered"] == "0" and C["rts_unanswered"] == "20"
+       and C["unanswered_fraction"] == "1.000", "gap C: txrts 0, txnocts 20: attempts 20, fraction 1.0: %s" % C)
+expect(C["reading"] == "chip_attempted_channel_access_rts_rules_out_complete_tx_silence_only"
+       and C["reading_unanswered"] == "20", "gap C: attempted, 20 unanswered")
 ew = [kv(x) for x in out_w if x.startswith("gap=1 eligible")]
 expect([e["chip_init_tx"] for e in ew] == ["0", "0"] and [e["chip_init_tx_clamped"] for e in ew] == ["0", "1"],
        "per window chip_init_tx and clamp flag")
 bl = [kv(x) for x in out_w if x.startswith("baseline ")]
 expect(bl and all("chip_init_tx" in b and "obss" not in b and "rxstrt_other" not in b for b in bl),
        "baseline windows carry chip_init_tx; no obss, no rxstrt_other anywhere")
-expect(not any("rxstrt_other" in x or " obss=" in x or "baseline_median" in x for x in out_w),
-       "the OBSS contention reading is gone")
+expect(not any("rxstrt_other" in x or " obss=" in x or "baseline_median" in x or "txrts0_note" in x for x in out_w),
+       "the OBSS contention reading and the old keys are gone")
 expect(all(x.endswith(LABEL_S) for x in out_w if x.startswith(("gap=", "baseline"))), "wide readings labelled")
 
-# sensitivity low: under half the control windows carry RTS
+# sensitivity low: under half the control windows carry an attempt
 plan_low = [(50_000, RTS_ON if k < 4 else QUIET) for k in range(11)] + \
     [(50_000, {"txrts": 2, "txallfrm": 9, "txackfrm": 1}) for _ in range(3)] + [(50_000, QUIET) for _ in range(6)]
 out_l = wide_leg("wideLow", plan_low, lambda t: [(peer(t[10]) - 0.001, peer(t[13]) + 0.010)])
 L = rts_line(out_l, 0)
-expect(L["rts_sensitivity"] == "low" and L["reading"] == "none" and float(L["control_txrts_positive_fraction"]) < 0.5,
-       "under half the control with RTS: rts_sensitivity=low, no reading: %s" % L)
-expect(L["txrts"] == "6" and L["unanswered_fraction"] == "0.000", "the numbers are still printed")
+expect(L["rts_sensitivity"] == "low" and L["reading"] == "none"
+       and float(L["control_rts_attempt_positive_fraction"]) < 0.5,
+       "under half the control with attempts: rts_sensitivity=low, no reading: %s" % L)
+expect(L["rts_attempts"] == "6" and L["unanswered_fraction"] == "0.000", "the numbers are still printed")
+
+# sensitivity counts attempts, not txrts: control with only unanswered RTS is sensitive
+NOCTS = {"txnocts": 2, "txallfrm": 5, "txackfrm": 5}
+plan_nc2 = [(50_000, NOCTS) for _ in range(11)] + [(50_000, QUIET) for _ in range(3)] + \
+    [(50_000, NOCTS) for _ in range(6)]
+out_s = wide_leg("wideSens", plan_nc2, lambda t: [(peer(t[10]) - 0.001, peer(t[13]) + 0.010)])
+S = rts_line(out_s, 0)
+expect(S["rts_sensitivity"] == "ok" and float(S["control_rts_attempt_positive_fraction"]) >= 0.5
+       and S["control_rts_answered_per_s_median"] == "0.000",
+       "control with txrts 0 but txnocts > 0: sensitive (attempts), %s" % S)
+expect(S["reading"] == "no_rts_attempt_in_sampled_windows_cannot_distinguish_internal_hold_from_cca_deferral",
+       "a quiet hold against it: the no-attempt reading")
 
 # no control of matching length: in-hold windows 150 ms, every other window 50 ms
 plan_nc = [(50_000, RTS_ON) for _ in range(11)] + [(150_000, RTS_ON) for _ in range(3)] + \

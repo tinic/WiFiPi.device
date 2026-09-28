@@ -31,21 +31,23 @@ falsifier: there are no verdicts and nothing is counted across gaps.
                     sampler's own SDIO traffic -- request frame bytes (REQ d)
                     plus reply frame bytes (REP, LATE d>>16) -- over the span
                     from the first REQ to the last sample record
-  gap ... rts       22-field dumps, per gap, over its eligible windows only:
-                    txrts, txnocts, rxrsptmout summed and per second;
-                    unanswered = txnocts / txrts only when txrts rose, else
-                    n/a; rxrsptmout is supporting, not AP attribution;
-                    rxbeaconobss reported only (the chip hears the channel).
-                    Control: the out-of-hold windows of this leg whose
-                    length lies within [0.8 x shortest, 1.2 x longest] of
-                    the gap's eligible windows -- their median rates and the
-                    fraction with txrts > 0.  Under half of them with
-                    txrts > 0 (or none at all): rts_sensitivity=low (or
-                    no_control) and no reading.  Otherwise txrts > 0 in the
-                    gap reads "chip attempted channel access" (rules out
-                    complete TX silence only, not every internal stall),
-                    txrts = 0 reads "no RTS: cannot tell an internal hold
-                    from CCA/backoff" (and says: CCA deferral precedes RTS).
+  gap ... rts       22-field dumps, per gap, over its eligible windows only.
+                    RTS from the dot11 pair: answered = txrts
+                    (dot11RTSSuccessCount), unanswered = txnocts
+                    (dot11RTSFailureCount), attempts = both; sums and per
+                    second; unanswered_fraction = txnocts / attempts, only
+                    when attempts > 0, else n/a.  rxrsptmout: supporting, not
+                    AP attribution.  rxbeaconobss reported only (the chip
+                    hears the channel).  Control: this leg's out-of-hold
+                    windows within [0.8 x shortest, 1.2 x longest] of the
+                    gap's windows -- median rates and the fraction with an
+                    attempt.  Under half (or no control): rts_sensitivity
+                    low (or no_control) and no reading.  Else attempts > 0
+                    reads "chip attempted channel access (RTS)" (rules out
+                    complete TX silence only; reading_unanswered=N when
+                    txnocts > 0), attempts = 0 reads "no RTS attempt in the
+                    sampled windows: cannot tell an internal hold from CCA
+                    deferral".
                     chip_init_tx = txallfrm - txackfrm, per window and per
                     gap against the control median, approx (txallfrm also
                     counts CTS and block-ack responses to received frames)
@@ -209,7 +211,16 @@ def wide_str(iv):
 
 
 RTS_MATCH = (0.8, 1.2)           # control window length vs the gap's eligible windows
-RTS_SENSITIVE = 0.5              # control windows with txrts > 0, at least
+RTS_SENSITIVE = 0.5              # control windows with an RTS attempt, at least
+
+# RTS attempts come from the dot11 pair (WHD whd_wlioctl.h:2061-2062):
+# txrts = dot11RTSSuccessCount (a CTS came back), txnocts =
+# dot11RTSFailureCount (none did).  attempts = txrts + txnocts.  txrtsfrm
+# (RTS frames the MAC sent, :2278) is not sampled.
+
+
+def rts_attempts(iv):
+    return iv["d"]["txrts"] + iv["d"]["txnocts"]
 
 
 def rts_readout(g, inside, base):
@@ -218,41 +229,49 @@ def rts_readout(g, inside, base):
         return None
     total = lambda f: sum(iv["d"][f] for iv in inside)          # noqa: E731
     secs = sum(iv["hi"] - iv["lo"] for iv in inside)
-    rts, nocts, rsp = total("txrts"), total("txnocts"), total("rxrsptmout")
+    answered, unanswered, rsp = total("txrts"), total("txnocts"), total("rxrsptmout")
+    attempts = answered + unanswered
     lens = [iv["hi"] - iv["lo"] for iv in inside]
     lo, hi = min(lens) * RTS_MATCH[0], max(lens) * RTS_MATCH[1]
     ctl = [iv for iv in base if "txrts" in iv["d"] and lo <= iv["hi"] - iv["lo"] <= hi and iv["hi"] > iv["lo"]]
-    rate = lambda iv, f: iv["d"][f] / (iv["hi"] - iv["lo"])      # noqa: E731
 
-    def med(f):
-        v = median([rate(iv, f) for iv in ctl])
+    def med(get):
+        v = median([get(iv) / (iv["hi"] - iv["lo"]) for iv in ctl])
         return "none" if v is None else "%.3f" % v
-    pos = sum(1 for iv in ctl if iv["d"]["txrts"] > 0)
+    pos = sum(1 for iv in ctl if rts_attempts(iv) > 0)
     frac = pos / len(ctl) if ctl else None
     cit = [chip_init_tx(iv) for iv in inside]
     cit_sum = sum(x[0] for x in cit)
     cit_ctl = median([chip_init_tx(iv)[0] / (iv["hi"] - iv["lo"]) for iv in ctl])
+    detail = ""
     if not ctl:
         sens, reading = "no_control", "none"
     elif frac < RTS_SENSITIVE:
         sens, reading = "low", "none"
     else:
         sens = "ok"
-        reading = ("chip_attempted_channel_access_rules_out_complete_tx_silence_only" if rts > 0
-                   else "no_rts_cannot_distinguish_internal_hold_from_cca_backoff")
-    return ("gap=%d rts eligible=%d in_hold_ms=%.3f txrts=%d txnocts=%d rxrsptmout=%d txrts_per_s=%.3f "
-            "txnocts_per_s=%.3f rxrsptmout_per_s=%.3f unanswered_fraction=%s "
+        if attempts > 0:
+            reading = "chip_attempted_channel_access_rts_rules_out_complete_tx_silence_only"
+            if unanswered > 0:
+                detail = " reading_unanswered=%d" % unanswered
+        else:
+            reading = "no_rts_attempt_in_sampled_windows_cannot_distinguish_internal_hold_from_cca_deferral"
+    return ("gap=%d rts eligible=%d in_hold_ms=%.3f rts_attempts=%d rts_answered=%d rts_unanswered=%d "
+            "rxrsptmout=%d rts_attempts_per_s=%.3f rts_answered_per_s=%.3f rts_unanswered_per_s=%.3f "
+            "rxrsptmout_per_s=%.3f unanswered_fraction=%s "
             "rxrsptmout_note=supporting_not_ap_attribution rxbeaconobss=%d rxbeaconobss_note=chip_hears_channel "
-            "control_windows=%d control_len_ms=%.3f..%.3f control_txrts_per_s_median=%s "
-            "control_txnocts_per_s_median=%s control_rxrsptmout_per_s_median=%s "
-            "control_txrts_positive_fraction=%s rts_sensitivity=%s reading=%s%s "
+            "control_windows=%d control_len_ms=%.3f..%.3f control_rts_attempts_per_s_median=%s "
+            "control_rts_answered_per_s_median=%s control_rts_unanswered_per_s_median=%s "
+            "control_rxrsptmout_per_s_median=%s control_rts_attempt_positive_fraction=%s "
+            "rts_sensitivity=%s reading=%s%s "
             "chip_init_tx=%d chip_init_tx_per_s=%.3f chip_init_tx_approx=1 chip_init_tx_clamped=%d "
             "control_chip_init_tx_per_s_median=%s control_chip_init_tx_clamped=%d chip_init_tx_reading=%s %s" % (
-                g, len(inside), secs * 1e3, rts, nocts, rsp, rts / secs, nocts / secs, rsp / secs,
-                "%.3f" % (nocts / rts) if rts > 0 else "n/a", total("rxbeaconobss"),
-                len(ctl), lo * 1e3, hi * 1e3, med("txrts"), med("txnocts"), med("rxrsptmout"),
-                "none" if frac is None else "%.3f" % frac, sens, reading,
-                " txrts0_note=cannot_separate_internal_hold_from_cca_deferral_deferral_precedes_rts" if rts == 0 else "",
+                g, len(inside), secs * 1e3, attempts, answered, unanswered, rsp,
+                attempts / secs, answered / secs, unanswered / secs, rsp / secs,
+                "%.3f" % (unanswered / attempts) if attempts > 0 else "n/a", total("rxbeaconobss"),
+                len(ctl), lo * 1e3, hi * 1e3, med(rts_attempts), med(lambda iv: iv["d"]["txrts"]),
+                med(lambda iv: iv["d"]["txnocts"]), med(lambda iv: iv["d"]["rxrsptmout"]),
+                "none" if frac is None else "%.3f" % frac, sens, reading, detail,
                 cit_sum, cit_sum / secs, sum(1 for x in cit if x[1]),
                 "none" if cit_ctl is None else "%.3f" % cit_ctl, sum(1 for iv in ctl if chip_init_tx(iv)[1]),
                 "chip_mac_transmitted_non_ack_frames_in_hold_approx_may_include_cts_ba_responses" if cit_sum > 0
