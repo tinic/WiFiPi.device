@@ -1763,6 +1763,17 @@ static int Do_S2_CONFIGINTERFACE(struct IOSana2Req *io)
         {
             CFG_ALIVE(PacketCmdInt(sdio, 0x56, 2));
         }
+#ifdef WIFIPI_NOAMPDURTS
+        /* #89 R-class holds: A-MPDUs (our pure ACKs) without RTS; set before the join with its result
+           in the ring (RT_BTC op 2, name 5), so a firmware that refuses it is visible */
+        {
+            LONG r = PacketSetVarInt(sdio, "ampdu_rts", 0);
+#ifdef WIFIPI_RINGTRACE
+            RtPut(sdio, RT_BTC, BTC_OP_SET, BTC_NAME_AMPDU_RTS, 0, (ULONG)r);
+#endif
+            CFG_ALIVE(r);
+        }
+#endif
 
         CFG_ALIVE(PacketSetVarInt(sdio, "bus:txglom", 1));
         CFG_ALIVE(PacketSetVarInt(sdio, "bus:txglomalign", 4));
