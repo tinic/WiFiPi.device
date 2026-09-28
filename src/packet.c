@@ -3894,6 +3894,17 @@ void StartPacketReceiver(struct SDIO *sdio)
     for (int i=0; i < 128; i++) { if (ver[i] == 13 || ver[i] == 10) { ver[i] = 0; break; } }
     D(bug("[WiFi] Firmware version: %s\n", (ULONG)ver));
 
+    if (sdio->s_Chip->c_Country[0])
+    {
+        /* struct brcmf_fil_country_le: abbrev[4], rev (LE32, -1 = firmware's default rev), ccode[4] */
+        UBYTE cq[12];
+        for (int i = 0; i < 12; i++) cq[i] = 0;
+        cq[0] = cq[8] = sdio->s_Chip->c_Country[0];
+        cq[1] = cq[9] = sdio->s_Chip->c_Country[1];
+        cq[4] = cq[5] = cq[6] = cq[7] = 0xff;
+        PacketSetVar(sdio, "country", cq, 12);
+    }
+
     PacketSetVarInt(sdio, "roam_off", 1);
 
     PacketCmdInt(sdio, BRCMF_C_SET_INFRA, 1);

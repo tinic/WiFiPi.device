@@ -150,6 +150,7 @@ struct Chip {
 
     UBYTE               c_D11Type;
 
+    char                c_Country[4];   /* #89 debug: ENV:WiFiPi/Country, two letters, or empty */
 #ifdef WIFIPI_FWINFO
     struct FwInfo       c_FwInfo;   /* boot-time firmware record (#89), src/fwinfo.h */
 #endif

@@ -251,6 +251,19 @@ BOOL LoadFirmware(struct Chip *chip)
     Write(file, buf, 4);
     Close(file);
 
+    {
+        /* #89 debug: regulatory country from ENV:WiFiPi/Country, two letters */
+        char cc[8];
+        LONG n = GetVar((CONST_STRPTR)"WiFiPi/Country", (STRPTR)cc, sizeof(cc), GVF_GLOBAL_ONLY);
+        chip->c_Country[0] = 0;
+        if (n == 2 && cc[0] >= 'A' && cc[0] <= 'Z' && cc[1] >= 'A' && cc[1] <= 'Z')
+        {
+            chip->c_Country[0] = cc[0];
+            chip->c_Country[1] = cc[1];
+            chip->c_Country[2] = 0;
+        }
+    }
+
 #ifdef WIFIPI_FWINFO
     /* One directory for all three files, chosen before the first: the
        stock DEVS:Firmware, or ENV:WiFiPi/FirmwareDir when it is set.  A
