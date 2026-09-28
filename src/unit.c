@@ -1590,6 +1590,15 @@ static int Do_Btc(struct IOSana2Req *io)
                 v |= (get_extgpio_state(g, unit->wu_Base) & 1) << g;
             rc = 0;
         }
+        else if (id == BTC_NAME_COUNTRY)    /* #89: ccode chars in bytes 3/2, rev in the low half */
+        {
+            ULONG cw[3];                    /* no aggregate init: it links memset */
+            UBYTE *c = (UBYTE *)cw;
+            cw[0] = cw[1] = cw[2] = 0;
+            rc = PacketGetVarMin(sdio, (char *)btc_name(id), c, 12, 12);
+            if (rc == 0)
+                v = ((ULONG)c[8] << 24) | ((ULONG)c[9] << 16) | (c[4] | (c[5] << 8));
+        }
         else
         {
             rc = PacketGetVarMin(sdio, (char *)btc_name(id), &raw, 4, 4);
