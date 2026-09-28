@@ -746,6 +746,12 @@ void ProcessEvent(struct SDIO *sdio, struct PacketEvent *pe)
             else
             {
                 D(bug("[WiFi] E_LINK up\n"));
+#ifdef WIFIPI_PMLINK
+                /* #89: PM is set to 0 only before the join; re-assert it on every link up, in case the
+                   firmware re-arms power save on association (PM1/PM2 buffers our downlink at the AP) */
+                if (sdio->s_Chip->c_ChipID == BRCM_CC_43430_CHIP_ID || sdio->s_Chip->c_ChipID == BRCM_CC_4345_CHIP_ID)
+                    PacketCmdIntAsync(sdio, BRCMF_C_SET_PM, 0);
+#endif
                 unit->wu_Flags |= IFF_CONNECTED;
                 ReportEvents(unit, S2EVENT_CONNECT);
             }

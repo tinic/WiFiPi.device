@@ -1578,9 +1578,18 @@ static int Do_Btc(struct IOSana2Req *io)
     if (b->br_Op == BTC_OP_GET)
     {
         ULONG raw = 0;
-        rc = PacketGetVarMin(sdio, (char *)btc_name(id), &raw, 4, 4);
-        if (rc == 0)
-            v = LE32(raw);
+        if (id == BTC_NAME_PM)          /* #89: the live power-save mode, WLC GET_PM (a command, not an iovar) */
+        {
+            rc = PacketCmdIntGet(sdio, BRCMF_C_GET_PM, &raw);
+            if (rc == 0)
+                v = raw;
+        }
+        else
+        {
+            rc = PacketGetVarMin(sdio, (char *)btc_name(id), &raw, 4, 4);
+            if (rc == 0)
+                v = LE32(raw);
+        }
         b->br_Value = v;
     }
     else
