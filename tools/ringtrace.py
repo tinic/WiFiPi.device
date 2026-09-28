@@ -412,8 +412,10 @@ def cmd_rxjoin(dump, pcap, start, end, w=TXJOIN_W, times=None):
     sent more than once in the window, each copy listed with its delay), UNSEEN (none, the window inside the capture) or
     CENSORED.  A SEEN frame names its copy by send order among all the capture's copies
     of that key: original, or retx N (the original may lie outside the window).
-    Then the gap's END edge: the last peer segment sent before END (the exit
-    segment), when the host read it, and the first host ACK after that read covering it."""
+    The edge: the release ACK (first host ACK whose unique peer arrival is in (START, END]),
+    its trigger (latest SEEN host data read before it that it covers), their delays; the
+    resume segment (the peer's frame at END) apart.  Exits no_rx_identity when the ring
+    holds no RX identity records within [START - W, END + W]."""
     h, recs = load(dump)
     m = model(pings(recs, marks_from_pcap(pcap)))
     lo, hi, w = float(start), float(end), max(float(w), TXJOIN_W_MIN)
@@ -428,6 +430,10 @@ def cmd_rxjoin(dump, pcap, start, end, w=TXJOIN_W, times=None):
         v.sort(key=lambda p: p["ep"])
         for i, p in enumerate(v):
             p["copy"] = i
+    # a ring without RX identity near the window (a pre-RX driver, a pre-arm ring) cannot answer
+    near = [r for r in recs if r["k"] in (17, 18, 19) and lo - w <= to_peer(m, r["t"] / 1e6) <= hi + w]
+    if not near:
+        sys.exit("ringtrace=fail reason=no_rx_identity (no RXID/RXO record within [START - W, END + W])")
     rxs = rx_frames(recs)
     # covered: nothing lost, or the first kept record precedes the earliest send a frame here could match
     first_t = to_peer(m, recs[0]["t"] / 1e6) if recs else None
@@ -479,38 +485,72 @@ def cmd_rxjoin(dump, pcap, start, end, w=TXJOIN_W, times=None):
             ",".join("%s=%d" % kv for kv in sorted(outc.items()))))
     if delays:
         print("rx_delay_ms n=%d max=%.3f (inside W only)" % (len(delays), max(delays)))
-    # the END edge: exit segment (last peer data segment sent before END), its host read, the release ACK
+    # the edge, anchored on the release ACK: the first host ACK whose unique peer arrival is in
+    # (START, END]; its trigger is the latest SEEN host data read before that ACK which it covers.
+    # END is the peer's first frame after the gap: the last peer segment at or before END is the
+    # resume, reported apart and not used for the edge.  Clocks: host_* values are the ring's CLO
+    # (us) and their peer mapping; peer_* values are the capture's.  A delay across the two carries
+    # the alignment bound; one inside the ring carries ~0.  Without an edge rxjoin exits 3.
+    bms = m["bound"] * 1e3
+    dflows = {(p["dst"][3], p["src"][3], p["dport"], p["sport"]) for p in segs if p["len"] > 0}
+    ptx = byk_tx(peer)
+    rel, cand_rel = None, []
+    for a in sorted(tx_frames(recs), key=lambda f: f["t"]):
+        if not a["flags"] & 0x10 or (a["src"], a["dst"], a["sport"], a["dport"]) not in dflows:
+            continue
+        at = to_peer(m, a["t"] / 1e6)
+        cand = [p for p in ptx.get(txkey(a), []) if at - m["bound"] <= p["ep"] <= at + w]
+        if any(lo < p["ep"] <= hi for p in cand):
+            rel, cand_rel = a, cand
+            break
+    why = None
+    if rel is None:
+        why = "no host ACK with a peer arrival in (START, END]"
+    elif len(cand_rel) != 1:
+        why = "release ACK ambiguous: %d peer copies of its identity in the join window" % len(cand_rel)
+    else:
+        at = to_peer(m, rel["t"] / 1e6)
+        print("release_ack host_tx_clo_us=%d host_tx_peer=%.6f ack=%d ip_id=%d peer_rx_peer=%.6f write=%s "
+              "unique=one peer copy of its full identity in [host_tx-bound, host_tx+W]; first host ACK arriving in (START, END]" % (
+                  rel["t"], at, rel["ack"], rel["ipid"], cand_rel[0]["ep"], rel["write"]))
+        covd = [fr for fr in rxs if fr["len"] > 0 and fr["pt"] < at
+                and fr["src"] == rel["dst"] and fr["dst"] == rel["src"]
+                and fr["sport"] == rel["dport"] and fr["dport"] == rel["sport"]
+                and seq_after(rel["ack"], (fr["seq"] + fr["len"]) & 0xffffffff)]
+        seen = [fr for fr in covd if fr["cls"] == "SEEN"]
+        if not seen:
+            why = "no SEEN host data read before the release ACK that it covers"
+        else:
+            r = max(seen, key=lambda f: f["pt"])
+            c = r["cand"][0]
+            rival = [fr for fr in covd if fr is not r and fr["pt"] >= r["pt"]]
+            print("trigger_evidence seq_end=%d <= ack=%d; other covered reads between it and the ACK: %d%s" % (
+                (r["seq"] + r["len"]) & 0xffffffff, rel["ack"], len(rival),
+                "" if not rival else " (%s)" % ",".join("seq=%d:%s" % (f["seq"], f["cls"]) for f in rival)))
+            if rival:
+                why = "trigger ambiguous: %d other covered read(s) at or after the chosen read" % len(rival)
+            else:
+                rd = (r["pt"] - c["ep"]) * 1e3          # across clocks: carries the bound
+                ap = (rel["t"] - r["t"]) / 1e3          # same clock: straight from the ring
+                print("trigger_segment peer_tx_peer=%.6f seq=%d len=%d segment=%d/%dB host_rx_clo_us=%d host_rx_peer=%.6f outcome=%s" % (
+                    c["ep"], r["seq"], r["len"], c["k"], c["super_len"], r["t"], r["pt"], r["outcome"]))
+                larger = "unresolved" if abs(rd - ap) <= bms else ("upstream_delivery" if rd > ap else "host_ack_production")
+                print("edge read_delay_ms=%.3f+-%.3f (peer_tx to host_rx, across clocks) "
+                      "ack_production_ms=%.3f+-0.001 (host_rx to host_tx, ring clock) larger=%s" % (rd, bms, ap, larger))
+    if why:
+        print("edge unavailable (%s)" % why)
     ex = [p for p in segs if p["len"] > 0 and lo - w <= p["ep"] <= hi]
     if ex:
         e = max(ex, key=lambda p: (p["ep"], p["super"], p["k"]))
         got = [fr for fr in rxs if fr["cls"] == "SEEN" and fr["cand"][0] is e]
-        print("exit_segment peer_tx_t=%.6f seq=%d len=%d segment=%d/%dB" % (e["ep"], e["seq"], e["len"], e["k"], e["super_len"]))
-        if got:
-            r = got[0]
-            print("exit_segment host_rx_t=%.6f read_delay_ms=%.3f outcome=%s" % (r["pt"], (r["pt"] - e["ep"]) * 1e3, r["outcome"]))
-            want = (e["seq"] + e["len"]) & 0xffffffff
-            acks = [f for f in tx_frames(recs)
-                    if f["flags"] & 0x10 and f["sport"] == e["dport"] and f["dport"] == e["sport"]
-                    and f["src"] == e["dst"][3] and f["dst"] == e["src"][3]
-                    and to_peer(m, f["t"] / 1e6) >= r["pt"] and seq_after(f["ack"], want)]
-            if acks:
-                a = min(acks, key=lambda f: f["t"])
-                at = to_peer(m, a["t"] / 1e6)
-                seen = [p for p in byk_tx(peer).get(txkey(a), []) if at - m["bound"] <= p["ep"] <= at + w]
-                print("release_ack host_tx_t=%.6f ack=%d ip_id=%d ack_production_ms=%.3f peer_rx_t=%s write=%s" % (
-                    at, a["ack"], a["ipid"], (at - r["pt"]) * 1e3,
-                    "%.6f" % seen[0]["ep"] if len(seen) == 1 else ("ambiguous" if seen else "unseen"), a["write"]))
-                rd, ap = (r["pt"] - e["ep"]) * 1e3, (at - r["pt"]) * 1e3
-                print("edge read_delay_ms=%.3f ack_production_ms=%.3f larger=%s" % (
-                    rd, ap, "upstream_delivery" if rd > ap else "host_ack_production"))
-            else:
-                print("release_ack none (no host ACK covering seq %d after the read)" % want)
-        else:
-            print("exit_segment host_rx_t=none (not matched uniquely at the host handoff)")
-    else:
-        print("exit_segment none (no peer data segment in the window)")
+        print("resume_segment peer_tx_peer=%.6f seq=%d len=%d segment=%d/%dB host_rx=%s (the peer's frame at END, after the gap; not the edge)" % (
+            e["ep"], e["seq"], e["len"], e["k"], e["super_len"],
+            "clo_us=%d peer=%.6f" % (got[0]["t"], got[0]["pt"]) if got else "unavailable"))
     print("received_at_host=%d seen=%d unseen=%d ambiguous=%d censored=%d" % (
         len(inw), tot["SEEN"], tot["UNSEEN"], tot["AMBIGUOUS"], tot["CENSORED"]))
+    if why:
+        sys.stderr.write("ringtrace=fail reason=edge_unavailable (%s)\n" % why)
+        sys.exit(3)
 
 
 def byk_tx(peer):

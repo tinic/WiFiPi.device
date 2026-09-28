@@ -12,7 +12,12 @@ sent (unseen), and a near miss in payload length that must not match.
 Gap C: the peer's GSO super-frames (captured before segmentation) matched
 segment by segment; a retransmit whose original lies outside the window
 (SEEN, retx1); two copies inside the window (AMBIGUOUS, both listed); and an
-exit edge whose last frame is a 2920 B super-frame (exit = its 2nd segment).
+edge whose trigger is a 2920 B super-frame's 2nd segment.
+Gap D: the edge is anchored on the release ACK (first host ACK arriving at the
+peer inside the gap), its trigger read differs from the resume frame at END.
+Also: an unresolved edge (the delays within the clock bound), no release ACK
+and an ambiguous trigger (rxjoin exits 3, "unavailable", no zeros), and a ring
+without RX identity (no_rx_identity).
 """
 import os
 import struct
@@ -135,7 +140,26 @@ superframe(peer(EXC) - 0.001, 60000, 2920)
 rxseg(EXC, 60000, 1460, 0x10, 0x906); rxseg(EXC + 50, 61460, 1460, 0x18, 0x907)
 ack(EXC + 100_000, 0x502, 62920, 3)
 C_END = EXC + 103_000
-t += 2_000_000 + 1_000_000
+# gap D: trigger read 1 ms after its send, release ACK 100 ms later (arrives in the gap),
+# then the peer's resume frame at END, read 2 ms after it
+D0 = C_END + 1_000_000
+data(D0, 1, 0xD00, 90000)                                  # trigger: seq 90000..91448
+ack(D0 + 100_000, 0x503, 91448, 3)                         # release ACK, at the peer 103 ms after the read
+RES = D0 + 150_000
+data(RES + 2_000, 2, 0xD01, 91448)                         # resume frame, sent at RES
+D_END_T = RES                                              # END = the resume frame's send (peer clock via peer())
+# gap U: read 5 ms after send, ACK 5.5 ms after the read: inside the clock bound
+U0 = RES + 500_000
+data(U0, 5, 0xE00, 95000)
+ack(U0 + 5_500, 0x504, 96448, 1)
+U_END = U0 + 8_000
+# gap Q: a covered read after the SEEN one that the peer never sent (UNSEEN): trigger ambiguous
+Q0 = U_END + 500_000
+data(Q0, 1, 0xF00, 97000)
+data(Q0 + 1_000, 1, 0xF01, 98448, sent=False)
+ack(Q0 + 50_000, 0x505, 99896, 3)
+Q_END = Q0 + 54_000
+t = Q_END + 1_000_000
 for s in range(5, 10):
     ping(t + (s - 5) * 100_000, s)
 
@@ -151,7 +175,7 @@ open(pcap, "wb").write(b"".join(pk))
 
 h, rs = ringtrace.load(dump)
 rx = ringtrace.rx_frames(rs)
-expect(len(rx) == 16 and [f["outcome"] for f in rx[:3]] == ["read", "orphan", "dropped"], "RX pairs and outcomes decoded")
+expect(len(rx) == 21 and [f["outcome"] for f in rx[:3]] == ["read", "orphan", "dropped"], "RX pairs and outcomes decoded")
 
 
 def run(lo, hi):
@@ -169,7 +193,7 @@ def num(lines, key, *parts, near=None, tol=0.2):
     """the value of key= on the line holding every part, within tol of near"""
     for l in lines:
         if all(p in l for p in parts) and key + "=" in l:
-            v = float(l.split(key + "=")[1].split()[0])
+            v = float(l.split(key + "=")[1].split()[0].split("+-")[0])
             return near is None or abs(v - near) <= tol
     return False
 expect(num(a, "delay_ms", "ip_id=256 ", "outcome=read SEEN", near=2.0), "A: data frame seen, 2 ms")
@@ -177,10 +201,12 @@ expect(has(a, "ip_id=257 ", "outcome=orphan SEEN"), "A: orphaned frame reported"
 expect(has(a, "ip_id=258 ", "outcome=dropped SEEN"), "A: dropped frame reported")
 expect(has(a, "ip_id=259 ", "UNSEEN"), "A: frame the peer never sent is unseen")
 expect(has(a, "ip_id=260 ", "UNSEEN"), "A: payload-length near miss does not match")
-expect(has(a, "exit_segment peer_tx_t=", "seq=6792 len=1448"), "A: exit frame found")
-expect(num(a, "read_delay_ms", "exit_segment host_rx_t=", "outcome=read", near=1.0), "A: exit frame read 1 ms after its send")
-expect(num(a, "ack_production_ms", "release_ack host_tx_t=", "ack=8240", "write=ok", near=100.0), "A: release ACK 100 ms after the read")
-expect(has(a, "edge read_delay_ms=", "larger=host_ack_production"), "A: host ACK production")
+expect(has(a, "release_ack host_tx_clo_us=", "ack=8240", "write=ok", "unique=one peer copy"), "A: release ACK found, with why it is unique")
+expect(has(a, "trigger_evidence seq_end=8240 <= ack=8240; other covered reads between it and the ACK: 0"), "A: trigger evidence")
+expect(has(a, "trigger_segment peer_tx_peer=", "seq=6792 len=1448", "host_rx_clo_us=", "host_rx_peer="), "A: trigger is the frame the ACK covers, both clocks")
+expect(num(a, "read_delay_ms", "edge ", near=1.0), "A: read 1 ms after its send")
+expect(num(a, "ack_production_ms", "edge ", near=100.0), "A: ACK 100 ms after the read")
+expect(has(a, "edge read_delay_ms=", "+-1.150 (peer_tx to host_rx, across clocks)", "+-0.001 (host_rx to host_tx, ring clock)", "larger=host_ack_production"), "A: host ACK production, uncertainty shown")
 expect(a[-1] == "received_at_host=6 seen=4 unseen=2 ambiguous=0 censored=0", "A: summary")
 expect(" covered=1 lost=0" in a[0], "A: coverage in the header")
 early = run(peer(BASE) - 5, peer(A_END))
@@ -225,8 +251,8 @@ expect(has(a, "arrived frames=6 ", "outcomes=dropped=1,orphan=1,read=4"), "A: ar
 
 b = run(peer(EXB) - 0.2, peer(B_END))
 print("\n".join(b))
-expect(num(b, "read_delay_ms", "exit_segment host_rx_t=", near=100.0), "B: exit frame read 100 ms after its send")
-expect(num(b, "ack_production_ms", "release_ack host_tx_t=", near=1.0), "B: release ACK 1 ms after the read")
+expect(num(b, "read_delay_ms", "edge ", near=100.0), "B: trigger read 100 ms after its send")
+expect(num(b, "ack_production_ms", "edge ", near=1.0), "B: release ACK 1 ms after the read")
 expect(has(b, "edge read_delay_ms=", "larger=upstream_delivery"), "B: delivery upstream of the host")
 
 c = run(peer(C0) - 0.01, peer(C_END))
@@ -237,15 +263,41 @@ for sq, k in ((30000, 0), (31460, 1), (32920, 2)):
 expect(has(c, "seq=32920 ", "flags=PA", "SEEN"), "C: PSH only on the last segment")
 expect(has(c, "seq=40000 ", "SEEN", "copy=retx1") and num(c, "delay_ms", "seq=40000 ", near=2.0, tol=0.3), "C: retransmit, original outside W: SEEN retx1")
 expect(has(c, "seq=50000 ", "AMBIGUOUS retx_candidates=2 copies=original@", ",retx1@"), "C: two copies inside W: AMBIGUOUS, both listed")
-expect(has(c, "exit_segment peer_tx_t=", "seq=61460 len=1460 segment=1/2920B"), "C: exit = the 2920 B super-frame's second segment")
-expect(num(c, "read_delay_ms", "exit_segment host_rx_t=", near=1.0, tol=0.3), "C: exit segment read 1 ms after its send")
-expect(num(c, "ack_production_ms", "release_ack host_tx_t=", "ack=62920", near=100.0, tol=0.3), "C: release ACK covers the whole super-frame, 100 ms")
+expect(has(c, "trigger_segment peer_tx_peer=", "seq=61460 len=1460 segment=1/2920B"), "C: trigger = the 2920 B super-frame's second segment")
+expect(num(c, "read_delay_ms", "edge ", near=1.0, tol=0.3), "C: trigger read 1 ms after its send")
+expect(num(c, "ack_production_ms", "edge ", near=99.95, tol=0.3), "C: release ACK covers the whole super-frame, about 100 ms")
 expect(has(c, "seq=71460 ", "len=1276", "SEEN", "segment=1/2736B"), "C: 2736 B super-frame's 1276 B tail matched")
 segs = ringtrace.peer_segments(ringtrace.peer_tcp(pcap))
 expect([(p["seq"], p["len"], p["flags"]) for p in segs if p["super_len"] == 2736] == [(70000, 1460, 0x10), (71460, 1276, 0x18)],
        "peer_segments: the last segment is the payload minus (n-1) x 1460")
 sf = [p for p in segs if p["super_len"] == 4380]
 expect([(p["seq"], p["len"], p["flags"]) for p in sf] == [(30000, 1460, 0x10), (31460, 1460, 0x10), (32920, 1460, 0x18)], "peer_segments split rule")
+
+def run2(lo, hi, path=None):
+    r = subprocess.run([sys.executable, TOOL, "rxjoin", path or dump, pcap, "%.6f" % lo, "%.6f" % hi], capture_output=True, text=True)
+    return r.returncode, r.stdout.splitlines(), r.stderr
+
+rc, dd, _ = run2(peer(D0) - 0.01, peer(D_END_T) + 0.0001)
+print("\n".join(dd))
+expect(rc == 0, "D: edge available, rc 0")
+expect(has(dd, "trigger_segment peer_tx_peer=", "seq=90000 len=1448"), "D: edge on the trigger read, not the resume frame")
+expect(has(dd, "resume_segment peer_tx_peer=", "seq=91448", "not the edge"), "D: resume frame reported apart")
+expect(num(dd, "read_delay_ms", "edge ", near=1.0) and num(dd, "ack_production_ms", "edge ", near=100.0), "D: 1 ms read, 100 ms ACK production")
+rc, uu, _ = run2(peer(U0) - 0.01, peer(U_END))
+expect(rc == 0 and has(uu, "edge read_delay_ms=", "larger=unresolved"), "U: delays within the bound: unresolved")
+rc, nn, err = run2(peer(RES) + 0.05, peer(RES) + 0.2)          # no host ACK arrives in this window
+expect(rc == 3 and has(nn, "edge unavailable (no host ACK") and "edge_unavailable" in err and not has(nn, "edge read_delay_ms="),
+       "N: no release ACK: unavailable, exit 3, no numbers")
+rc, qq, err = run2(peer(Q0) - 0.01, peer(Q_END))
+print("\n".join(l for l in qq if "trigger" in l or "edge" in l))
+expect(rc == 3 and has(qq, "trigger_evidence", "other covered reads between it and the ACK: 1", "UNSEEN") and has(qq, "edge unavailable (trigger ambiguous"),
+       "Q: an unmatched covered read after the SEEN one: trigger ambiguous, exit 3")
+norx = os.path.join(d, "norx.bin")                          # the same pings, no RX identity records
+kept = [r for r in recs if r[1] == 11]
+open(norx, "wb").write(struct.pack(">IHHIIIIII", 0x52544431, 1, 16, 1 << 22, len(kept), 0, len(kept), 0, (t + 900_000) & 0xFFFFFFFF)
+                       + b"".join(struct.pack(">IBBHII", *r) for r in kept))
+rc, oo, err = run2(peer(A0), peer(A_END), norx)
+expect(rc != 0 and "no_rx_identity" in err and not oo, "a ring without RX identity: no_rx_identity, nothing printed")
 
 print("RESULT test_rxjoin checks=%d failures=%d" % (checks, failures))
 sys.exit(1 if failures else 0)
