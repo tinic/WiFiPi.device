@@ -240,5 +240,28 @@ expect(leg["sdio_bytes"] == str(want) and leg["span_s"] == "%.3f" % ((last - req
        and leg["sdio_bytes_per_s"] == "%.1f" % (want / ((last - reqs[0]) / 1e6)), "leg SDIO bytes from the records")
 expect(summ["skipped_no_credit"] == "1", "summary carries no_credit")
 
+# --- BTC records (kind 29): listed by `btc`, invisible to `samples` -------
+btc = [(t + 10, 29, 2, 1, 1, 0), (t + 20, 29, 1, 3, 0, 0xFFFFFFE9), (t + 30, 29, 2, 0, 0, 0x7FFF0100),
+       (t + 40, 29, 1, 1, 0, 0x7FFF0001)]
+recs2 = sorted(recs + btc, key=lambda r: r[0])
+dump2 = os.path.join(tmp, "ring_btc.bin")
+with open(dump2, "wb") as f:
+    f.write(struct.pack(">IHHIIIIII", 0x52544431, 1, 16, 1 << 22, len(recs2), 0, len(recs2), 0,
+                        recs2[-1][0]) + b"".join(struct.pack(">IBBHII", *r) for r in recs2))
+r2 = subprocess.run([sys.executable, TOOL, "samples", dump2, mk, gp, "--gap", "%.6f" % G3_LO, "%.6f" % G3_HI],
+                    capture_output=True, text=True)
+expect(r2.returncode == 0 and r2.stdout == r.stdout, "samples output byte-identical with BTC records in the ring")
+rb = subprocess.run([sys.executable, TOOL, "btc", dump2], capture_output=True, text=True)
+bl = rb.stdout.splitlines()
+expect(rb.returncode == 0 and len(bl) == 5 and bl[-1] == "btc_records=4", "btc lists the four: %s" % bl)
+expect(bl[0].endswith("op=set name=btc_mode value=1 rc=0"), bl[0])
+expect(bl[1].endswith("op=get name=btc_dos_status value=0 rc=-23"), bl[1])
+expect(bl[2].endswith("op=set name=refused value=0 rc=driver_refused"), bl[2])
+expect(bl[3].endswith("op=get name=btc_mode value=0 rc=ctrl_timeout"), bl[3])
+rb0 = subprocess.run([sys.executable, TOOL, "btc", dump], capture_output=True, text=True)
+expect(rb0.stdout == "btc_records=0\n", "no BTC records: btc_records=0")
+bh = open(os.path.join(HERE, "..", "src", "btc.h")).read()
+expect(re.search(r"#define RT_BTC\s+29\b", bh) is not None and wlsample.K_BTC == 29, "RT_BTC is kind 29 on both sides")
+
 print("RESULT test_wlsample checks=%d failures=%d" % (checks, failures))
 sys.exit(1 if failures else 0)

@@ -2,6 +2,7 @@
 """In-leg firmware counter samples from a ringdump (AmiNetXDuo #89).
 
   wlsample.py samples DUMP MARKS [GAPS] [--gap START END]...
+  wlsample.py btc DUMP                  the BT-coexistence records (hw34)
 
 DUMP is a ringdump from a driver built with -DWIFIPI_WLSAMPLE
 -DWIFIPI_RINGTRACE after `wlsample ENABLE`; MARKS the peer's alignment pings
@@ -51,6 +52,10 @@ FIELDS = ("tbtt", "rxbeaconmbss", "rxframe", "rxcrsglitch", "rxbadplcp",
 REP_STATUS = {0: "ok", 1: "bad_layout", 2: "fw_error"}
 SKIP_REASON = {1: "slot_busy", 2: "ctrl_busy", 3: "nomem", 4: "stopped", 5: "no_credit"}
 STOP_REASON = {1: "idcap", 2: "disabled", 3: "wrap", 4: "id_space"}
+K_BTC = 29                                  # src/btc.h RT_BTC
+BTC_OP = {1: "get", 2: "set"}
+BTC_NAME = {1: "btc_mode", 2: "btc_flags", 3: "btc_dos_status"}
+BTC_RC_REFUSED = 0x7fff0100
 BEACON_S = 0.1024
 LABEL = "label=descriptive_association_not_a_falsifier"
 
@@ -229,7 +234,32 @@ def cmd_samples(dump, marks, gaps_path=None, extra=()):
     return out
 
 
+def cmd_btc(dump):
+    """one line per RT_BTC record: op, name, value, rc (a signed firmware status,
+    ctrl_* for no answer, driver_refused for a request never sent)"""
+    h, recs = rt.load(dump)
+    out = []
+    for r in recs:
+        if r["k"] != K_BTC:
+            continue
+        rc = r["d"]
+        if rc == BTC_RC_REFUSED:
+            rcs = "driver_refused"
+        elif 0x7fff0001 <= rc <= 0x7fff0004:
+            rcs = ("ctrl_timeout", "ctrl_nores", "ctrl_short", "ctrl_toobig")[rc - 0x7fff0001]
+        else:
+            rcs = str(rc - (1 << 32) if rc & 0x80000000 else rc)
+        out.append("btc t_us=%d clo=%d op=%s name=%s value=%d rc=%s" % (
+            r["t"], r["clo"], BTC_OP.get(r["a"], "invalid"), BTC_NAME.get(r["b"], "refused"), r["c"], rcs))
+    out.append("btc_records=%d" % len(out))
+    return out
+
+
 def main(argv):
+    if len(argv) == 2 and argv[0] == "btc":
+        for line in cmd_btc(argv[1]):
+            print(line)
+        return 0
     if len(argv) >= 3 and argv[0] == "samples":
         pos, extra, i = [], [], 1
         while i < len(argv):

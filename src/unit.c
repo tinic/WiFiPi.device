@@ -32,6 +32,9 @@
 #ifdef WIFIPI_WLCNT
 #include "wlcnt.h"
 #endif
+#ifdef WIFIPI_BTC
+#include "btc.h"
+#endif
 
 #define D(x) x
 #define UNIT_STACK_SIZE (32768 / sizeof(ULONG))
@@ -1550,6 +1553,48 @@ static int Do_WlCnt(struct IOSana2Req *io)
 }
 #endif
 
+#ifdef WIFIPI_BTC
+/* BT coexistence iovars (#89 hw34): struct BtcReq in ios2_Data.  GET
+   btc_mode / btc_flags / btc_dos_status, SET btc_mode only; the rest is
+   refused before anything is sent.  Every op, refused ones too, is an
+   RT_BTC record. */
+static int Do_Btc(struct IOSana2Req *io)
+{
+    struct WiFiUnit *unit = (struct WiFiUnit *)io->ios2_Req.io_Unit;
+    struct SDIO *sdio = unit->wu_Base->w_SDIO;
+    struct BtcReq *b = io->ios2_Data;
+    ULONG id, v = 0;
+    LONG rc;
+
+    if (b == NULL || io->ios2_DataLength < sizeof(*b) ||
+        (id = btc_check(b->br_Op, b->br_Name)) == 0)
+    {
+        if (b != NULL && io->ios2_DataLength >= sizeof(*b))
+            b->br_Rc = (LONG)BTC_RC_REFUSED;
+        io->ios2_Req.io_Error = S2ERR_BAD_ARGUMENT;
+        RtPut(sdio, RT_BTC, b && io->ios2_DataLength >= sizeof(*b) ? (UBYTE)b->br_Op : 0, 0, 0, BTC_RC_REFUSED);
+        return 1;
+    }
+    if (b->br_Op == BTC_OP_GET)
+    {
+        ULONG raw = 0;
+        rc = PacketGetVarMin(sdio, (char *)btc_name(id), &raw, 4, 4);
+        if (rc == 0)
+            v = LE32(raw);
+        b->br_Value = v;
+    }
+    else
+    {
+        v = b->br_Value;
+        rc = PacketSetVarInt(sdio, "btc_mode", v);
+    }
+    b->br_Rc = rc;
+    io->ios2_Req.io_Error = 0;
+    RtPut(sdio, RT_BTC, (UBYTE)b->br_Op, id, v, (ULONG)rc);
+    return 1;
+}
+#endif
+
 /* The receiver task's counters (struct SDIO s_Stat*), one record each */
 static int Do_S2_GETSPECIALSTATS(struct IOSana2Req *io)
 {
@@ -2058,6 +2103,11 @@ void HandleRequest(struct IOSana2Req *io)
 #ifdef WIFIPI_WLCNT
             case WIFIPI_CMD_WLCNT:
                 complete = Do_WlCnt(io);
+                break;
+#endif
+#ifdef WIFIPI_BTC
+            case WIFIPI_CMD_BTC:
+                complete = Do_Btc(io);
                 break;
 #endif
 #ifdef WIFIPI_WLSAMPLE
