@@ -1590,6 +1590,11 @@ static int Do_Btc(struct IOSana2Req *io)
                 v |= (get_extgpio_state(g, unit->wu_Base) & 1) << g;
             rc = 0;
         }
+        else if (id == BTC_NAME_COUNTRYRC)  /* #89: result of the init-time country SET */
+        {
+            v = (ULONG)sdio->s_Chip->c_CountryRc;
+            rc = 0;
+        }
         else if (id == BTC_NAME_COUNTRY)    /* #89: ccode chars in bytes 3/2, rev in the low half */
         {
             ULONG cw[3];                    /* no aggregate init: it links memset */

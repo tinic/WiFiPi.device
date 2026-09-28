@@ -3896,13 +3896,13 @@ void StartPacketReceiver(struct SDIO *sdio)
 
     if (sdio->s_Chip->c_Country[0])
     {
-        /* struct brcmf_fil_country_le: abbrev[4], rev (LE32, -1 = firmware's default rev), ccode[4] */
+        /* struct brcmf_fil_country_le: abbrev[4], rev (LE32), ccode[4]; ISO code and rev 0,
+           as Linux brcmf_translate_country_code's fallback does for the 4345 */
         UBYTE cq[12];
         for (int i = 0; i < 12; i++) cq[i] = 0;
         cq[0] = cq[8] = sdio->s_Chip->c_Country[0];
         cq[1] = cq[9] = sdio->s_Chip->c_Country[1];
-        cq[4] = cq[5] = cq[6] = cq[7] = 0xff;
-        PacketSetVar(sdio, "country", cq, 12);
+        sdio->s_Chip->c_CountryRc = PacketSetVar(sdio, "country", cq, 12);
     }
 
     PacketSetVarInt(sdio, "roam_off", 1);
