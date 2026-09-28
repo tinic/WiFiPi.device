@@ -193,6 +193,34 @@ lo_early = subprocess.run([sys.executable, TOOL, "rxjoin", lossy, pcap, "%.6f" %
 lo_late = subprocess.run([sys.executable, TOOL, "rxjoin", lossy, pcap, "%.6f" % peer(A0), "%.6f" % peer(A_END)],
                          capture_output=True, text=True).stdout.splitlines()
 expect(" covered=0 lost=5" in lo_early[0] and " covered=1 lost=5" in lo_late[0], "records lost: covered only once the window starts after the first kept record")
+
+# coverage at the boundary: first kept record exactly at START - W is not covered, just below it is
+import math
+mdl = ringtrace.model(ringtrace.pings(rs, ringtrace.marks_from_pcap(pcap)))
+first_t = ringtrace.to_peer(mdl, rs[0]["t"] / 1e6)
+W = ringtrace.TXJOIN_W
+st = first_t + W
+for _ in range(64):                                        # a START whose float minus W is exactly first_t
+    if st - W == first_t:
+        break
+    st = math.nextafter(st, math.inf if st - W < first_t else -math.inf)
+expect(st - W == first_t, "found a START with START - W == first kept record")
+above = st
+while not above - W > first_t:
+    above = math.nextafter(above, math.inf)
+def cov(start):
+    out = subprocess.run([sys.executable, TOOL, "rxjoin", lossy, pcap, repr(start), "%.6f" % peer(A_END)],
+                         capture_output=True, text=True).stdout.splitlines()
+    return out[0].split(" covered=")[1].split()[0] if out and " covered=" in out[0] else None
+expect(cov(st) == "0", "lost>0, first kept record exactly at START - W: covered=0")
+expect(cov(above) == "1", "lost>0, first kept record just below START - W: covered=1")
+
+# lost>0 and no records at all: no clock model can be formed, rxjoin fails and prints no coverage
+empty = os.path.join(d, "empty.bin")
+open(empty, "wb").write(struct.pack(">IHHIIIIII", 0x52544431, 1, 16, 1 << 22, 5, 5, 0, 5, 0))
+e = subprocess.run([sys.executable, TOOL, "rxjoin", empty, pcap, "%.6f" % peer(A0), "%.6f" % peer(A_END)], capture_output=True, text=True)
+expect(e.returncode != 0 and "covered=1" not in e.stdout and "no_paired_pings" in e.stderr,
+       "lost>0 with no records: rxjoin exits non-zero without covered=1 (rc=%d)" % e.returncode)
 expect(has(a, "arrived frames=6 ", "outcomes=dropped=1,orphan=1,read=4"), "A: arrival summary")
 
 b = run(peer(EXB) - 0.2, peer(B_END))
