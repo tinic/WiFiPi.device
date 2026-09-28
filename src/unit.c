@@ -1489,9 +1489,24 @@ static int Do_S2_GETNETWORKS(struct IOSana2Req *io)
 
     /* Put it into scan queue */
     PutMsg(unit->wu_ScanQueue, (struct Message *)io);
+    RT(WiFiBase->w_SDIO, RT_SCAN, 0, 0, 0, 0);
 
     return 0;
 }
+
+#ifdef WIFIPI_RINGTRACE
+/* Debug ring dump (#89): header and records into ios2_Data, oldest first;
+   ios2_DataLength is the room given and comes back as the bytes written */
+static int Do_RingDump(struct IOSana2Req *io)
+{
+    struct WiFiUnit *unit = (struct WiFiUnit *)io->ios2_Req.io_Unit;
+    ULONG n = RtDump(unit->wu_Base->w_SDIO, io->ios2_Data, io->ios2_DataLength);
+
+    io->ios2_DataLength = n;
+    io->ios2_Req.io_Error = n ? 0 : S2ERR_BAD_ARGUMENT;
+    return 1;
+}
+#endif
 
 /* The receiver task's counters (struct SDIO s_Stat*), one record each */
 static int Do_S2_GETSPECIALSTATS(struct IOSana2Req *io)
@@ -1992,6 +2007,12 @@ void HandleRequest(struct IOSana2Req *io)
             case CMD_WRITE:
                 complete = Do_CMD_WRITE(io);
                 break;
+
+#ifdef WIFIPI_RINGTRACE
+            case WIFIPI_CMD_RINGDUMP:
+                complete = Do_RingDump(io);
+                break;
+#endif
 
             default:
                 D(bug("[WiFi.0] Unknown command %ld\n", io->ios2_Req.io_Command));

@@ -351,6 +351,9 @@ struct SDIO {
     void    (*SendPKT)(UBYTE *pkt, ULONG length, struct SDIO *);
     void    (*RecvPKT)(UBYTE *pkt, ULONG length, struct SDIO *);
     ULONG   (*GetIntStatus)(struct SDIO *);
+#ifdef WIFIPI_RINGTRACE
+    struct RtRing *     s_Ring;     // debug event ring (#89), NULL = none
+#endif
 };
 
 struct SDIO * sdio_init(struct WiFiBase *WiFiBase);

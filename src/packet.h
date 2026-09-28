@@ -296,4 +296,14 @@ struct VsTLV {
 struct VsTLV * FindWPAIE(UBYTE *data, ULONG len);
 struct TLV * brcmf_parse_tlvs(void *buf, ULONG buflen, UBYTE key);
 
+#ifdef WIFIPI_RINGTRACE
+#include "ringtrace.h"
+ULONG RtClock(struct SDIO *sdio);
+void RtPut(struct SDIO *sdio, UBYTE kind, UBYTE a, UWORD b, ULONG c, ULONG d);
+ULONG RtDump(struct SDIO *sdio, void *out, ULONG size);
+#define RT(sdio, k, a, b, c, d) RtPut((sdio), (k), (a), (b), (c), (d))
+#else
+#define RT(sdio, k, a, b, c, d) do { } while (0)
+#endif
+
 #endif /* _PACKET_H */

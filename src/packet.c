@@ -637,6 +637,13 @@ void ProcessEvent(struct SDIO *sdio, struct PacketEvent *pe)
 
     // pe is in network (BigEndian) order!
     // BUT! pe data is native (LittleEndian) order!
+#ifdef WIFIPI_RINGTRACE
+    RtPut(sdio, RT_EVENT, pe->e_EventType < 255 ? pe->e_EventType : 255,
+          pe->e_EventType == BRCMF_E_ESCAN_RESULT
+              ? LE16(((struct EScanResult *)((ULONG)pe + sizeof(struct PacketEvent)))->esr_BSSCount)
+              : pe->e_Flags,
+          pe->e_Status, pe->e_Reason);
+#endif
     switch (pe->e_EventType)
     {
         case BRCMF_E_ESCAN_RESULT:
@@ -649,6 +656,7 @@ void ProcessEvent(struct SDIO *sdio, struct PacketEvent *pe)
                 // Scan complete
                 if (unit->wu_ScanRequest)
                 {
+                    RT(sdio, RT_SCAN, 2, 0, pe->e_Status, 0);
                     ReplyMsg((struct Message *)unit->wu_ScanRequest);
                     unit->wu_ScanRequest = NULL;
                 }
@@ -851,6 +859,115 @@ UBYTE PacketTxCredit(struct SDIO *sdio)
     return (d & 0x80) ? 0 : d;
 }
 
+#ifdef WIFIPI_RINGTRACE
+/* Debug event ring (#89): writers are tasks, so Forbid() is enough */
+ULONG RtClock(struct SDIO *sdio)
+{
+    APTR t = sdio->s_WiFiBase->w_SysTimer;
+    return t ? rd32(t, 4) : 0;
+}
+
+void RtPut(struct SDIO *sdio, UBYTE kind, UBYTE a, UWORD b, ULONG c, ULONG d)
+{
+    struct ExecBase *SysBase = sdio->s_SysBase;
+    struct RtRing *r = sdio->s_Ring;
+
+    if (r == NULL)
+        return;
+    Forbid();
+    rt_put(r, RtClock(sdio), kind, a, b, c, d);
+    Permit();
+}
+
+ULONG RtDump(struct SDIO *sdio, void *out, ULONG size)
+{
+    struct ExecBase *SysBase = sdio->s_SysBase;
+    struct RtRing *r = sdio->s_Ring;
+    ULONG n;
+
+    if (r == NULL)
+        return 0;
+    Forbid();
+    n = rt_snapshot(r, RtClock(sdio), out, size);
+    Permit();
+    return n;
+}
+
+/* Once per SDIO: the largest ring that can be had, never freed */
+static void RtAlloc(struct SDIO *sdio)
+{
+    struct ExecBase *SysBase = sdio->s_SysBase;
+    ULONG log2;
+
+    if (sdio->s_Ring != NULL)
+        return;
+    for (log2 = WIFIPI_RINGTRACE_LOG2; log2 >= RT_MIN_LOG2; log2--)
+    {
+        ULONG size = sizeof(struct RtRing) + (sizeof(struct RtRec) << log2);
+        struct RtRing *r = AllocMem(size, MEMF_ANY);
+
+        if (r != NULL)
+        {
+            rt_init(r, log2, size);
+            sdio->s_Ring = r;
+            RtPut(sdio, RT_START, log2, sdio->s_WiFiBase->w_SysTimer != NULL, size, 0);
+            return;
+        }
+    }
+}
+
+static void RtCredit(struct SDIO *sdio, BYTE *state, BOOL initial)
+{
+    BYTE zero = PacketTxCredit(sdio) == 0;
+
+    if (!initial && zero == *state)
+        return;
+    *state = zero;
+    RtPut(sdio, RT_CREDIT, initial ? 2 + zero : zero, !IsMsgPortEmpty(sdio->s_SenderPort),
+          sdio->s_TXSeq, sdio->s_MaxTXSeq);
+}
+
+/* Openers and read requests posted across them */
+static void RtRxQueue(struct SDIO *sdio, ULONG *openers, ULONG *reads)
+{
+    struct ExecBase *SysBase = sdio->s_SysBase;
+    struct WiFiUnit *unit = sdio->s_WiFiBase->w_Unit;
+    struct Opener *opener;
+    struct IOSana2Req *io;
+    ULONG o = 0, n = 0;
+
+    if (unit != NULL)
+    {
+        Disable();
+        ForeachNode(&unit->wu_Openers, opener)
+        {
+            o++;
+            ForeachNode(&opener->o_ReadPort.mp_MsgList, io)
+                n++;
+        }
+        Enable();
+    }
+    *openers = o;
+    *reads = n;
+}
+
+static inline UWORD RtCap16(ULONG v) { return v > 0xffff ? 0xffff : v; }
+
+/* An SDPCM header in one longword: channel, rx seq, window end, flow bits */
+#define RT_HDR(p) (((ULONG)(p)->c_ChannelFlag << 24) | ((ULONG)(p)->c_Seq << 16) | \
+                   ((ULONG)(p)->c_MaxSeq << 8) | (p)->c_FlowControl)
+
+/* The alignment ping: ICMP echo, IPv4 without options, total length 1139
+   (ping -s 1111).  Returns type<<16 | 1, or 0; *idseq gets id<<16 | seq. */
+static inline ULONG RtMarkPing(const UBYTE *ip, ULONG *idseq)
+{
+    if (ip[0] != 0x45 || ip[9] != 1 || *(const UWORD *)&ip[2] != 1139)
+        return 0;
+    *idseq = *(const ULONG *)&ip[24];
+    return ((ULONG)ip[20] << 16) | 1;
+}
+#endif
+
 static void PacketPoller(struct SDIO *sdio)
 {
     struct ExecBase *SysBase = sdio->s_SysBase;
@@ -874,6 +991,7 @@ static void PacketPoller(struct SDIO *sdio)
         sdio->s_PollAsleep = FALSE;
         if (got & SIGBREAKF_CTRL_C)
             break;
+        RT(sdio, RT_POLL, 4, 0, 0, 0);
 
         ULONG since = PollClock(WiFiBase);
         ULONG queued = 0;       /* when the first waiting write was seen, 0 = none */
@@ -895,6 +1013,10 @@ static void PacketPoller(struct SDIO *sdio)
 
             if (sdio_card_asserting(sdio) || send)
             {
+#ifdef WIFIPI_RINGTRACE
+                ULONG rtNow = PollClock(WiFiBase);
+                RtPut(sdio, RT_POLL, send ? 2 : 1, 0, rtNow - since, sdio->s_StatPollHits);
+#endif
                 if (send)
                     sdio->s_StatPollSends++;
                 queued = 0;
@@ -912,6 +1034,7 @@ static void PacketPoller(struct SDIO *sdio)
             }
             if ((ULONG)(PollClock(WiFiBase) - since) > POLL_GRACE_US)
             {
+                RT(sdio, RT_POLL, 3, 0, 0, sdio->s_StatPollSleeps);
                 sdio->s_StatPollSleeps++;
                 break;
             }
@@ -1087,6 +1210,12 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
     cur->tr_time.tv_sec = waitDelay / 1000000;
     cur->tr_time.tv_micro = waitDelay % 1000000;
     SendIO(&cur->tr_node);
+#ifdef WIFIPI_RINGTRACE
+    ULONG rtArm = RtClock(sdio), rtArmDelay = waitDelay;
+    UBYTE rtArmUnit = (cur == trv);
+    BYTE rtCredit0 = 0;
+    RtCredit(sdio, &rtCredit0, TRUE);
+#endif
 
     // Clear PACKET_INITIAL_FETCH_SIZE bytes of RX buffer
     UBYTE *buffer = sdio->s_RXBuffer;
@@ -1108,6 +1237,16 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
                             (1 << port->mp_SigBit) |
                             (1 << ctrl->mp_SigBit) |
                             irqMask | pollMask);
+#ifdef WIFIPI_RINGTRACE
+        struct WiFiUnit *rtUnit = WiFiBase->w_Unit;
+        ULONG rtWake = RtClock(sdio);
+        ULONG rtRx0 = rtUnit ? rtUnit->wu_Stats.PacketsReceived : 0;
+        ULONG rtOrph0 = rtUnit ? rtUnit->wu_Stats.UnknownTypesReceived : 0;
+        RtPut(sdio, RT_WAKE,
+              ((sigSet & (1 << port->mp_SigBit)) ? 1 : 0) | ((sigSet & (1 << ctrl->mp_SigBit)) ? 2 : 0) |
+              ((sigSet & irqMask) ? 4 : 0) | ((sigSet & pollMask) ? 8 : 0) | ((sigSet & SIGBREAKF_CTRL_C) ? 16 : 0),
+              PacketTxCredit(sdio), rtRx0, sdio->s_StatTXFrames);
+#endif
 
         /* control requests whose callers gave up (#93) */
         PacketCtrlSweep(sdio);
@@ -1136,6 +1275,9 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
             UBYTE maxCount;
 
             maxCount = PacketTxCredit(sdio);
+#ifdef WIFIPI_RINGTRACE
+            UBYTE rtCredit = maxCount;
+#endif
             
             /* Make sure we have place in TX */
             if (maxCount == 0)
@@ -1173,6 +1315,8 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
                         }
                         */
                         SendGlomDataPacket(sdio, ioList, ioCount);
+                        RT(sdio, RT_TX, ioCount, rtCredit, sdio->s_StatTXFrames,
+                           ((ULONG)sdio->s_TXSeq << 8) | sdio->s_MaxTXSeq);
                         ioCount = 0;
                     }
                 }
@@ -1192,6 +1336,8 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
                     //D(bug("[WiFi] Glom frame would do, there are %ld entries in queue\n", ioCount));
                     // More items? Construct glom frame
                     SendGlomDataPacket(sdio, ioList, ioCount);
+                    RT(sdio, RT_TX, ioCount, rtCredit, sdio->s_StatTXFrames,
+                       ((ULONG)sdio->s_TXSeq << 8) | sdio->s_MaxTXSeq);
                     /*
                     for (ULONG i=0; i < ioCount; i++)
                     {
@@ -1201,6 +1347,9 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
                     */
                 }
             }
+#ifdef WIFIPI_RINGTRACE
+            RtCredit(sdio, &rtCredit0, FALSE);
+#endif
         }
 
         /* If no scan request is in progress start another one (if needed) */
@@ -1251,6 +1400,10 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
 
             /* Update gotTransfer flag if it wasn't set already */
             gotTransfer = LE16(pkt->p_Length) != 0;
+#ifdef WIFIPI_RINGTRACE
+            if (!gotTransfer)
+                RtPut(sdio, RT_READ, 0, 0, 0, RT_HDR(pkt));
+#endif
             sdio->s_StatWakes++;
             if (!gotTransfer)
                 sdio->s_StatEmpty++;
@@ -1270,6 +1423,9 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
                signal with the request still active leaves timerReady false. */
             if (timerReady)
             {
+#ifdef WIFIPI_RINGTRACE
+                RtPut(sdio, RT_TICK, rtArmUnit | (timerEvent ? 0 : 0x80), 0, rtArmDelay, rtWake - rtArm);
+#endif
                 /* A frame in or out, or a write still waiting for TX credit:
                    the 2 ms tick for the next few ticks -- credits come back in
                    the header of the next frame read, and a 10 ms tick between
@@ -1311,6 +1467,11 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
                 cur->tr_time.tv_sec = waitDelay / 1000000;
                 cur->tr_time.tv_micro = waitDelay % 1000000;
                 SendIO(&cur->tr_node);
+#ifdef WIFIPI_RINGTRACE
+                rtArm = RtClock(sdio);
+                rtArmDelay = waitDelay;
+                rtArmUnit = (cur == trv);
+#endif
             }
 
             if (gotTransfer)
@@ -1330,6 +1491,10 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
                 {
                     UWORD pktLen = LE16(pkt->p_Length);
                     UWORD pktChk = LE16(pkt->c_ChkSum);
+#ifdef WIFIPI_RINGTRACE
+                    ULONG rtHdr = RT_HDR(pkt);
+                    ULONG rtSub = 0;
+#endif
                 
                     if ((pktChk | pktLen) == 0xffff)
                     {
@@ -1368,6 +1533,9 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
                                     }
                                     else
                                     {
+#ifdef WIFIPI_RINGTRACE
+                                        rtSub++;
+#endif
                                         pos += processed;
                                         pos = (pos + 3) & ~3;
                                     }
@@ -1395,17 +1563,33 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
                         }
                     }
 
+#ifdef WIFIPI_RINGTRACE
+                    RtPut(sdio, RT_READ, burst < 255 ? burst : 255,
+                          (pkt->c_ChannelFlag & 15) == SDPCM_GLOM_CHANNEL ? rtSub : 1, pktLen, rtHdr);
+#endif
                     if (++burst >= 64)
                         break;
                     sdio->RecvPKT(buffer, PACKET_INITIAL_FETCH_SIZE, sdio);
                     if (LE16(pkt->p_Length) == 0)
+                    {
+                        RT(sdio, RT_READ, burst, 0, 0, RT_HDR(pkt));
                         break;
+                    }
                 }
                 sdio->s_StatRXFrames += burst;
                 if (burst > 1)
                     sdio->s_StatBursts++;
                 if (burst > sdio->s_StatMaxBurst)
                     sdio->s_StatMaxBurst = burst;
+#ifdef WIFIPI_RINGTRACE
+                {
+                    ULONG o, n;
+                    RtRxQueue(sdio, &o, &n);
+                    RtPut(sdio, RT_RXQ, o < 255 ? o : 255, RtCap16(n),
+                          rtUnit ? rtUnit->wu_Stats.PacketsReceived - rtRx0 : 0,
+                          rtUnit ? rtUnit->wu_Stats.UnknownTypesReceived - rtOrph0 : 0);
+                }
+#endif
             }
 
             /*
@@ -1466,6 +1650,9 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
             }
         }
 
+#ifdef WIFIPI_RINGTRACE
+        RtCredit(sdio, &rtCredit0, FALSE);
+#endif
         // Shutdown signal?
         if (sigSet & SIGBREAKF_CTRL_C)
         {
@@ -1741,6 +1928,14 @@ void ProcessDataPacket(struct SDIO *sdio, UBYTE *packet, ULONG packetLength)
     /* the receiver's tick and poller run fast for frames addressed to us */
     if ((packet[0] & 0x01) == 0)
         sdio->s_RxUnicast = 1;
+#ifdef WIFIPI_RINGTRACE
+    if (packetType == 0x0800 && packetLength >= 42)
+    {
+        ULONG idseq, m = RtMarkPing(&packet[14], &idseq);
+        if (m)
+            RtPut(sdio, RT_MARK, 0, m >> 16, idseq, packetLength);
+    }
+#endif
 #if 1
     if (packetType == 0x888e)
     {
@@ -1863,6 +2058,9 @@ int SendGlomDataPacket(struct SDIO *sdio, struct IOSana2Req **ioList, UBYTE coun
     struct ExecBase *SysBase = sdio->s_SysBase;
     struct WiFiUnit *unit = WiFiBase->w_Unit;
     ULONG totalLength = 0;
+#ifdef WIFIPI_RINGTRACE
+    ULONG rtMark = 0, rtIdSeq = 0;
+#endif
 
     struct PacketHeaderHW *pktBase = sdio->s_TXBuffer;
     UBYTE *byteBuffer = sdio->s_TXBuffer;
@@ -1932,6 +2130,11 @@ int SendGlomDataPacket(struct SDIO *sdio, struct IOSana2Req **ioList, UBYTE coun
         {
             // Copy packet contents
             opener->o_TXFunc(ptr, io->ios2_Data, io->ios2_DataLength);
+#ifdef WIFIPI_RINGTRACE
+            if ((io->ios2_Req.io_Flags & SANA2IOF_RAW) == 0 && io->ios2_PacketType == 0x0800 &&
+                io->ios2_DataLength >= 28 && RtMarkPing(ptr, &rtIdSeq))
+                rtMark = ((ULONG)ptr[20] << 16) | (i + 1);
+#endif
         }
         else
         {
@@ -1992,6 +2195,10 @@ int SendGlomDataPacket(struct SDIO *sdio, struct IOSana2Req **ioList, UBYTE coun
     while(1);
 #endif
     sdio->SendPKT((UBYTE *)pktBase, totalLength, sdio);
+#ifdef WIFIPI_RINGTRACE
+    if (rtMark)
+        RtPut(sdio, RT_MARK, 1, rtMark >> 16, rtIdSeq, ((ULONG)count << 16) | (rtMark & 0xffff));
+#endif
 
     for (UBYTE i = 0; i < count; i++) {
         ReplyMsg(&ioList[i]->ios2_Req.io_Message);
@@ -2423,6 +2630,11 @@ static ULONG CtrlTransact(struct SDIO *sdio, struct PacketMessage *mpkt, struct 
 
     if (copied != NULL)
         *copied = 0;
+#ifdef WIFIPI_RINGTRACE
+    UWORD rtID = LE16(c->c_ID);
+    ULONG rtCmd = LE32(c->c_Command);
+    RtPut(sdio, RT_CTRL, 0, rtID, rtCmd, *(ULONG *)(c + 1));
+#endif
 
     /* No receiver (it has shut down): nothing is queued, all is still ours */
     Forbid();
@@ -2437,6 +2649,7 @@ static ULONG CtrlTransact(struct SDIO *sdio, struct PacketMessage *mpkt, struct 
         FreeMem(mpkt, mpkt->pm_AllocSize);
         CtrlTimerClose(sdio, t);
         DeleteMsgPort(port);
+        RT(sdio, RT_CTRL, 1, rtID, rtCmd, PACKET_CTRL_NORES);
         return PACKET_CTRL_NORES;
     }
 
@@ -2491,6 +2704,7 @@ static ULONG CtrlTransact(struct SDIO *sdio, struct PacketMessage *mpkt, struct 
         error_code = PACKET_CTRL_TIMEOUT;   /* the block is the receiver's now */
 
     DeleteMsgPort(port);
+    RT(sdio, RT_CTRL, 1, rtID, rtCmd, error_code);
     return error_code;
 }
 
@@ -2536,6 +2750,12 @@ void PacketCtrlQueue(struct SDIO *sdio, struct Message *msg)
        too, so the numbers leave in order (brcmf_sdio_tx_ctrlframe). */
     ((UBYTE *)&m->pm_PacketHeader[0])[m->pm_SeqOff] = sdio->s_TXSeq++;
     sdio->SendPKT((APTR)&m->pm_PacketHeader[0], LE16(m->pm_PacketHeader[0].p_Length), sdio);
+#ifdef WIFIPI_RINGTRACE
+    {
+        struct PacketCmd *c = (APTR)m->pm_PacketData;
+        RtPut(sdio, RT_CTRL, 4, LE16(c->c_ID), LE32(c->c_Command), *(ULONG *)(c + 1));
+    }
+#endif
 }
 
 /* A control reply from the firmware.  Abandoned requests met on the way are
@@ -2554,6 +2774,7 @@ void PacketCtrlComplete(struct SDIO *sdio, struct Packet *pkt, ULONG pktLen)
         return;
     cmd = (APTR)&buffer[pkt->c_DataOffset];
     avail = pktLen - pkt->c_DataOffset - sizeof(struct PacketCmd);
+    RT(sdio, RT_CTRL, 3, LE16(cmd->c_ID), LE32(cmd->c_Command), LE32(cmd->c_Status));
 
     Forbid();
     for (m = (APTR)sdio->s_CtrlWaitList->mlh_Head; (next = (APTR)m->pm_Message.mn_Node.ln_Succ) != NULL; m = next)
@@ -2780,6 +3001,7 @@ void PacketSetVarAsync(struct SDIO *sdio, char *varName, const void *setBuffer, 
 
     // Async - fire the packet and forget
     sdio->SendPKT(pkt, totalLen, sdio);
+    RT(sdio, RT_CTRL, 2, LE16(c->c_ID), 263, *(ULONG *)param);
 
     FreeMem(pkt, allocLen);
 }
@@ -2914,6 +3136,7 @@ void PacketCmdIntAsync(struct SDIO *sdio, ULONG cmd, ULONG cmdValue)
 
     // Fire packet and forget it
     sdio->SendPKT(pkt, totalLen, sdio);
+    RT(sdio, RT_CTRL, 2, LE16(c->c_ID), cmd, cmdValue);
 
     FreeMem(pkt, allocLen);
 }
@@ -3250,6 +3473,7 @@ void StartNetworkScan(struct IOSana2Req *io)
 
     PacketCmdIntAsync(sdio, BRCMF_C_SET_PASSIVE_SCAN, 0);
     PacketSetVarAsync(sdio, "escan", data, sizeof(params));
+    RT(sdio, RT_SCAN, 1, networkName != NULL, 0, 0);
 }
 
 #if 0
@@ -3312,6 +3536,9 @@ void StartPacketReceiver(struct SDIO *sdio)
     static const char task_name[] = WIFIPI_TASK_RECEIVER;
 
     D(bug("[WiFi] Starting packet receiver task\n"));
+#ifdef WIFIPI_RINGTRACE
+    RtAlloc(sdio);
+#endif
 
     // Get all memory we need for the receiver task
     task = AllocMem(sizeof(struct Task), MEMF_PUBLIC | MEMF_CLEAR);
