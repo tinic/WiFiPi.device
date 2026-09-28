@@ -9,6 +9,10 @@ sent and the release ACK leaves 100 ms later (host ACK production).  In B the
 exit frame itself is read 100 ms after it was sent (delivery upstream of the
 host handoff).  Also: an orphaned and a dropped frame, a frame the peer never
 sent (unseen), and a near miss in payload length that must not match.
+Gap C: the peer's GSO super-frames (captured before segmentation) matched
+segment by segment; a retransmit whose original lies outside the window
+(SEEN, retx1); two copies inside the window (AMBIGUOUS, both listed); and an
+exit edge whose last frame is a 2920 B super-frame (exit = its 2nd segment).
 """
 import os
 import struct
@@ -54,11 +58,13 @@ def ping(t, s):
         frames.append((ep, b"\0" * 12 + b"\x08\x00" + bytes(ip) + bytes([typ, 0, 0, 0]) + struct.pack(">HH", 0x4242, s)))
 
 
-def tcp(ipid, ack, seq, flags, src, dst, sport, dport, plen):
-    ip = bytearray(20); ip[0] = 0x45; ip[2:4] = struct.pack(">H", 40 + plen)
+def tcp(ipid, ack, seq, flags, src, dst, sport, dport, plen, mss=None):
+    opt = struct.pack(">BBH", 2, 4, mss) if mss else b""
+    ip = bytearray(20); ip[0] = 0x45; ip[2:4] = struct.pack(">H", 40 + len(opt) + plen)
     ip[4:6] = struct.pack(">H", ipid); ip[9] = 6
     ip[12:16] = bytes([192, 168, 1, src]); ip[16:20] = bytes([192, 168, 1, dst])
-    return b"\0" * 12 + b"\x08\x00" + bytes(ip) + struct.pack(">HHIIBBHHH", sport, dport, seq, ack, 5 << 4, flags, 1000, 0, 0)
+    return (b"\0" * 12 + b"\x08\x00" + bytes(ip) +
+            struct.pack(">HHIIBBHHH", sport, dport, seq, ack, (5 + len(opt) // 4) << 4, flags, 1000, 0, 0) + opt)
 
 
 def data(t_rx, read_ms, ipid, seq, outcome=1, sent=True, plen=1448, peer_plen=None):
@@ -76,7 +82,18 @@ def ack(t_tx, ipid, ackno, seen_ms):
     frames.append((peer(t_tx) + seen_ms / 1000.0, tcp(ipid, ackno, 1, 0x10, 137, 136, 7502, 40462, 0)))
 
 
+def rxseg(t_rx, seq, plen, flags, ipid):
+    """one wire segment handed to the stack at t_rx (no peer frame: the caller adds the super-frame)"""
+    put(t_rx, 17, flags, ipid, 1, seq)
+    put(t_rx, 18, 0, (1 << 8) | (ipid & 0xff), (40462 << 16) | 7502, (136 << 24) | (137 << 16) | plen)
+
+
+def superframe(ep, seq, total, flags=0x18, ipid=0x900):
+    frames.append((ep, tcp(ipid, 1, seq, flags, 136, 137, 40462, 7502, total)))
+
+
 t = BASE
+frames.append((peer(t) - 0.5, tcp(1, 1, 0, 0x12, 137, 136, 7502, 40462, 0, mss=1460)))   # SYN-ACK: the Amiga's MSS
 for s in range(5):
     ping(t + s * 100_000, s)
 t += 1_000_000
@@ -97,7 +114,28 @@ EXB = t + 200_000
 data(EXB, 100, 0x200, 20000)
 ack(EXB + 1_000, 0x501, 20000 + 1448, 3)
 B_END = EXB + 4_000
-t += 2_000_000
+# gap C
+t += 1_000_000
+C0 = t
+superframe(peer(C0) - 0.002, 30000, 4380)                  # 4380 B: three segments
+rxseg(C0, 30000, 1460, 0x10, 0x901); rxseg(C0 + 100, 31460, 1460, 0x10, 0x902); rxseg(C0 + 200, 32920, 1460, 0x18, 0x903)
+R1 = C0 + 1_600_000                                        # retransmit read 2 ms after its send; original 1.5 s earlier
+superframe(peer(R1) - 1.502, 40000, 1460, flags=0x10)
+superframe(peer(R1) - 0.002, 40000, 1460, flags=0x10)
+rxseg(R1, 40000, 1460, 0x10, 0x904)
+R2 = R1 + 300_000                                          # two copies 200 ms apart, both inside the window
+superframe(peer(R2) - 0.202, 50000, 1460, flags=0x10)
+superframe(peer(R2) - 0.002, 50000, 1460, flags=0x10)
+rxseg(R2, 50000, 1460, 0x10, 0x905)
+T2 = R2 + 100_000                                          # 2736 B: 1460 + a 1276 B tail
+superframe(peer(T2) - 0.002, 70000, 2736)
+rxseg(T2, 70000, 1460, 0x10, 0x908); rxseg(T2 + 50, 71460, 1276, 0x18, 0x909)
+EXC = R2 + 300_000                                         # exit: a 2920 B super-frame, read 1 ms later
+superframe(peer(EXC) - 0.001, 60000, 2920)
+rxseg(EXC, 60000, 1460, 0x10, 0x906); rxseg(EXC + 50, 61460, 1460, 0x18, 0x907)
+ack(EXC + 100_000, 0x502, 62920, 3)
+C_END = EXC + 103_000
+t += 2_000_000 + 1_000_000
 for s in range(5, 10):
     ping(t + (s - 5) * 100_000, s)
 
@@ -113,7 +151,7 @@ open(pcap, "wb").write(b"".join(pk))
 
 h, rs = ringtrace.load(dump)
 rx = ringtrace.rx_frames(rs)
-expect(len(rx) == 7 and [f["outcome"] for f in rx[:3]] == ["read", "orphan", "dropped"], "RX pairs and outcomes decoded")
+expect(len(rx) == 16 and [f["outcome"] for f in rx[:3]] == ["read", "orphan", "dropped"], "RX pairs and outcomes decoded")
 
 
 def run(lo, hi):
@@ -139,8 +177,8 @@ expect(has(a, "ip_id=257 ", "outcome=orphan SEEN"), "A: orphaned frame reported"
 expect(has(a, "ip_id=258 ", "outcome=dropped SEEN"), "A: dropped frame reported")
 expect(has(a, "ip_id=259 ", "UNSEEN"), "A: frame the peer never sent is unseen")
 expect(has(a, "ip_id=260 ", "UNSEEN"), "A: payload-length near miss does not match")
-expect(has(a, "exit_frame peer_tx_t=", "seq=6792 len=1448"), "A: exit frame found")
-expect(num(a, "read_delay_ms", "exit_frame host_rx_t=", "outcome=read", near=1.0), "A: exit frame read 1 ms after its send")
+expect(has(a, "exit_segment peer_tx_t=", "seq=6792 len=1448"), "A: exit frame found")
+expect(num(a, "read_delay_ms", "exit_segment host_rx_t=", "outcome=read", near=1.0), "A: exit frame read 1 ms after its send")
 expect(num(a, "ack_production_ms", "release_ack host_tx_t=", "ack=8240", "write=ok", near=100.0), "A: release ACK 100 ms after the read")
 expect(has(a, "edge read_delay_ms=", "larger=host_ack_production"), "A: host ACK production")
 expect(a[-1] == "received_at_host=6 seen=4 unseen=2 ambiguous=0 censored=0", "A: summary")
@@ -148,9 +186,27 @@ expect(has(a, "arrived frames=6 ", "outcomes=dropped=1,orphan=1,read=4"), "A: ar
 
 b = run(peer(EXB) - 0.2, peer(B_END))
 print("\n".join(b))
-expect(num(b, "read_delay_ms", "exit_frame host_rx_t=", near=100.0), "B: exit frame read 100 ms after its send")
+expect(num(b, "read_delay_ms", "exit_segment host_rx_t=", near=100.0), "B: exit frame read 100 ms after its send")
 expect(num(b, "ack_production_ms", "release_ack host_tx_t=", near=1.0), "B: release ACK 1 ms after the read")
 expect(has(b, "edge read_delay_ms=", "larger=upstream_delivery"), "B: delivery upstream of the host")
+
+c = run(peer(C0) - 0.01, peer(C_END))
+print("\n".join(c))
+for sq, k in ((30000, 0), (31460, 1), (32920, 2)):
+    expect(has(c, "seq=%d " % sq, "SEEN", "segment=%d/4380B" % k, "copy=original") and num(c, "delay_ms", "seq=%d " % sq, "SEEN", near=2.0, tol=0.3),
+           "C: 4380 B super-frame segment %d matched, 2 ms" % k)
+expect(has(c, "seq=32920 ", "flags=PA", "SEEN"), "C: PSH only on the last segment")
+expect(has(c, "seq=40000 ", "SEEN", "copy=retx1") and num(c, "delay_ms", "seq=40000 ", near=2.0, tol=0.3), "C: retransmit, original outside W: SEEN retx1")
+expect(has(c, "seq=50000 ", "AMBIGUOUS retx_candidates=2 copies=original@", ",retx1@"), "C: two copies inside W: AMBIGUOUS, both listed")
+expect(has(c, "exit_segment peer_tx_t=", "seq=61460 len=1460 segment=1/2920B"), "C: exit = the 2920 B super-frame's second segment")
+expect(num(c, "read_delay_ms", "exit_segment host_rx_t=", near=1.0, tol=0.3), "C: exit segment read 1 ms after its send")
+expect(num(c, "ack_production_ms", "release_ack host_tx_t=", "ack=62920", near=100.0, tol=0.3), "C: release ACK covers the whole super-frame, 100 ms")
+expect(has(c, "seq=71460 ", "len=1276", "SEEN", "segment=1/2736B"), "C: 2736 B super-frame's 1276 B tail matched")
+segs = ringtrace.peer_segments(ringtrace.peer_tcp(pcap))
+expect([(p["seq"], p["len"], p["flags"]) for p in segs if p["super_len"] == 2736] == [(70000, 1460, 0x10), (71460, 1276, 0x18)],
+       "peer_segments: the last segment is the payload minus (n-1) x 1460")
+sf = [p for p in segs if p["super_len"] == 4380]
+expect([(p["seq"], p["len"], p["flags"]) for p in sf] == [(30000, 1460, 0x10), (31460, 1460, 0x10), (32920, 1460, 0x18)], "peer_segments split rule")
 
 print("RESULT test_rxjoin checks=%d failures=%d" % (checks, failures))
 sys.exit(1 if failures else 0)
