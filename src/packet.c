@@ -897,7 +897,7 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
             struct PacketMessage *msg;
 
             // Repeat until we run out of the messages
-            while(msg = (struct PacketMessage *)GetMsg(ctrl))
+            while((msg = (struct PacketMessage *)GetMsg(ctrl)) != NULL)
             {
                 // Put message in the control wait list
                 AddTail((struct List*)&ctrlWaitList, &msg->pm_Message.mn_Node);
@@ -921,7 +921,7 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
             if (maxCount)
             {
                 // Drain outgoing packet requests
-                while (msg = (struct IOSana2Req *)GetMsg(sender))
+                while ((msg = (struct IOSana2Req *)GetMsg(sender)) != NULL)
                 {
                     sendTransfer = TRUE;
 
@@ -2188,7 +2188,6 @@ int PacketUploadCLM(struct SDIO *sdio)
     if (sdio->s_Chip->c_CLMBase && sdio->s_Chip->c_CLMSize)
     {
         LONG dataLen = sdio->s_Chip->c_CLMSize;
-        ULONG transferred = 0;
         UBYTE *data = sdio->s_Chip->c_CLMBase;
         UWORD flag = DL_BEGIN | (DLOAD_HANDLER_VER << DLOAD_FLAG_VER_SHIFT);
 
@@ -2225,7 +2224,6 @@ int PacketUploadCLM(struct SDIO *sdio)
 
                 PacketSetVar(sdio, "clmload", upload, sizeof(struct UploadHeader) + transferLen);
 
-                transferred += transferLen;
                 dataLen -= transferLen;
                 data += transferLen;
 
