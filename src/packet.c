@@ -752,6 +752,11 @@ void ProcessEvent(struct SDIO *sdio, struct PacketEvent *pe)
                 if (sdio->s_Chip->c_ChipID == BRCM_CC_43430_CHIP_ID || sdio->s_Chip->c_ChipID == BRCM_CC_4345_CHIP_ID)
                     PacketCmdIntAsync(sdio, BRCMF_C_SET_PM, 0);
 #endif
+#ifdef WIFIPI_NOAMPDURTS
+                /* #89 type R holds: our pure-ACK A-MPDUs go out behind an RTS that the AP, busy with our
+                   downlink, leaves unanswered (hw35/hw36 txnocts); send them without RTS */
+                { ULONG off = LE32(0); PacketSetVarAsync(sdio, "ampdu_rts", &off, sizeof(off)); }
+#endif
                 unit->wu_Flags |= IFF_CONNECTED;
                 ReportEvents(unit, S2EVENT_CONNECT);
             }
