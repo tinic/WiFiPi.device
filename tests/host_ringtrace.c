@@ -13,6 +13,7 @@
 #include <stddef.h>
 #include <string.h>
 #include <pthread.h>
+#include <sched.h>
 
 typedef uint8_t UBYTE;
 typedef uint16_t UWORD;
@@ -154,10 +155,19 @@ static void test_dump_while_recording(void)
     size_t full = sizeof(struct RtDumpHeader) + 4096 * 16;
     void *buf = malloc(full);
     int i, bad = 0, lapped = 0;
+    ULONG seq, first = 0, last = 0;
 
     shared = mkring(RT_MIN_LOG2);
     stop = 0;
     pthread_create(&t, NULL, writer, NULL);
+    /* start once the writer has lapped the ring three times */
+    do
+    {
+        pthread_mutex_lock(&lock);
+        seq = shared->rt_Seq;
+        pthread_mutex_unlock(&lock);
+        sched_yield();
+    } while (seq < 3 * 4096);
     for (i = 0; i < 2000; i++)
     {
         ULONG bytes;
@@ -168,11 +178,16 @@ static void test_dump_while_recording(void)
             bad++;
         if (((struct RtDumpHeader *)buf)->rd_Lost)
             lapped++;
+        if (i == 0)
+            first = ((struct RtDumpHeader *)buf)->rd_Seq;
+        last = ((struct RtDumpHeader *)buf)->rd_Seq;
+        sched_yield();
     }
     stop = 1;
     pthread_join(t, NULL);
     EXPECT(bad == 0);
-    EXPECT(lapped > 0);        /* the writer did lap the ring meanwhile */
+    EXPECT(lapped == 2000);    /* every dump saw a ring already overwritten */
+    EXPECT(last > first);      /* and the writer ran between the dumps */
     free(buf);
     free(shared);
 }
