@@ -353,6 +353,8 @@ struct SDIO {
     ULONG   (*GetIntStatus)(struct SDIO *);
 #ifdef WIFIPI_RINGTRACE
     struct RtRing *     s_Ring;     // debug event ring (#89), NULL = none
+    UBYTE               s_RtTxStatus; // last sdio_sendpkt: 1/4 block/remainder part issued, 2/8 it succeeded
+    ULONG               s_RtTxIrq;  // interrupt status of the part that failed, 0 = none
 #endif
 };
 

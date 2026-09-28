@@ -6,8 +6,8 @@ what the driver did inside a silence.
   ringtrace.py pcapmarks PCAP > MARKS            the alignment pings in a peer capture
   ringtrace.py align  DUMP MARKS                 clock model from paired pings
   ringtrace.py window DUMP MARKS START END       records and verdicts for a gap
-  ringtrace.py txjoin DUMP PCAP START END        each TX TCP frame the host produced in
-                                                 the gap, and whether the peer saw it
+  ringtrace.py txjoin DUMP PCAP START END [W]    each TX TCP frame the host produced in
+                                                 the gap: SEEN / UNSEEN / AMBIGUOUS at the peer
 
 MARKS is the peer capture's alignment pings (ICMP echo, IP length 1139,
 ping -s 1111), one per line: epoch type id seq.  pcapmarks writes it from a
@@ -45,13 +45,17 @@ Record fields (r_A, r_B, r_C, r_D) per kind:
          src last octet<<24 | dst last octet<<16 | TCP payload length
   TXO    (any other frame) glom index, count<<8 | SDPCM seq,
          ethertype<<16 | IP protocol (0xff not parsed), frame length
+  TXRC   (after each glom's CMD53 write) status: 1 block part issued,
+         2 it succeeded, 4 remainder part issued, 8 it succeeded (no retries
+         exist); first SDPCM seq<<8 | frames; us in the write; interrupt
+         status of the part that failed (0 none)
 """
 import struct
 import sys
 
 KINDS = {1: "START", 2: "WAKE", 3: "READ", 4: "TICK", 5: "RXQ", 6: "TX",
          7: "CREDIT", 8: "EVENT", 9: "SCAN", 10: "CTRL", 11: "MARK", 12: "POLL",
-         13: "TXID1", 14: "TXID2", 15: "TXO"}
+         13: "TXID1", 14: "TXID2", 15: "TXO", 16: "TXRC"}
 E_ESCAN_RESULT = 69
 SCAN_EVENTS = {E_ESCAN_RESULT, 26, 19, 32, 37, 36, 38, 9, 11, 12, 5, 6, 16}
 # 26 SCAN_COMPLETE, 19 ROAM, 32 ROAM_PREP, 37 ROAM_START, 36 JOIN_START,
@@ -137,69 +141,127 @@ def marks_from_pcap(path):
     return m
 
 
+def txrc_state(a):
+    if not a & 5:
+        return "unknown"
+    return "failed" if (a & 1 and not a & 2) or (a & 4 and not a & 8) else "ok"
+
+
 def tx_frames(recs):
-    """TX TCP frames: a TXID1 and the TXID2 written right after it"""
-    out = []
-    for r, n in zip(recs, recs[1:]):
-        if r["k"] == 13 and n["k"] == 14 and n["seq"] == r["seq"] + 1:
-            out.append({"t": r["t"], "flags": r["a"], "ipid": r["b"], "ack": r["c"], "seq": r["d"],
-                        "idx": n["a"], "count": n["b"] >> 8, "sdpcm": n["b"] & 0xff,
-                        "sport": n["c"] >> 16, "dport": n["c"] & 0xffff,
-                        "src": n["d"] >> 24, "dst": (n["d"] >> 16) & 0xff, "len": n["d"] & 0xffff})
+    """TX TCP frames: a TXID1 and the TXID2 written right after it, each with the
+    result of its glom's write (the next TXRC whose SDPCM range holds it)"""
+    out, pending = [], []
+    for i, r in enumerate(recs):
+        n = recs[i + 1] if i + 1 < len(recs) else None
+        if r["k"] == 13 and n is not None and n["k"] == 14 and n["seq"] == r["seq"] + 1:
+            fr = {"t": r["t"], "flags": r["a"], "ipid": r["b"], "ack": r["c"], "seq": r["d"],
+                  "idx": n["a"], "count": n["b"] >> 8, "sdpcm": n["b"] & 0xff,
+                  "sport": n["c"] >> 16, "dport": n["c"] & 0xffff,
+                  "src": n["d"] >> 24, "dst": (n["d"] >> 16) & 0xff, "len": n["d"] & 0xffff,
+                  "write": "unknown", "write_us": None}
+            out.append(fr)
+            pending.append(fr)
+        elif r["k"] == 16:
+            first, cnt = r["b"] >> 8, r["b"] & 0xff
+            for fr in pending:
+                if (fr["sdpcm"] - first) & 0xff < cnt:
+                    fr["write"], fr["write_us"] = txrc_state(r["a"]), r["c"]
+            pending = []
     return out
 
 
 def peer_tcp(path):
-    """(IP id, ACK, src last octet) -> epochs of IPv4 TCP frames in the peer capture"""
-    seen = {}
+    """Every IPv4 TCP frame in the peer capture, with all the fields the host records"""
+    out = []
     for sec, us, f in pcap_frames(path):
         if len(f) < 34 or f[12:14] != b"\x08\x00" or f[14] >> 4 != 4 or f[23] != 6:
             continue
         ihl = (f[14] & 15) * 4
-        if ihl < 20 or len(f) < 14 + ihl + 12:
+        if ihl < 20 or len(f) < 14 + ihl + 14:
             continue
-        ipid = struct.unpack(">H", f[18:20])[0]
-        ack = struct.unpack(">I", f[14 + ihl + 8:14 + ihl + 12])[0]
-        seen.setdefault((ipid, ack, f[29]), []).append(sec + us / 1e6)
-    return seen
+        tot = struct.unpack(">H", f[16:18])[0]
+        if (struct.unpack(">H", f[20:22])[0] & 0x1fff) or tot < ihl + 20:
+            continue
+        th = 14 + ihl
+        doff = (f[th + 12] >> 4) * 4
+        out.append({"ep": sec + us / 1e6, "src": bytes(f[26:30]), "dst": bytes(f[30:34]),
+                    "sport": struct.unpack(">H", f[th:th + 2])[0], "dport": struct.unpack(">H", f[th + 2:th + 4])[0],
+                    "ipid": struct.unpack(">H", f[18:20])[0], "seq": struct.unpack(">I", f[th + 4:th + 8])[0],
+                    "ack": struct.unpack(">I", f[th + 8:th + 12])[0], "flags": f[th + 13],
+                    "len": tot - ihl - doff if doff >= 20 and ihl + doff <= tot else 0})
+    return out
+
+
+def txkey(x):
+    """All the discriminators a TX identity pair records; last octets for the addresses"""
+    src, dst = x["src"], x["dst"]
+    if isinstance(src, bytes):
+        src, dst = src[3], dst[3]
+    return (src, dst, x["sport"], x["dport"], x["flags"], x["ipid"], x["ack"], x["seq"], x["len"])
 
 
 FLAGS = "FSRPAUEC"
+TXJOIN_W = 1.0
 
 
 def flagstr(v):
     return "".join(c for i, c in enumerate(FLAGS) if v & (1 << i)) or "-"
 
 
-def cmd_txjoin(dump, pcap, start, end, horizon=2.0):
+def ipstr(b):
+    return ".".join(str(x) for x in b)
+
+
+def cmd_txjoin(dump, pcap, start, end, w=TXJOIN_W):
+    """SEEN: exactly one peer frame with every recorded field equal, at peer time in
+    [host_t - bound, host_t + w]; UNSEEN: none; AMBIGUOUS: more than one."""
     h, recs = load(dump)
     m = model(pings(recs, marks_from_pcap(pcap)))
-    lo, hi = float(start), float(end)
-    seen = peer_tcp(pcap)
+    lo, hi, w = float(start), float(end), float(w)
+    peer = peer_tcp(pcap)
+    byk = {}
+    for p in peer:
+        byk.setdefault(txkey(p), []).append(p)
     first_t = to_peer(m, recs[0]["t"] / 1e6) if recs else None
     covered = h["lost"] == 0 or (first_t is not None and first_t < lo - m["bound"])
-    print("window_s=%.6f..%.6f bound_ms=%.3f covered=%d lost=%d" % (lo, hi, m["bound"] * 1e3, covered, h["lost"]))
-    flows, n_seen, n_miss = {}, 0, 0
-    for fr in tx_frames(recs):
+    print("window_s=%.6f..%.6f bound_ms=%.3f join_window=[host_t-%.3f ms, host_t+%.3f s] covered=%d lost=%d" % (
+        lo, hi, m["bound"] * 1e3, m["bound"] * 1e3, w, covered, h["lost"]))
+    frames = [fr for fr in tx_frames(recs) if lo <= to_peer(m, fr["t"] / 1e6) <= hi]
+    # endpoint mapping: recorded octets and ports -> the capture's full addresses
+    pflows = {}
+    for p in peer:
+        pflows.setdefault((p["src"][3], p["dst"][3], p["sport"], p["dport"]), set()).add(
+            (ipstr(p["src"]), ipstr(p["dst"]), p["sport"], p["dport"]))
+    hflows = sorted({(f["src"], f["dst"], f["sport"], f["dport"]) for f in frames})
+    for hf in hflows:
+        full = sorted(pflows.get(hf, ()))
+        tag = "flow=.%d:%d>.%d:%d" % (hf[0], hf[2], hf[1], hf[3])
+        if not full:
+            print("flow_map %s UNMAPPED (no capture flow has these octets and ports)" % tag)
+        for f in full:
+            print("flow_map %s pcap=%s:%d>%s:%d%s" % (tag, f[0], f[2], f[1], f[3], " AMBIGUOUS_MAP" if len(full) > 1 else ""))
+    stats, tot, wstats = {}, [0, 0, 0, 0], {}
+    for fr in frames:
         pt = to_peer(m, fr["t"] / 1e6)
-        if not lo <= pt <= hi:
-            continue
-        hits = [e for e in seen.get((fr["ipid"], fr["ack"], fr["src"]), []) if pt - m["bound"] <= e <= pt + horizon]
-        flow = "%d>%d" % (fr["sport"], fr["dport"])
-        st = flows.setdefault(flow, [0, 0, 0])
-        st[0] += 1
-        if hits:
-            n_seen += 1; st[1] += 1
-            what = "seen_at_peer=%.6f delay_ms=%.3f" % (hits[0], (hits[0] - pt) * 1e3)
-        else:
-            n_miss += 1; st[2] += 1
-            what = "MISSING"
-        print("host_t=%.6f flow=%s ip_id=%d ack=%d seq=%d flags=%s len=%d sdpcm=%d glom=%d/%d %s" % (
+        cand = [p for p in byk.get(txkey(fr), []) if pt - m["bound"] <= p["ep"] <= pt + w]
+        cls = "SEEN" if len(cand) == 1 else ("UNSEEN" if not cand else "AMBIGUOUS")
+        what = cls + (" peer_t=%.6f delay_ms=%.3f" % (cand[0]["ep"], (cand[0]["ep"] - pt) * 1e3) if cls == "SEEN"
+                      else " candidates=%d" % len(cand) if cls == "AMBIGUOUS" else "")
+        flow = ".%d:%d>.%d:%d" % (fr["src"], fr["sport"], fr["dst"], fr["dport"])
+        st = stats.setdefault(flow, [0, 0, 0, 0])
+        k = {"SEEN": 1, "UNSEEN": 2, "AMBIGUOUS": 3}[cls]
+        for a in (st, tot):
+            a[0] += 1; a[k] += 1
+        wr = fr["write"] + ("" if fr["write_us"] is None else " write_us=%d" % fr["write_us"])
+        print("host_t=%.6f flow=%s ip_id=%d ack=%d seq=%d flags=%s len=%d sdpcm=%d glom=%d/%d write=%s %s" % (
             pt, flow, fr["ipid"], fr["ack"], fr["seq"], flagstr(fr["flags"]), fr["len"],
-            fr["sdpcm"], fr["idx"], fr["count"], what))
-    for flow, (p, s_, x) in sorted(flows.items()):
-        print("flow=%s produced_at_host=%d seen_at_peer=%d missing=%d" % (flow, p, s_, x))
-    print("produced_at_host=%d seen_at_peer=%d missing=%d" % (n_seen + n_miss, n_seen, n_miss))
+            fr["sdpcm"], fr["idx"], fr["count"], wr, what))
+        wst = wstats.setdefault(flow, {"ok": 0, "failed": 0, "unknown": 0})
+        wst[fr["write"]] += 1
+    for flow, st in sorted(stats.items()):
+        print("flow=%s write_ok=%d write_failed=%d write_unknown=%d" % (flow, wstats[flow]["ok"], wstats[flow]["failed"], wstats[flow]["unknown"]))
+        print("flow=%s produced_at_host=%d seen=%d unseen=%d ambiguous=%d" % ((flow,) + tuple(st)))
+    print("produced_at_host=%d seen=%d unseen=%d ambiguous=%d" % tuple(tot))
 
 
 def pings(recs, pm):
@@ -313,8 +375,8 @@ def main():
         cmd_pcapmarks(sys.argv[2])
     elif len(sys.argv) == 4 and sys.argv[1] == "align":
         cmd_align(sys.argv[2], sys.argv[3])
-    elif len(sys.argv) == 6 and sys.argv[1] == "txjoin":
-        cmd_txjoin(*sys.argv[2:6])
+    elif len(sys.argv) in (6, 7) and sys.argv[1] == "txjoin":
+        cmd_txjoin(*sys.argv[2:])
     elif len(sys.argv) == 6 and sys.argv[1] == "window":
         cmd_window(*sys.argv[2:6])
     else:

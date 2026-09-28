@@ -41,7 +41,8 @@ enum {
     RT_POLL   = 12,     /* poller: line seen, write wake, grace ran out */
     RT_TXID1  = 13,     /* TX frame identity, IPv4 TCP, first of a pair */
     RT_TXID2  = 14,     /* ... second of the pair, always the next record */
-    RT_TXO    = 15      /* TX frame identity, anything else */
+    RT_TXO    = 15,     /* TX frame identity, anything else */
+    RT_TXRC   = 16      /* one glom's CMD53 write: result and time */
 };
 
 struct RtRec {

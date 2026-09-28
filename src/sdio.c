@@ -727,6 +727,11 @@ void sdio_sendpkt(UBYTE *pkt, ULONG length, struct SDIO *sdio)
 
     ULONG block_count = length / 512;
     ULONG reminder = length % 512;
+#ifdef WIFIPI_RINGTRACE
+    /* the write's result for the debug ring (#89); cmd() does not retry */
+    sdio->s_RtTxStatus = 0;
+    sdio->s_RtTxIrq = 0;
+#endif
 
     if (block_count)
     {
@@ -737,6 +742,11 @@ void sdio_sendpkt(UBYTE *pkt, ULONG length, struct SDIO *sdio)
         cmd(IO_RW_EXTENDED | SD_DATA_WRITE | SD_CMD_MULTI_BLOCK | SD_CMD_BLKCNT_EN, 0x80000000 |
             ((SD_FUNC_RAD & 7) << 28) | (1 << 27) | (block_count & 0x1ff) | (0 << 26), 5000000, sdio);
         pkt += block_count * 512;
+#ifdef WIFIPI_RINGTRACE
+        sdio->s_RtTxStatus |= sdio->s_LastCMDSuccess ? 3 : 1;
+        if (!sdio->s_LastCMDSuccess)
+            sdio->s_RtTxIrq = sdio->s_LastInterrupt;
+#endif
     }
 
     if (reminder)
@@ -746,6 +756,11 @@ void sdio_sendpkt(UBYTE *pkt, ULONG length, struct SDIO *sdio)
         sdio->s_BlockSize = reminder;
         sdio->s_BlocksToTransfer = 1;
         cmd(IO_RW_EXTENDED | SD_DATA_WRITE, 0x80000000 | ((SD_FUNC_RAD & 7) << 28) | (reminder & 0x1ff) | (0 << 26), 5000000, sdio);
+#ifdef WIFIPI_RINGTRACE
+        sdio->s_RtTxStatus |= sdio->s_LastCMDSuccess ? 12 : 4;
+        if (!sdio->s_LastCMDSuccess && sdio->s_RtTxIrq == 0)
+            sdio->s_RtTxIrq = sdio->s_LastInterrupt;
+#endif
     }
 
     S_UNLOCK(sdio);

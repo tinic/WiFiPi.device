@@ -2084,7 +2084,8 @@ int SendGlomDataPacket(struct SDIO *sdio, struct IOSana2Req **ioList, UBYTE coun
     struct WiFiUnit *unit = WiFiBase->w_Unit;
     ULONG totalLength = 0;
 #ifdef WIFIPI_RINGTRACE
-    ULONG rtMark = 0, rtIdSeq = 0;
+    ULONG rtMark = 0, rtIdSeq = 0, rtW0;
+    UBYTE rtSeq0 = sdio->s_TXSeq;
 #endif
 
     struct PacketHeaderHW *pktBase = sdio->s_TXBuffer;
@@ -2223,8 +2224,14 @@ int SendGlomDataPacket(struct SDIO *sdio, struct IOSana2Req **ioList, UBYTE coun
 #if 0
     while(1);
 #endif
+#ifdef WIFIPI_RINGTRACE
+    rtW0 = RtClock(sdio);
+#endif
     sdio->SendPKT((UBYTE *)pktBase, totalLength, sdio);
 #ifdef WIFIPI_RINGTRACE
+    /* TXRC: a status (1/4 block/remainder part issued, 2/8 it succeeded),
+       b first SDPCM seq<<8 | frames, c us in the write, d failing part's interrupt status */
+    RtPut(sdio, RT_TXRC, sdio->s_RtTxStatus, ((UWORD)rtSeq0 << 8) | count, RtClock(sdio) - rtW0, sdio->s_RtTxIrq);
     if (rtMark)
         RtPut(sdio, RT_MARK, 1, rtMark >> 16, rtIdSeq, ((ULONG)count << 16) | (rtMark & 0xffff));
 #endif
