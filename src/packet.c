@@ -816,6 +816,9 @@ ULONG ProcessPacket(struct SDIO *sdio, struct Packet *pkt)
         {
             UBYTE *frame = (APTR)&buffer[pkt->c_DataOffset + 4];
             ULONG frameLength = pktLen - pkt->c_DataOffset - 4;
+#ifdef WIFIPI_RINGTRACE
+            sdio->s_RtRxSeq = pkt->c_Seq;
+#endif
 
             ProcessDataPacket(sdio, frame, frameLength);
 
@@ -979,6 +982,23 @@ static void RtTxFrame(struct SDIO *sdio, const UBYTE *data, ULONG len, BOOL raw,
     tcp = rt_parse_tx(data, len, et, &t);
     Forbid();
     rt_put_tx(r, RtClock(sdio), &t, tcp, idx, count, seq, et, len);
+    Permit();
+}
+
+/* Per-frame RX identity (#89) at the handoff to the stack: after the frame
+   was given to a posted read, an orphan listener, or nobody.  A pair under one Forbid. */
+static void RtRxFrame(struct SDIO *sdio, const UBYTE *frame, ULONG len, UWORD et, UBYTE outcome)
+{
+    struct ExecBase *SysBase = sdio->s_SysBase;
+    struct RtRing *r = sdio->s_Ring;
+    struct RtTx t;
+    int tcp;
+
+    if (r == NULL)
+        return;
+    tcp = len >= 14 ? rt_parse_tx(frame + 14, len - 14, et, &t) : rt_parse_tx(frame, 0, et, &t);
+    Forbid();
+    rt_put_rx(r, RtClock(sdio), &t, tcp, sdio->s_RtRxIdx, outcome, sdio->s_RtRxSeq, et, len);
     Permit();
 }
 
@@ -1543,6 +1563,9 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
                                 while(pos < pktLen)
                                 {
                                     struct Packet *epkt = (APTR)&buffer[pos];
+#ifdef WIFIPI_RINGTRACE
+                                    sdio->s_RtRxIdx = rtSub < 255 ? rtSub : 255;
+#endif
 
                                     ULONG processed = ProcessPacket(sdio, epkt);
 
@@ -1569,6 +1592,9 @@ void PacketReceiver(struct SDIO *sdio, struct Task *caller)
                         }
                         else
                         {
+#ifdef WIFIPI_RINGTRACE
+                            sdio->s_RtRxIdx = 0;
+#endif
                             ProcessPacket(sdio, pkt);
                         }
 
@@ -1993,6 +2019,9 @@ void ProcessDataPacket(struct SDIO *sdio, UBYTE *packet, ULONG packetLength)
         }
     }
 
+#ifdef WIFIPI_RINGTRACE
+    UBYTE rtOut = RT_RX_FILTERED;
+#endif
     if (accept)
     {
         UBYTE orphan = TRUE;
@@ -2016,6 +2045,11 @@ void ProcessDataPacket(struct SDIO *sdio, UBYTE *packet, ULONG packetLength)
                 {
                     /* Match, copy packet, break loop for this opener */
                     CopyPacket(io, packet, packetLength);
+#ifdef WIFIPI_RINGTRACE
+                    /* still under Disable: the reply's receiver has not run yet */
+                    if (orphan || rtOut != RT_RX_READ)
+                        rtOut = io->ios2_Req.io_Error ? RT_RX_READERR : RT_RX_READ;
+#endif
                     
                     /* The packet is sent at least to one opener, not an orphan anymore */
                     orphan = FALSE;
@@ -2029,6 +2063,9 @@ void ProcessDataPacket(struct SDIO *sdio, UBYTE *packet, ULONG packetLength)
         if (orphan)
         {
             unit->wu_Stats.UnknownTypesReceived++;
+#ifdef WIFIPI_RINGTRACE
+            rtOut = RT_RX_DROPPED;
+#endif
 
             Disable();
             /* Go through all openers and offer orphan packet to anyone asking */
@@ -2042,11 +2079,17 @@ void ProcessDataPacket(struct SDIO *sdio, UBYTE *packet, ULONG packetLength)
                 if (io->ios2_Req.io_Message.mn_Node.ln_Succ)
                 {
                     CopyPacket(io, packet, packetLength);
+#ifdef WIFIPI_RINGTRACE
+                    rtOut = RT_RX_ORPHAN;
+#endif
                 }
             }
             Enable();
         }
     }
+#ifdef WIFIPI_RINGTRACE
+    RtRxFrame(sdio, packet, packetLength, packetType, rtOut);
+#endif
 }
 
 /*

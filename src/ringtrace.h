@@ -42,7 +42,19 @@ enum {
     RT_TXID1  = 13,     /* TX frame identity, IPv4 TCP, first of a pair */
     RT_TXID2  = 14,     /* ... second of the pair, always the next record */
     RT_TXO    = 15,     /* TX frame identity, anything else */
-    RT_TXRC   = 16      /* one glom's CMD53 write: result and time */
+    RT_TXRC   = 16,     /* one glom's CMD53 write: result and time */
+    RT_RXID1  = 17,     /* RX frame identity at the handoff to the stack, IPv4 TCP, first of a pair */
+    RT_RXID2  = 18,     /* ... second of the pair, always the next record */
+    RT_RXO    = 19      /* RX frame identity, anything else */
+};
+
+/* RX outcome at the handoff (RXID2/RXO b high byte) */
+enum {
+    RT_RX_READ     = 1, /* copied into a posted read, replied without error */
+    RT_RX_READERR  = 2, /* a posted read took it but was replied with an error */
+    RT_RX_ORPHAN   = 3, /* no read of its type: given to an orphan listener */
+    RT_RX_DROPPED  = 4, /* no read and no orphan listener */
+    RT_RX_FILTERED = 5  /* multicast not in the accepted ranges */
 };
 
 struct RtRec {
@@ -173,6 +185,23 @@ static inline void rt_put_tx(struct RtRing *r, ULONG clo, const struct RtTx *t, 
     }
     else
         rt_put(r, clo, RT_TXO, idx, b, ((ULONG)ethertype << 16) | t->tx_Proto, flen);
+}
+
+/* One received frame's identity at the handoff (#89): as rt_put_tx, with
+   b = outcome<<8 | SDPCM rx seq, a = index in its glom (0 if not glommed) */
+static inline void rt_put_rx(struct RtRing *r, ULONG clo, const struct RtTx *t, int tcp,
+                             UBYTE idx, UBYTE outcome, UBYTE sdpcmSeq, UWORD ethertype, ULONG flen)
+{
+    UWORD b = ((UWORD)outcome << 8) | sdpcmSeq;
+
+    if (tcp)
+    {
+        rt_put(r, clo, RT_RXID1, t->tx_Flags, t->tx_IPId, t->tx_Ack, t->tx_Seq);
+        rt_put(r, clo, RT_RXID2, idx, b, ((ULONG)t->tx_SPort << 16) | t->tx_DPort,
+               ((ULONG)t->tx_Src << 24) | ((ULONG)t->tx_Dst << 16) | t->tx_Payload);
+    }
+    else
+        rt_put(r, clo, RT_RXO, idx, b, ((ULONG)ethertype << 16) | t->tx_Proto, flen);
 }
 
 /* Header plus the newest records that fit in `size` bytes, oldest first.

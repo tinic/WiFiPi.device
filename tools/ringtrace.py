@@ -9,6 +9,9 @@ what the driver did inside a silence.
   ringtrace.py txjoin DUMP PCAP START END [W] [--times TIMES]
                                                  each TX TCP frame the host produced in the gap:
                                                  SEEN / UNSEEN / AMBIGUOUS / CENSORED at the peer
+  ringtrace.py rxjoin DUMP PCAP START END [W] [--times TIMES]
+                                                 each TCP frame the host received in the gap, matched
+                                                 to the peer's send; the gap's exit frame and release ACK
   ringtrace.py gaps   PCAP PORT [GAP_MS]         peer-capture silences (data and ACK) > GAP_MS
 
 MARKS is the peer capture's alignment pings (ICMP echo, IP length 1139,
@@ -51,13 +54,22 @@ Record fields (r_A, r_B, r_C, r_D) per kind:
          2 it succeeded, 4 remainder part issued, 8 it succeeded (no retries
          exist); first SDPCM seq<<8 | frames; us in the write; interrupt
          status of the part that failed (0 none)
+  RXID1  (IPv4 TCP frame at the handoff to the stack, then RXID2 as the very
+         next record) TCP flags, IP id, ACK number, sequence number
+  RXID2  index in its glom, outcome<<8 | SDPCM rx seq, sport<<16 | dport,
+         src last octet<<24 | dst last octet<<16 | TCP payload length;
+         outcome 1 read, 2 read replied with an error, 3 orphan listener,
+         4 dropped (no read, no orphan listener), 5 filtered multicast
+  RXO    (any other frame) index, outcome<<8 | SDPCM seq,
+         ethertype<<16 | IP protocol (0xff not parsed), frame length
 """
 import struct
 import sys
 
 KINDS = {1: "START", 2: "WAKE", 3: "READ", 4: "TICK", 5: "RXQ", 6: "TX",
          7: "CREDIT", 8: "EVENT", 9: "SCAN", 10: "CTRL", 11: "MARK", 12: "POLL",
-         13: "TXID1", 14: "TXID2", 15: "TXO", 16: "TXRC"}
+         13: "TXID1", 14: "TXID2", 15: "TXO", 16: "TXRC", 17: "RXID1", 18: "RXID2", 19: "RXO"}
+RX_OUT = {1: "read", 2: "read_error", 3: "orphan", 4: "dropped", 5: "filtered"}
 E_ESCAN_RESULT = 69
 SCAN_EVENTS = {E_ESCAN_RESULT, 26, 19, 32, 37, 36, 38, 9, 11, 12, 5, 6, 16}
 # 26 SCAN_COMPLETE, 19 ROAM, 32 ROAM_PREP, 37 ROAM_START, 36 JOIN_START,
@@ -323,6 +335,116 @@ def cmd_txjoin(dump, pcap, start, end, w=TXJOIN_W, times=None):
     print("produced_at_host=%d seen=%d unseen=%d ambiguous=%d censored=%d" % tuple(tot))
 
 
+def rx_frames(recs):
+    """RX TCP frames at the stack handoff: an RXID1 and the RXID2 right after it"""
+    out = []
+    for r, n in zip(recs, recs[1:]):
+        if r["k"] == 17 and n["k"] == 18 and n["seq"] == r["seq"] + 1:
+            out.append({"t": r["t"], "flags": r["a"], "ipid": r["b"], "ack": r["c"], "seq": r["d"],
+                        "idx": n["a"], "outcome": RX_OUT.get(n["b"] >> 8, "unknown"), "sdpcm": n["b"] & 0xff,
+                        "sport": n["c"] >> 16, "dport": n["c"] & 0xffff,
+                        "src": n["d"] >> 24, "dst": (n["d"] >> 16) & 0xff, "len": n["d"] & 0xffff})
+    return out
+
+
+def seq_after(a, b):
+    """a is at or after b in 32-bit sequence space"""
+    return ((a - b) & 0xffffffff) < 0x80000000
+
+
+def cmd_rxjoin(dump, pcap, start, end, w=TXJOIN_W, times=None):
+    """Each TCP frame the host handed to the stack with host_t in [START, END], matched
+    to the peer frame with every recorded field equal sent in [host_t - W, host_t + bound]:
+    SEEN (unique; delay = host_t - peer_t, air + AP + chip + driver), AMBIGUOUS,
+    UNSEEN (none, the window inside the capture) or CENSORED.  Then the gap's END edge:
+    the last peer data frame sent before END (the exit frame), when the host read it,
+    and the first host ACK after that read covering it (the release ACK)."""
+    h, recs = load(dump)
+    m = model(pings(recs, marks_from_pcap(pcap)))
+    lo, hi, w = float(start), float(end), max(float(w), TXJOIN_W_MIN)
+    eps = [sec + us / 1e6 for sec, us, _ in pcap_frames(pcap)]
+    c_lo, c_hi = capture_span(min(eps), max(eps), times)
+    peer = peer_tcp(pcap)
+    byk = {}
+    for p in peer:
+        byk.setdefault(txkey(p), []).append(p)
+    rxs = rx_frames(recs)
+    for fr in rxs:
+        fr["pt"] = to_peer(m, fr["t"] / 1e6)
+        cand = [p for p in byk.get(txkey(fr), []) if fr["pt"] - w <= p["ep"] <= fr["pt"] + m["bound"]]
+        fr["cand"] = cand
+        if len(cand) == 1:
+            fr["cls"] = "SEEN"
+        elif cand:
+            fr["cls"] = "AMBIGUOUS"
+        elif c_lo <= fr["pt"] - w and fr["pt"] + m["bound"] <= c_hi:
+            fr["cls"] = "UNSEEN"
+        else:
+            fr["cls"] = "CENSORED"
+    print("window_s=%.6f..%.6f bound_ms=%.3f join_window=[host_t-%.3f s, host_t+%.3f ms] (W provisional) capture=%.6f..%.6f lost=%d" % (
+        lo, hi, m["bound"] * 1e3, w, m["bound"] * 1e3, c_lo, c_hi, h["lost"]))
+    print("note=delay_ms is host handoff minus peer send: air, AP, chip and driver together")
+    inw = [fr for fr in rxs if lo <= fr["pt"] <= hi]
+    tot = {"SEEN": 0, "UNSEEN": 0, "AMBIGUOUS": 0, "CENSORED": 0}
+    outc, delays = {}, []
+    for fr in inw:
+        tot[fr["cls"]] += 1
+        outc[fr["outcome"]] = outc.get(fr["outcome"], 0) + 1
+        extra = ""
+        if fr["cls"] == "SEEN":
+            d = (fr["pt"] - fr["cand"][0]["ep"]) * 1e3
+            delays.append(d)
+            extra = " peer_tx_t=%.6f delay_ms=%.3f" % (fr["cand"][0]["ep"], d)
+        elif fr["cls"] == "AMBIGUOUS":
+            extra = " candidates=%d" % len(fr["cand"])
+        print("host_rx_t=%.6f flow=.%d:%d>.%d:%d ip_id=%d seq=%d ack=%d flags=%s len=%d sdpcm=%d glom_idx=%d outcome=%s %s%s" % (
+            fr["pt"], fr["src"], fr["sport"], fr["dst"], fr["dport"], fr["ipid"], fr["seq"], fr["ack"],
+            flagstr(fr["flags"]), fr["len"], fr["sdpcm"], fr["idx"], fr["outcome"], fr["cls"], extra))
+    data = [fr for fr in inw if fr["len"]]
+    if data:
+        s0 = min(data, key=lambda f: f["pt"])
+        sent = [f["cand"][0]["ep"] for f in data if f["cls"] == "SEEN"]
+        print("arrived frames=%d bytes=%d seq_first=%d seq_last_end=%d peer_sent=%s outcomes=%s" % (
+            len(data), sum(f["len"] for f in data), s0["seq"],
+            max(((f["seq"] + f["len"]) & 0xffffffff for f in data), key=lambda v: (v - s0["seq"]) & 0xffffffff),
+            "%.6f..%.6f" % (min(sent), max(sent)) if sent else "-",
+            ",".join("%s=%d" % kv for kv in sorted(outc.items()))))
+    if delays:
+        print("rx_delay_ms n=%d max=%.3f (inside W only)" % (len(delays), max(delays)))
+    # the END edge: exit frame (last peer data frame sent before END), its host read, the release ACK
+    ex = [p for p in peer if p["len"] > 0 and p["ep"] <= hi and p["ep"] >= lo - w]
+    if ex:
+        e = max(ex, key=lambda p: p["ep"])
+        got = [fr for fr in rxs if fr["cls"] == "SEEN" and fr["cand"][0] is e]
+        print("exit_frame peer_tx_t=%.6f seq=%d len=%d ip_id=%d" % (e["ep"], e["seq"], e["len"], e["ipid"]))
+        if got:
+            r = got[0]
+            print("exit_frame host_rx_t=%.6f read_delay_ms=%.3f outcome=%s" % (r["pt"], (r["pt"] - e["ep"]) * 1e3, r["outcome"]))
+            want = (e["seq"] + e["len"]) & 0xffffffff
+            acks = [f for f in tx_frames(recs)
+                    if f["flags"] & 0x10 and f["sport"] == e["dport"] and f["dport"] == e["sport"]
+                    and f["src"] == e["dst"][3] and f["dst"] == e["src"][3]
+                    and to_peer(m, f["t"] / 1e6) >= r["pt"] and seq_after(f["ack"], want)]
+            if acks:
+                a = min(acks, key=lambda f: f["t"])
+                at = to_peer(m, a["t"] / 1e6)
+                seen = [p for p in byk.get(txkey(a), []) if at - m["bound"] <= p["ep"] <= at + w]
+                print("release_ack host_tx_t=%.6f ack=%d ip_id=%d ack_production_ms=%.3f peer_rx_t=%s write=%s" % (
+                    at, a["ack"], a["ipid"], (at - r["pt"]) * 1e3,
+                    "%.6f" % seen[0]["ep"] if len(seen) == 1 else ("ambiguous" if seen else "unseen"), a["write"]))
+                rd, ap = (r["pt"] - e["ep"]) * 1e3, (at - r["pt"]) * 1e3
+                print("edge read_delay_ms=%.3f ack_production_ms=%.3f larger=%s" % (
+                    rd, ap, "upstream_delivery" if rd > ap else "host_ack_production"))
+            else:
+                print("release_ack none (no host ACK covering seq %d after the read)" % want)
+        else:
+            print("exit_frame host_rx_t=none (not matched at the host handoff)")
+    else:
+        print("exit_frame none (no peer data frame in the window)")
+    print("received_at_host=%d seen=%d unseen=%d ambiguous=%d censored=%d" % (
+        len(inw), tot["SEEN"], tot["UNSEEN"], tot["AMBIGUOUS"], tot["CENSORED"]))
+
+
 def cmd_gaps(pcap, port, gap_ms=150.0):
     """Silences in the peer capture, as ackab.py counts them: data = peer->Amiga TCP to
     PORT with payload; ack = Amiga->peer TCP from PORT.  One line per gap > gap_ms."""
@@ -453,6 +575,12 @@ def main():
         cmd_align(sys.argv[2], sys.argv[3])
     elif len(sys.argv) in (4, 5) and sys.argv[1] == "gaps":
         cmd_gaps(*sys.argv[2:])
+    elif len(sys.argv) >= 6 and sys.argv[1] == "rxjoin":
+        a = sys.argv[2:]
+        times = None
+        if "--times" in a:
+            i = a.index("--times"); times = a[i + 1]; del a[i:i + 2]
+        cmd_rxjoin(*a, times=times)
     elif len(sys.argv) >= 6 and sys.argv[1] == "txjoin":
         a = sys.argv[2:]
         times = None

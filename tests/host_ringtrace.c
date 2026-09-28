@@ -270,6 +270,16 @@ static void test_txid(void)
            e[1].r_C == ((7502UL << 16) | 40462) && e[1].r_D == ((137UL << 24) | (136UL << 16)));
     EXPECT(e[2].r_Kind == RT_TXO && e[2].r_A == 4 && e[2].r_B == ((7 << 8) | 0xC5) &&
            e[2].r_C == ((0x0800UL << 16) | 17) && e[2].r_D == 60);
+    /* RX: the same pair shape, outcome in b's high byte */
+    n = mk_tcp(b, 5, 200, 0x0BAD, 0x33333333, 0x44444444, 0x10, 0);
+    rt_put_rx(r, 600, &t, rt_parse_tx(b, n, 0x0800, &t), 2, RT_RX_READ, 0x7E, 0x0800, n + 14);
+    t.tx_Proto = 0xff;
+    rt_put_rx(r, 601, &t, 0, 0, RT_RX_DROPPED, 0x7F, 0x0806, 60);
+    EXPECT(rt_snapshot(r, 0, buf, full) == 32 + 6 * 16);
+    EXPECT(e[3].r_Kind == RT_RXID1 && e[3].r_A == 0x10 && e[3].r_B == 0x0BAD && e[3].r_C == 0x44444444 && e[3].r_D == 0x33333333);
+    EXPECT(e[4].r_Kind == RT_RXID2 && e[4].r_A == 2 && e[4].r_B == ((RT_RX_READ << 8) | 0x7E) &&
+           e[4].r_D == ((137UL << 24) | (136UL << 16) | 200));
+    EXPECT(e[5].r_Kind == RT_RXO && e[5].r_B == ((RT_RX_DROPPED << 8) | 0x7F) && e[5].r_C == ((0x0806UL << 16) | 0xff) && e[5].r_D == 60);
     free(buf);
     free(r);
 }
