@@ -15,6 +15,20 @@ extern "C" {
 #define REGARG(arg, reg) arg asm(reg)
 #endif
 
+/*
+ * Arguments on the stack whatever -mregparm says.  For a function that is
+ * entered by something other than a C call: a task entry whose arguments
+ * were pushed onto its initial stack, or a callback another binary calls.
+ * AmiNetXDuo builds this driver with -mregparm=3, under which an unmarked
+ * function reads its first arguments from a0/a1/d0 instead.  Goes before the
+ * declarator: GCC rejects a trailing attribute on a definition.
+ */
+#if defined(__GNUC__) && defined(__stdargs) && !defined(__INTELLISENSE__)
+#define STACKARGS __stdargs
+#else
+#define STACKARGS
+#endif
+
 #ifdef __cplusplus
 }
 #endif

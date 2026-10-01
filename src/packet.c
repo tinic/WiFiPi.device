@@ -851,7 +851,8 @@ UBYTE PacketTxCredit(struct SDIO *sdio)
     return (d & 0x80) ? 0 : d;
 }
 
-static void PacketPoller(struct SDIO *sdio)
+/* Entered by AddTask() with its arguments pushed on the initial stack. */
+static STACKARGS void PacketPoller(struct SDIO *sdio)
 {
     struct ExecBase *SysBase = sdio->s_SysBase;
     struct WiFiBase *WiFiBase = sdio->s_WiFiBase;
@@ -973,7 +974,8 @@ static inline void PokePoller(struct SDIO *sdio)
         Signal(sdio->s_PollTask, sdio->s_PollWake);
 }
 
-void PacketReceiver(struct SDIO *sdio, struct Task *caller)
+/* Entered by AddTask() with its arguments pushed on the initial stack. */
+STACKARGS void PacketReceiver(struct SDIO *sdio, struct Task *caller)
 {
     struct ExecBase *SysBase = sdio->s_SysBase;
     ULONG waitDelay = PACKET_WAIT_DELAY_MAX;
@@ -2068,7 +2070,8 @@ int SendDataPacket(struct SDIO *sdio, struct IOSana2Req *io)
     return 1;
 }
 #if 0
-void NetworkScanner(struct SDIO *sdio)
+/* Entered by AddTask() with its arguments pushed on the initial stack. */
+STACKARGS void NetworkScanner(struct SDIO *sdio)
 {
     struct ExecBase *SysBase = sdio->s_SysBase;
     struct WiFiBase *WiFiBase = sdio->s_WiFiBase;

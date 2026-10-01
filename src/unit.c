@@ -34,7 +34,8 @@
 #define UNIT_STACK_SIZE (32768 / sizeof(ULONG))
 #define UNIT_TASK_PRIORITY 10
 
-void UnitTask(struct WiFiUnit *unit, struct Task *parent)
+/* Entered by AddTask() with its arguments pushed on the initial stack. */
+STACKARGS void UnitTask(struct WiFiUnit *unit, struct Task *parent)
 {
     struct WiFiBase *WiFiBase = unit->wu_Base;
     struct ExecBase *SysBase = WiFiBase->w_SysBase;
