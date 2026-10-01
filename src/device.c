@@ -303,12 +303,15 @@ void WiFi_Open(REGARG(struct IOSana2Req * io, "a1"), REGARG(LONG unitNumber, "d0
 
         /* AmiNetXDuo's private direct-receive path is one versioned TAG_USER
            record.  Unknown versions and short records remain untouched, just
-           like an ordinary SANA-II driver that does not know the extension. */
+           like an ordinary SANA-II driver that does not know the extension.
+           Every version from MIN on keeps the prefix read here; v3 changed
+           only ANXD_CMD_RX_BATCH's record, which this driver does not take. */
         {
             AnxdS2Extension *ext = (AnxdS2Extension *)
                 GetTagData(ANXD_S2_EXTENSION, 0, tags);
 
-            if (ext != NULL && ext->Version == ANXD_S2_ABI_VERSION &&
+            if (ext != NULL && ext->Version >= ANXD_S2_ABI_VERSION_MIN &&
+                ext->Version <= ANXD_S2_ABI_VERSION &&
                 ext->Size >= (UWORD)sizeof(*ext))
             {
                 ULONG accepted = 0;

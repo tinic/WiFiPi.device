@@ -21,7 +21,12 @@ add_executable(wifipi.device
     src/findtoken.c
 )
 
-target_include_directories(wifipi.device PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+# <aminetxduo/anxs2ext.h> is AmiNetXDuo's own header, not a copy kept here:
+# this fork is built as AmiNetXDuo's third_party/wifipi.
+set(AMINETXDUO_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/../../include" CACHE PATH
+    "AmiNetXDuo's include directory, for <aminetxduo/anxs2ext.h>")
+target_include_directories(wifipi.device PRIVATE ${AMINETXDUO_INCLUDE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # -fno-tree-loop-distribute-patterns and -fno-builtin: a freestanding image has no
 # libc for the memset/memcpy calls GCC would otherwise invent; the loops stay loops.
 target_compile_options(wifipi.device PRIVATE -Os -m68040 -Wall -Wextra -Werror -fomit-frame-pointer
