@@ -13,10 +13,19 @@
 #define ANXD_S2_TXF_TCP         0x01
 #define ANXD_S2_TXF_UDP         0x02
 
-typedef UBYTE *(*AnxdS2RxDirect)(APTR ios2_data, ULONG len);
-typedef VOID   (*AnxdS2RxFilled)(APTR ios2_data, ULONG len, ULONG sum,
-                                 UBYTE flags);
-typedef UBYTE  (*AnxdS2TxFlags)(APTR ios2_data);
+/* The library defines these with stack arguments (AmiNetXDuo #126), and
+   this driver is built with -mregparm=3: without the pin every call handed
+   ios2_data and len in a0/d0 to a callee reading 4(sp). */
+#if defined(__GNUC__) && defined(__stdargs)
+#define ANXD_S2_STDARGS __stdargs
+#else
+#define ANXD_S2_STDARGS
+#endif
+
+typedef ANXD_S2_STDARGS UBYTE *(*AnxdS2RxDirect)(APTR ios2_data, ULONG len);
+typedef ANXD_S2_STDARGS VOID   (*AnxdS2RxFilled)(APTR ios2_data, ULONG len,
+                                                 ULONG sum, UBYTE flags);
+typedef ANXD_S2_STDARGS UBYTE  (*AnxdS2TxFlags)(APTR ios2_data);
 
 /* One versioned TAG_USER negotiation record shared with AmiNetXDuo. */
 #define ANXD_S2_EXTENSION       (0x80000000UL | 0x00414e58UL)
