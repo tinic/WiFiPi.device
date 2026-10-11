@@ -189,6 +189,18 @@ void PacketCtrlShutdown(struct SDIO *sdio, struct MsgPort *ctrl);
 void StartNetworkScan(struct IOSana2Req *io);
 struct WiFiUnit;
 void ReplyScan(struct WiFiUnit *unit);
+struct WiFiBase;
+struct BSSInfo;
+struct PacketEvent;
+void UpdateNetwork(struct WiFiUnit *unit, struct BSSInfo *info);
+void ProcessEvent(struct SDIO *sdio, struct PacketEvent *pe);
+void ScanWatchdog(struct WiFiBase *WiFiBase);
+
+/* wl_escan_params: version, action, sync_id, then wl_scan_params up to a
+   channel list of 14 and room for one SSID */
+#define SCAN_PARAMS_SIZE    (4+2+2+4+32+6+1+1+4*4+2+2+14*2+32+4)
+#define SCAN_PARAMS_NCHAN   68      /* channel_num: channels low, SSIDs high */
+const UBYTE *ScanParams(UBYTE *buf, const UBYTE *networkName);
 int PacketUploadCLM(struct SDIO *sdio);
 int Connect(struct SDIO *sdio, struct WiFiNetwork *network);
 int SendDataPacket(struct SDIO *sdio, struct IOSana2Req *io);
@@ -297,5 +309,85 @@ struct VsTLV {
 
 struct VsTLV * FindWPAIE(UBYTE *data, ULONG len);
 struct TLV * brcmf_parse_tlvs(void *buf, ULONG buflen, UBYTE key);
+
+/* Firmware event and escan records, shared with tests/test_scan.c */
+struct EtherHeader {
+    UBYTE eh_Dest[6];
+    UBYTE eh_Src[6];
+    UWORD eh_Type;
+} __attribute__((packed));
+
+#define ETHERHDR_TYPE_LINK_CTL  0x886c
+
+struct BCMEtherHeader {
+    UWORD beh_Subtype;
+    UWORD beh_Length;
+    UBYTE beh_Version;
+    UBYTE beh_OUI[3];
+    UWORD beh_UsrSubtype;
+} __attribute__((packed));
+
+#define BCMETHHDR_OUI   "\0x00\0x10\0x18"
+#define BCMETHHDR_SUBTYPE_EVENT 1
+
+struct EtherAddr {
+    UBYTE ea_Addr[6];
+} __attribute__((packed));
+
+struct PacketEvent {
+    struct EtherHeader      e_EthHeader;
+    struct BCMEtherHeader   e_Header;
+    UWORD                   e_Version;
+    UWORD                   e_Flags;
+    ULONG                   e_EventType;
+    ULONG                   e_Status;
+    ULONG                   e_Reason;
+    ULONG                   e_AuthType;
+    ULONG                   e_DataLen;
+    struct EtherAddr        e_Address;
+    char                    e_IFName[16];
+    UBYTE                   e_IFIdx;
+    UBYTE                   e_BSSCFgIdx;
+} __attribute__((packed));
+
+struct BSSInfo {
+    ULONG   bssi_Version;
+    ULONG   bssi_Length;
+    UBYTE   bssi_ID[6];
+    UWORD   bssi_BeaconPeriod;
+    UWORD   bssi_Capability;
+    UBYTE   bssi_SSIDLength;
+    UBYTE   bssi_SSID[32];
+    UBYTE   PAD;
+    ULONG   bssi_NRates;
+    UBYTE   bssi_Rates[16];
+    UWORD   bssi_ChanSpec;      // 72
+    UWORD   bssi_ATimWindow;
+    UBYTE   bssi_DTimPeriod;
+    UBYTE   PAD;
+    UWORD   bssi_RSSI;
+    UBYTE   bssi_PHYNoise;
+    UBYTE   bssi_NCap;
+    UWORD   PAD;
+    ULONG   bssi_NBSSCap;
+    UBYTE   bssi_CtlCh;
+    UBYTE   PAD[3];
+    ULONG   bssi_Reserved32[1];
+    UBYTE   bssi_Flags;
+    UBYTE   bssi_Reserved[3];
+    UBYTE   bssi_BasicMCS[16];
+    UWORD   bssi_IEOffset;
+    UWORD   PAD;
+    ULONG   bssi_IELength;
+    UWORD   bssi_SNR;
+} __attribute__((packed));
+
+struct EScanResult {
+    ULONG   esr_Length;
+    ULONG   esr_Version;
+    UWORD   esr_SyncID;
+    UWORD   esr_BSSCount;
+    struct BSSInfo esr_BSSInfo[];
+} __attribute__((packed));
 
 #endif /* _PACKET_H */

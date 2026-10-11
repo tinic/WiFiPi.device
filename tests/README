@@ -24,3 +24,5 @@ test_abortio.c (AbortIO leaves a limited request's io_Actual alone) likewise.
 test_open.c (#95) builds the same way (tests/test_open.c in place of
 tests/test_ctrl.c) and takes about 5 s: a full open fails, with nothing
 changed, when the unit cannot read its permanent address.
+test_scan.c (S2_GETNETWORKS: escan parameters, 2.4 and 5 GHz results, abort,
+the 10 s watchdog) builds the same way and takes about 5 s.
