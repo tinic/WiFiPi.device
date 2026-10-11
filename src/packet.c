@@ -459,7 +459,7 @@ struct TagItem * FindNetwork(struct WiFiUnit *unit, struct BSSInfo *info)
                 continue;
 
             ULONG channel = GetTagData(S2INFO_Channel, 0, tags);
-            if (channel != ci.ci_CHNum)
+            if (channel != ci.ci_ControlChannel)
                 continue;
 
             found = tags;
@@ -623,8 +623,10 @@ void UpdateNetwork(struct WiFiUnit *unit, struct BSSInfo *info)
     ci.ci_CHSpec = LE16(info->bssi_ChanSpec);
     DecodeChanSpec(&ci, sdio->s_Chip->c_D11Type);
 
+    /* The primary channel, the one a BSS is known by; ci_CHNum is the
+       centre of a 40/80 MHz one (46 for a BSS on 44 with 48) */
     tags->ti_Tag = S2INFO_Channel;
-    tags->ti_Data = ci.ci_CHNum;
+    tags->ti_Data = ci.ci_ControlChannel;
     tags++;
 
     tags->ti_Tag = S2INFO_Band;
@@ -3204,7 +3206,12 @@ void StartNetworkScan(struct IOSana2Req *io)
     UBYTE *networkName = NULL;
     struct TagItem *tags = io->ios2_StatData;
 
-    /* THis needs to be gone! The paramsv2 layout is known... */
+    /* THis needs to be gone! The paramsv2 layout is known...
+       channel_num is 0: the firmware scans every channel its country and
+       regulatory revision allow, on both bands, active or passive as each
+       channel requires (brcmfmac does the same for a scan that names no
+       channels).  It used to list 1-14 as d11n chanspecs, which this
+       d11ac chip reads as 160 MHz 2.4 GHz channels: none is valid. */
     static const UBYTE params[4+2+2+4+32+6+1+1+4*4+2+2+14*2+32+4] = {
         1,0,0,0,
         1,0,
@@ -3218,10 +3225,10 @@ void StartNetworkScan(struct IOSana2Req *io)
         0xff,0xff,0xff,0xff,
         0xff,0xff,0xff,0xff,
         0xff,0xff,0xff,0xff,
-        14,0,
         0,0,
-        0x01,0x2b,0x02,0x2b,0x03,0x2b,0x04,0x2b,0x05,0x2e,0x06,0x2e,0x07,0x2e,
-        0x08,0x2b,0x09,0x2b,0x0a,0x2b,0x0b,0x2b,0x0c,0x2b,0x0d,0x2b,0x0e,0x2b,
+        0,0,
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,
         0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
     };
     UBYTE buf[sizeof(params)];      /* the receiver's stack, not w_MemPool (#94) */
