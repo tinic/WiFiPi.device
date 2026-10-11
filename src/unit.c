@@ -507,33 +507,6 @@ static int Do_S2_SETKEY(struct IOSana2Req *io)
     D(bug("[WiFi.0]   Enc.Type: %ld\n", io->ios2_PacketType));
     D(bug("[WiFi.0]   KeyLength: %ld\n", io->ios2_DataLength));
 
-    D(bug("[WiFi.0]   Key: %08lx", (ULONG)io->ios2_Data));
-    if (io->ios2_Data && io->ios2_DataLength)
-    {
-        for (ULONG i=0; i < io->ios2_DataLength; i++) {
-            if (i == 0)
-                bug(" (%02lx, ", ((UBYTE*)io->ios2_Data)[i]);
-            else if (i == io->ios2_DataLength - 1)
-                bug("%02lx)\n", ((UBYTE*)io->ios2_Data)[i]);
-            else
-                bug("%02lx, ", ((UBYTE*)io->ios2_Data)[i]);
-        }
-    }
-    else { D(bug("\n")); }
-    D(bug("[WiFi.0]   RX cnt: %08lx", (ULONG)io->ios2_StatData));
-    if (io->ios2_StatData)
-    {
-        for (ULONG i=0; i < 8; i++) {
-            if (i == 0)
-                bug(" (%02lx, ", ((UBYTE*)io->ios2_StatData)[i]);
-            else if (i == 7 - 1)
-                bug("%02lx)\n", ((UBYTE*)io->ios2_StatData)[i]);
-            else
-                bug("%02lx, ", ((UBYTE*)io->ios2_StatData)[i]);
-        }
-    }
-    else { D(bug("\n")); }
-
     /* A key the firmware's record cannot hold, or one that is not there */
     if (io->ios2_DataLength > sizeof(((struct bwfm_wsec_key *)0)->k_Data) ||
         (io->ios2_DataLength != 0 && io->ios2_Data == NULL))
@@ -628,16 +601,6 @@ static int Do_S2_SETKEY(struct IOSana2Req *io)
         }
 
         D(bug("[WiFi.0] Setting key (size %ld)\n", sizeof(key)));
-        for (unsigned i=0; i < sizeof(key); i++)
-        {
-            if (i % 16 == 0)
-                D(bug("[KEY] %03lx:", i));
-            
-            D(bug(" %02lx", ((UBYTE*)&key)[i]));
-            if (i % 16 == 15)
-                D(bug("\n"));
-        }
-        if (sizeof(key) & 15) D(bug("\n"));
 
         if (CtrlLost(PacketSetVar(WiFiBase->w_SDIO, "wsec_key", &key, sizeof(key))))
         {

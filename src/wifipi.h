@@ -311,8 +311,19 @@ static inline void wr32be(APTR addr, ULONG offset, ULONG val)
 struct WiFiBase * WiFi_Init(REGARG(struct WiFiBase *base, "d0"), REGARG(BPTR seglist, "a0"),
                             REGARG(struct ExecBase *SysBase, "a6"));
 
+/* Diagnostics go to Emu68's debug port, which no user reads, so only a
+   build with WIFIPI_DEBUG prints.  Elsewhere bug() compiles to nothing and
+   its arguments are not evaluated: an argument that must run (a hardware
+   read) is made a statement of its own.  SysBase is named because the
+   printing build's RawDoFmt needs it in scope at every call.  Key material
+   is printed in no build. */
+#ifdef WIFIPI_DEBUG
 #define bug(string, ...) \
     do { ULONG args[] = {0, __VA_ARGS__}; RawDoFmt((CONST_STRPTR)string, &args[1], (APTR)putch, NULL); } while(0)
+#else
+#define bug(string, ...) \
+    do { if (0) { ULONG args[] = {0, __VA_ARGS__}; (void)args; (void)SysBase; } } while(0)
+#endif
 
 
 BOOL LoadFirmware(struct Chip *chip);

@@ -33,6 +33,12 @@ target_compile_options(wifipi.device PRIVATE -Os -m68040 -Wall -Wextra -Werror -
     -ffreestanding -fno-builtin -fno-tree-loop-distribute-patterns
     -flto)
 target_compile_definitions(wifipi.device PRIVATE VERSION_STRING="${VERSTRING}")
+# The diagnostics to Emu68's debug port (bug() in src/wifipi.h): a third of
+# the image, and no user reads them.  -DWIFIPI_DEBUG=ON for a debug build.
+option(WIFIPI_DEBUG "Print diagnostics to Emu68's debug port" OFF)
+if(WIFIPI_DEBUG)
+    target_compile_definitions(wifipi.device PRIVATE WIFIPI_DEBUG=1)
+endif()
 # -Wl,-u,_RomTag: nothing in the image references the ROMTag (exec finds it by
 # scanning for RTC_MATCHWORD), so under LTO the linker plugin sees it, the init
 # table, the LVO vector table and every function they point at as dead code

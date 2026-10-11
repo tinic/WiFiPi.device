@@ -1783,22 +1783,6 @@ void ProcessDataPacket(struct SDIO *sdio, UBYTE *packet, ULONG packetLength)
     /* the receiver's tick and poller run fast for frames addressed to us */
     if ((packet[0] & 0x01) == 0)
         sdio->s_RxUnicast = 1;
-#if 1
-    if (packetType == 0x888e)
-    {
-        struct ExecBase *SysBase = WiFiBase->w_SysBase;
-        bug("[DATA.IN] Packet in:\n");
-        for (ULONG i=0; i < packetLength; i++)
-        {
-            if (i % 16 == 0)
-                bug("[DATA.IN] %04lx: ", i);
-            bug(" %02lx", packet[i]);
-            if (i % 16 == 15)
-                bug("\n");
-        }
-        if (packetLength % 16 != 0) bug("\n");
-    }
-#endif
 
     if (destAddr != 0xffffffffffffULL && (destAddr & 0x010000000000ULL))
     {
@@ -1980,24 +1964,6 @@ int SendGlomDataPacket(struct SDIO *sdio, struct IOSana2Req **ioList, UBYTE coun
             D(bug("[WiFi] Sending Frame without data, packet type %04lx\n", io->ios2_PacketType));
         }
 
-#if 1
-        if (io->ios2_PacketType == 0x888e)
-        {
-            UBYTE *ptr = (UBYTE *)hdr + sizeof(struct PacketHeaderSW) + 4;
-            ULONG length = packetLength - sizeof(struct Packet) - sizeof(struct GlomHeader) - 4;
-
-            bug("[DATA.OUT] Packet out:\n");
-            for (ULONG i=0; i < length; i++)
-            {
-                if (i % 16 == 0)
-                    bug("[DATA.OUT] %04lx: ", i);
-                bug(" %02lx", ptr[i]);
-                if (i % 16 == 15)
-                    bug("\n");
-            }
-            if (packetLength % 16 != 0) bug("\n");
-        }
-#endif
         // Increase total length by packet length (aligned)
         totalLength += (packetLength + 3) & ~3;
     }
