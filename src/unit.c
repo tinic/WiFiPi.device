@@ -1089,15 +1089,19 @@ static int Do_S2_GETNETWORKINFO(struct IOSana2Req *io)
         ULONG rssi;
         ULONG chanspec;
 
-        if (PacketCmdIntGet(sdio, BRCMF_C_GET_RSSI, &rssi) == 0)
+        ULONG err = PacketCmdIntGet(sdio, BRCMF_C_GET_RSSI, &rssi);
+
+        if (err == 0)
         {
             tags->ti_Tag = S2INFO_Signal;
             tags->ti_Data = rssi;               /* dBm, negative */
             tags++;
         }
-        if (PacketGetVarMin(sdio, "chanspec", &chanspec, 4, 4) == 0)
+        /* a firmware that did not answer is not asked again: the unit
+           lock is held, and each request may wait out its deadline */
+        if (!CtrlLost(err) && PacketGetVarMin(sdio, "chanspec", &chanspec, 4, 4) == 0)
         {
-            struct ChannelInfo ci;
+            struct ChannelInfo ci = { 0 };
             ci.ci_CHSpec = LE32(chanspec);
             DecodeChanSpec(&ci, sdio->s_Chip->c_D11Type);
 

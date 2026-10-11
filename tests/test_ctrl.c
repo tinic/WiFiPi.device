@@ -674,6 +674,8 @@ int main(void)
         struct TagItem *t;
         funit.wu_JoinParams.ej_SSID.ssid_Length = LE32(4);
         CopyMem("Five", funit.wu_JoinParams.ej_SSID.ssid_Value, 4);
+        static UBYTE rsn[] = { 48, 2, 1, 0 };
+        funit.wu_WPAInfo = rsn;                 /* all seven slots in use */
         mode = M_NETINFO;
         io->ios2_Req.io_Command = S2_GETNETWORKINFO;
         io->ios2_Req.io_Flags = IOF_QUICK;
@@ -687,6 +689,21 @@ int main(void)
         expect_eq(t ? (LONG)GetTagData(S2INFO_Signal, 0, t) : 0, NETINFO_RSSI, "S2INFO_Signal, dBm");
         expect_eq(t ? (LONG)GetTagData(S2INFO_Channel, 0, t) : 0, 44, "S2INFO_Channel, primary");
         expect_eq(t ? (LONG)GetTagData(S2INFO_Band, 99, t) : 0, S2BAND_A, "S2INFO_Band A");
+        expect(t != NULL && GetTagData(S2INFO_WPAInfo, 0, t) != 0 &&
+               ((UBYTE *)GetTagData(S2INFO_WPAInfo, 0, t))[0] == 48, "S2INFO_WPAInfo");
+        funit.wu_WPAInfo = NULL;
+
+        /* no answer at all: the chanspec is not asked after the lost RSSI */
+        mode = M_NOREPLY;
+        io->ios2_Req.io_Flags = IOF_QUICK;
+        io->ios2_StatData = NULL;
+        i = sends;
+        WiFi_BeginIO(io);
+        t = io->ios2_StatData;
+        expect_eq(io->ios2_Req.io_Error, 0, "GETNETWORKINFO answered after a lost reading");
+        expect_eq(sends - i, 1, "one request sent, not two");
+        expect(t != NULL && FindTagItem(S2INFO_Signal, t) == NULL, "no reading: no S2INFO_Signal");
+        helper_cmd(CMD_SWEEP);
 
         /* the firmware refuses both: the link's name still comes back */
         mode = M_FWERR;

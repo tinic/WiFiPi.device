@@ -370,7 +370,7 @@ struct TagItem * FindNetwork(struct WiFiUnit *unit, struct BSSInfo *info)
                 continue;
             
             /* Finally, check channel */
-            struct ChannelInfo ci;
+            struct ChannelInfo ci = { 0 };
             ci.ci_CHSpec = LE16(info->bssi_ChanSpec);
             DecodeChanSpec(&ci, sdio->s_Chip->c_D11Type);
 
@@ -540,7 +540,7 @@ void UpdateNetwork(struct WiFiUnit *unit, struct BSSInfo *info)
     tags->ti_Data = LE16(info->bssi_Capability);
     tags++;
 
-    struct ChannelInfo ci;
+    struct ChannelInfo ci = { 0 };
     ci.ci_CHSpec = LE16(info->bssi_ChanSpec);
     DecodeChanSpec(&ci, sdio->s_Chip->c_D11Type);
 
