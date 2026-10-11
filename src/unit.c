@@ -26,6 +26,7 @@
 #include <stdint.h>
 
 #include "wifipi.h"
+#include "d11.h"
 #include "packet.h"
 #include "brcm.h"
 #include "brcm_wifi.h"
@@ -995,7 +996,8 @@ static int Do_S2_GETNETWORKINFO(struct IOSana2Req *io)
         return 1;
     }
 
-    io->ios2_StatData = tags = AllocPooled(memPool, sizeof(struct TagItem) * 4);
+    /* SSID, BSSID, WPAInfo, Signal, Channel, Band, TAG_DONE */
+    io->ios2_StatData = tags = AllocPooled(memPool, sizeof(struct TagItem) * 7);
     if (io->ios2_StatData == NULL)
     {
         io->ios2_WireError = S2WERR_BUFF_ERROR;
@@ -1077,6 +1079,35 @@ static int Do_S2_GETNETWORKINFO(struct IOSana2Req *io)
         }
         CopyMem(unit->wu_WPAInfo, (APTR)tags->ti_Data, unit->wu_WPAInfo[1] + 2);
         tags++;
+    }
+
+    /* The link as it is now, so a client needs no scan to show it.  A value
+       the firmware does not give is left out rather than failing the
+       request: WirelessManager asks this at every association. */
+    {
+        struct SDIO *sdio = WiFiBase->w_SDIO;
+        ULONG rssi;
+        ULONG chanspec;
+
+        if (PacketCmdIntGet(sdio, BRCMF_C_GET_RSSI, &rssi) == 0)
+        {
+            tags->ti_Tag = S2INFO_Signal;
+            tags->ti_Data = rssi;               /* dBm, negative */
+            tags++;
+        }
+        if (PacketGetVarMin(sdio, "chanspec", &chanspec, 4, 4) == 0)
+        {
+            struct ChannelInfo ci;
+            ci.ci_CHSpec = LE32(chanspec);
+            DecodeChanSpec(&ci, sdio->s_Chip->c_D11Type);
+
+            tags->ti_Tag = S2INFO_Channel;
+            tags->ti_Data = ci.ci_ControlChannel;
+            tags++;
+            tags->ti_Tag = S2INFO_Band;
+            tags->ti_Data = ci.ci_Band == BRCMU_CHAN_BAND_2G ? S2BAND_B : S2BAND_A;
+            tags++;
+        }
     }
     
 

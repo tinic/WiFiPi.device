@@ -13,7 +13,8 @@
  * while the receiver is still inside SendPKT (the block stays valid until the
  * receiver frees it); two callers in two tasks at once; the quarantine of an
  * abandoned c_ID; S2_GETSIGNALQUALITY timing out and a CMD_READ getting
- * through afterwards; and receiver shutdown with a caller waiting.
+ * through afterwards; S2_GETNETWORKINFO with and without its signal,
+ * channel and band readings; and receiver shutdown with a caller waiting.
  */
 #include <exec/exec.h>
 #include <exec/io.h>
@@ -23,6 +24,7 @@
 #include <devices/timer.h>
 #include <proto/exec.h>
 #include <proto/dos.h>
+#include <proto/utility.h>
 #include <string.h>
 
 #include "../src/wifipi.h"
@@ -101,7 +103,7 @@ extern int wifipi_test_fail_timer;
 /* The helper: the receiver's control half, driven by a script        */
 
 enum { M_SUCCESS, M_FWERR, M_NOREPLY, M_LATE, M_SHORT, M_TRUNC, M_DELAY, M_SENDBLOCK, M_ECHO,
-       M_HOLD, M_WRONGCMD, M_MACONLY, M_UPDEAD, M_SHORTN };
+       M_HOLD, M_WRONGCMD, M_MACONLY, M_UPDEAD, M_SHORTN, M_NETINFO };
 static volatile int shortN;
 
 static struct MinList waitList;
@@ -184,6 +186,9 @@ static void fake_sendpkt(UBYTE *pkt, ULONG length, struct SDIO *sdio)
 }
 
 static UBYTE replyFrame[128];
+static volatile ULONG replyVal = 0x44332211;     /* the first 4 data bytes, raw */
+#define NETINFO_RSSI    (-61)
+#define NETINFO_CHSPEC  0xd82e      /* d11ac 5 GHz 40 MHz on 44+48: primary 44 */
 
 static void replyTo(struct SDIO *sdio, UWORD id, ULONG cmd, UWORD flags, ULONG status, ULONG dataLen, ULONG pktLen);
 static void reply(struct SDIO *sdio, UWORD flags, ULONG status, ULONG dataLen, ULONG pktLen)
@@ -202,7 +207,7 @@ static void replyTo(struct SDIO *sdio, UWORD id, ULONG cmd, UWORD flags, ULONG s
     *(UWORD *)(c + 8) = LE16(flags);
     *(UWORD *)(c + 10) = id;
     *(ULONG *)(c + 12) = LE32(status);
-    c[16] = 0x44; c[17] = 0x33; c[18] = 0x22; c[19] = 0x11;   /* LE 0x11223344 */
+    *(ULONG *)(c + 16) = replyVal;                   /* LE 0x11223344 unless set */
     c[20] = 0x55; c[21] = 0x66; c[22] = 0x77; c[23] = 0x88;
     PacketCtrlComplete(sdio, (struct Packet *)replyFrame, pktLen);
 }
@@ -248,6 +253,11 @@ static void helper(void)
                 case M_WRONGCMD: replyTo(sdio, lastID, lastCmd ^ LE32(1), 0, 0, 4, 12 + 16 + 4); break;
                 case M_MACONLY:  if (modeCount <= 2) reply(sdio, 0, 0, 8, 12 + 16 + 8); break;
                 case M_UPDEAD:   if (!(lastCmd == LE32(2) && lastVal == LE32(1))) reply(sdio, 0, 0, 8, 12 + 16 + 8); break;
+                case M_NETINFO:
+                    replyVal = lastCmd == LE32(127) ? LE32((ULONG)NETINFO_RSSI) : LE32(NETINFO_CHSPEC);
+                    reply(sdio, 0, 0, 4, 12 + 16 + 4);
+                    replyVal = 0x44332211;
+                    break;
                 case M_SUCCESS: case M_ECHO: reply(sdio, 0, 0, 4, 12 + 16 + 4); break;
                 case M_FWERR:   reply(sdio, 1 /* BCDC_DCMD_ERROR */, (ULONG)-23, 0, 12 + 16); break;
                 case M_SHORT:   reply(sdio, 0, 0, 2, 12 + 16 + 2); break;
@@ -655,6 +665,42 @@ int main(void)
         Remove(&read_io->ios2_Req.io_Message.mn_Node);
         Permit();
         DeleteMsgPort(rp);
+    }
+
+    PutStr("step 12 GETNETWORKINFO: signal, channel and band of the link\n");
+    {
+        APTR pool = CreatePool(MEMF_PUBLIC | MEMF_CLEAR, 1024, 1024);
+        struct Library *UtilityBase = fbase.w_UtilityBase;
+        struct TagItem *t;
+        funit.wu_JoinParams.ej_SSID.ssid_Length = LE32(4);
+        CopyMem("Five", funit.wu_JoinParams.ej_SSID.ssid_Value, 4);
+        mode = M_NETINFO;
+        io->ios2_Req.io_Command = S2_GETNETWORKINFO;
+        io->ios2_Req.io_Flags = IOF_QUICK;
+        io->ios2_Data = pool;
+        io->ios2_StatData = NULL;
+        WiFi_BeginIO(io);
+        t = io->ios2_StatData;
+        expect_eq(io->ios2_Req.io_Error, 0, "GETNETWORKINFO answered");
+        expect(t != NULL && strcmp((char *)GetTagData(S2INFO_SSID, 0, t), "Five") == 0, "S2INFO_SSID");
+        expect(t != NULL && GetTagData(S2INFO_BSSID, 0, t) != 0, "S2INFO_BSSID");
+        expect_eq(t ? (LONG)GetTagData(S2INFO_Signal, 0, t) : 0, NETINFO_RSSI, "S2INFO_Signal, dBm");
+        expect_eq(t ? (LONG)GetTagData(S2INFO_Channel, 0, t) : 0, 44, "S2INFO_Channel, primary");
+        expect_eq(t ? (LONG)GetTagData(S2INFO_Band, 99, t) : 0, S2BAND_A, "S2INFO_Band A");
+
+        /* the firmware refuses both: the link's name still comes back */
+        mode = M_FWERR;
+        io->ios2_Req.io_Flags = IOF_QUICK;
+        io->ios2_StatData = NULL;
+        WiFi_BeginIO(io);
+        t = io->ios2_StatData;
+        expect_eq(io->ios2_Req.io_Error, 0, "GETNETWORKINFO answered without the readings");
+        expect(t != NULL && GetTagData(S2INFO_SSID, 0, t) != 0, "S2INFO_SSID still there");
+        expect(t != NULL && FindTagItem(S2INFO_Signal, t) == NULL, "no S2INFO_Signal");
+        expect(t != NULL && FindTagItem(S2INFO_Channel, t) == NULL, "no S2INFO_Channel");
+        expect(t != NULL && FindTagItem(S2INFO_Band, t) == NULL, "no S2INFO_Band");
+        DeletePool(pool);
+        io->ios2_Data = NULL;
     }
     WiFi_Close(io);
 
