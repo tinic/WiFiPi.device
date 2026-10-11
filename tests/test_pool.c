@@ -29,24 +29,7 @@
 #include "../src/wifipi.h"
 #include "../src/packet.h"
 
-/* as in packet.c, which keeps it to itself */
-struct PacketEvent {
-    UBYTE   e_EthHeader[14];
-    UBYTE   e_Header[10];
-    UWORD   e_Version;
-    UWORD   e_Flags;
-    ULONG   e_EventType;
-    ULONG   e_Status;
-    ULONG   e_Reason;
-    ULONG   e_AuthType;
-    ULONG   e_DataLen;
-    UBYTE   e_Address[6];
-    char    e_IFName[16];
-    UBYTE   e_IFIdx;
-    UBYTE   e_BSSCFgIdx;
-} __attribute__((packed));
-
-void ProcessEvent(struct SDIO *sdio, struct PacketEvent *pe);
+/* struct PacketEvent and ProcessEvent come from packet.h */
 
 static int checks, failures;
 
@@ -159,7 +142,7 @@ static void assoc(ULONG len)
     memset(evbuf, 0, sizeof(evbuf));
     pe->e_EventType = BRCMF_E_ASSOC;
     pe->e_DataLen = len;
-    for (i = 0; i < 6; i++) pe->e_Address[i] = 0x10 + i;
+    for (i = 0; i < 6; i++) pe->e_Address.ea_Addr[i] = 0x10 + i;
     for (i = 0; i < 64; i++) evbuf[sizeof(struct PacketEvent) + i] = 0x80 + i;
     ProcessEvent(&fsdio, pe);
 }

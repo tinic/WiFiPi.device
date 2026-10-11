@@ -127,85 +127,6 @@ struct PacketCmd {
     ULONG c_Status;
 } __attribute__((packed));
 
-struct EtherHeader {
-    UBYTE eh_Dest[6];
-    UBYTE eh_Src[6];
-    UWORD eh_Type;
-} __attribute__((packed));
-
-#define ETHERHDR_TYPE_LINK_CTL  0x886c
-
-struct BCMEtherHeader {
-    UWORD beh_Subtype;
-    UWORD beh_Length;
-    UBYTE beh_Version;
-    UBYTE beh_OUI[3];
-    UWORD beh_UsrSubtype;
-} __attribute__((packed));
-
-#define BCMETHHDR_OUI   "\0x00\0x10\0x18"
-#define BCMETHHDR_SUBTYPE_EVENT 1
-
-struct EtherAddr {
-    UBYTE ea_Addr[6];
-} __attribute__((packed));
-
-struct PacketEvent {
-    struct EtherHeader      e_EthHeader;
-    struct BCMEtherHeader   e_Header;
-    UWORD                   e_Version;
-    UWORD                   e_Flags;
-    ULONG                   e_EventType;
-    ULONG                   e_Status;
-    ULONG                   e_Reason;
-    ULONG                   e_AuthType;
-    ULONG                   e_DataLen;
-    struct EtherAddr        e_Address;
-    char                    e_IFName[16];
-    UBYTE                   e_IFIdx;
-    UBYTE                   e_BSSCFgIdx;
-} __attribute__((packed));
-
-struct BSSInfo {
-    ULONG   bssi_Version;
-    ULONG   bssi_Length;
-    UBYTE   bssi_ID[6];
-    UWORD   bssi_BeaconPeriod;
-    UWORD   bssi_Capability;
-    UBYTE   bssi_SSIDLength;
-    UBYTE   bssi_SSID[32];
-    UBYTE   PAD;
-    ULONG   bssi_NRates;
-    UBYTE   bssi_Rates[16];
-    UWORD   bssi_ChanSpec;      // 72
-    UWORD   bssi_ATimWindow;
-    UBYTE   bssi_DTimPeriod;
-    UBYTE   PAD;
-    UWORD   bssi_RSSI;
-    UBYTE   bssi_PHYNoise;
-    UBYTE   bssi_NCap;
-    UWORD   PAD;
-    ULONG   bssi_NBSSCap;
-    UBYTE   bssi_CtlCh;
-    UBYTE   PAD[3];
-    ULONG   bssi_Reserved32[1];
-    UBYTE   bssi_Flags;
-    UBYTE   bssi_Reserved[3];
-    UBYTE   bssi_BasicMCS[16];
-    UWORD   bssi_IEOffset;
-    UWORD   PAD;
-    ULONG   bssi_IELength;
-    UWORD   bssi_SNR;
-} __attribute__((packed));
-
-struct EScanResult {
-    ULONG   esr_Length;
-    ULONG   esr_Version;
-    UWORD   esr_SyncID;
-    UWORD   esr_BSSCount;
-    struct BSSInfo esr_BSSInfo[];
-} __attribute__((packed));
-
 struct PacketMessage {
     struct Message  pm_Message;
     APTR            pm_RecvBuffer;
@@ -867,6 +788,20 @@ static inline ULONG PollClock(struct WiFiBase *WiFiBase)
     return rd32(WiFiBase->w_SysTimer, 4);       /* CLO, 1 MHz */
 }
 
+/* The receiver's check on the running scan (SCAN_TIMEOUT_US) */
+void ScanWatchdog(struct WiFiBase *WiFiBase)
+{
+    struct WiFiUnit *unit = WiFiBase->w_Unit;
+    struct ExecBase *SysBase = WiFiBase->w_SysBase;
+
+    if (unit != NULL && unit->wu_ScanRequest != NULL && WiFiBase->w_SysTimer != NULL &&
+        (ULONG)(PollClock(WiFiBase) - unit->wu_ScanStart) > SCAN_TIMEOUT_US)
+    {
+        D(bug("[WiFi] Scan timed out\n"));
+        ReplyScan(unit);
+    }
+}
+
 /*
  * TX credit (#99): how many frames the firmware's window still admits.  The
  * window end s_MaxTXSeq and the next number s_TXSeq are modulo 256; only a
@@ -1239,13 +1174,7 @@ STACKARGS void PacketReceiver(struct SDIO *sdio, struct Task *caller)
            completion) would hold the request, and a caller waiting out its
            AbortIO, for ever.  Ended after SCAN_TIMEOUT_US as brcmfmac's escan
            timer does: it goes back with the networks reported so far. */
-        if (WiFiBase->w_Unit && WiFiBase->w_Unit->wu_ScanRequest != NULL &&
-            WiFiBase->w_SysTimer != NULL &&
-            (ULONG)(PollClock(WiFiBase) - WiFiBase->w_Unit->wu_ScanStart) > SCAN_TIMEOUT_US)
-        {
-            D(bug("[WiFi] Scan timed out\n"));
-            ReplyScan(WiFiBase->w_Unit);
-        }
+        ScanWatchdog(WiFiBase);
 
         /* If no scan request is in progress start another one (if needed) */
         if (WiFiBase->w_Unit && WiFiBase->w_Unit->wu_ScanRequest == NULL)
@@ -3196,6 +3125,51 @@ int PacketUploadCLM(struct SDIO *sdio)
     return 1;
 }
 
+/* THis needs to be gone! The paramsv2 layout is known...
+   channel_num is 0: the firmware scans every channel its country and
+   regulatory revision allow, on both bands, active or passive as each
+   channel requires (brcmfmac does the same for a scan that names no
+   channels).  It used to list 1-14 as d11n chanspecs, which this
+   d11ac chip reads as 160 MHz 2.4 GHz channels: none is valid. */
+static const UBYTE params[SCAN_PARAMS_SIZE] = {
+    1,0,0,0,
+    1,0,
+    0x34,0x12,
+    0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0xff,0xff,0xff,0xff,0xff,0xff,
+    2,
+    0,
+    0xff,0xff,0xff,0xff,
+    0xff,0xff,0xff,0xff,
+    0xff,0xff,0xff,0xff,
+    0xff,0xff,0xff,0xff,
+    0,0,
+    0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+};
+
+/* The escan parameters for a scan of every network, or with buf, of the
+   one named (a directed probe for a hidden SSID) */
+const UBYTE *ScanParams(UBYTE *buf, const UBYTE *networkName)
+{
+    ULONG len;
+
+    if (networkName == NULL)
+        return params;
+
+    len = _strlen((CONST_STRPTR)networkName);
+    if (len > 32) len = 32;
+    for (ULONG i = 0; i < sizeof(params); i++)
+        buf[i] = params[i];
+    buf[8] = len;
+    for (ULONG i = 0; i < len; i++)
+        buf[12 + i] = networkName[i];
+    return buf;
+}
+
 void StartNetworkScan(struct IOSana2Req *io)
 {
     struct WiFiUnit *unit = (APTR)io->ios2_Req.io_Unit;
@@ -3206,33 +3180,8 @@ void StartNetworkScan(struct IOSana2Req *io)
     UBYTE *networkName = NULL;
     struct TagItem *tags = io->ios2_StatData;
 
-    /* THis needs to be gone! The paramsv2 layout is known...
-       channel_num is 0: the firmware scans every channel its country and
-       regulatory revision allow, on both bands, active or passive as each
-       channel requires (brcmfmac does the same for a scan that names no
-       channels).  It used to list 1-14 as d11n chanspecs, which this
-       d11ac chip reads as 160 MHz 2.4 GHz channels: none is valid. */
-    static const UBYTE params[4+2+2+4+32+6+1+1+4*4+2+2+14*2+32+4] = {
-        1,0,0,0,
-        1,0,
-        0x34,0x12,
-        0,0,0,0,
-        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-        0xff,0xff,0xff,0xff,0xff,0xff,
-        2,
-        0,
-        0xff,0xff,0xff,0xff,
-        0xff,0xff,0xff,0xff,
-        0xff,0xff,0xff,0xff,
-        0xff,0xff,0xff,0xff,
-        0,0,
-        0,0,
-        0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-        0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    };
-    UBYTE buf[sizeof(params)];      /* the receiver's stack, not w_MemPool (#94) */
-    UBYTE *data = (UBYTE*)params;
+    UBYTE buf[SCAN_PARAMS_SIZE];    /* the receiver's stack, not w_MemPool (#94) */
+    const UBYTE *data;
     
     D(bug("[WiFi] StartNetworkScan("));
 
@@ -3245,19 +3194,7 @@ void StartNetworkScan(struct IOSana2Req *io)
     
     D(bug(")\n"));
 
-    if (networkName)
-    {
-        ULONG len = _strlen(networkName);
-        data = buf;
-
-        if (len > 32) len = 32;
-
-        CopyMem((const APTR)params, data, sizeof(params));
-        
-        data[8] = len;
-        for (int i=0; i < data[8]; i++)
-            data[12 + i] = networkName[i];
-    }
+    data = ScanParams(buf, networkName);
 
     io->ios2_DataLength = 0;
     io->ios2_StatData = NULL;
@@ -3268,7 +3205,7 @@ void StartNetworkScan(struct IOSana2Req *io)
     unit->wu_ScanRequest = io;
 
     PacketCmdIntAsync(sdio, BRCMF_C_SET_PASSIVE_SCAN, 0);
-    PacketSetVarAsync(sdio, "escan", data, sizeof(params));
+    PacketSetVarAsync(sdio, "escan", data, SCAN_PARAMS_SIZE);
 }
 
 #if 0
