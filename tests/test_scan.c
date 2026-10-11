@@ -9,9 +9,10 @@
  *              allows, both bands); a directed scan carries its SSID
  *   wm         WirelessManager's scan (tests/callers row 11: ios2_Data =
  *              pool, ios2_StatData = an S2INFO_SSID tag list) is queued
- *   mixed      2.4 and 5 GHz networks at 20/40/80 MHz: S2INFO_Channel is
- *              the primary channel, S2INFO_Band B or A; a duplicate is
- *              dropped; the completion replies once
+ *   mixed      2.4 and 5 GHz networks at 20/40/80 MHz, every sideband,
+ *              d11ac and d11n chanspecs: S2INFO_Channel is the primary
+ *              channel, S2INFO_Band B or A; a duplicate is dropped, the
+ *              same BSSID on another channel kept; replied once
  *   empty      a scan that finds nothing: io_Error 0, no list
  *   abort      AbortIO between 5 GHz results: replied once at completion,
  *              aborted and empty; later results are not written into it
@@ -85,6 +86,15 @@ static void set_clock(ULONG us) { fclock[1] = __builtin_bswap32(us); }
 #define CS_5G_42_80_LL  0xe02a          /* 36..48, primary 36 */
 #define CS_5G_46_40_L   0xd82e          /* 44+48, primary 44 */
 #define CS_5G_149_20    0xd095          /* primary 149 */
+#define CS_5G_46_40_U   0xd92e          /* 44+48, primary 48 */
+#define CS_5G_42_80_LU  0xe12a          /* 36..48, primary 40 */
+#define CS_5G_42_80_UL  0xe22a          /* 36..48, primary 44 */
+#define CS_5G_42_80_UU  0xe32a          /* 36..48, primary 48 */
+#define CS_2G_3_40_U    0x1903          /* 1..5, primary 5 */
+#define CS_2G_11_20     0x100b          /* primary 11 */
+/* d11n (43430): 2G 0x2000 / 5G 0x1000, BW 20 0x0800 / 40 0x0c00, SB L 0x0100 / none 0x0300 */
+#define CSN_2G_1_20     0x2b01          /* primary 1 */
+#define CSN_5G_38_40_L  0x1d26          /* 36+40, primary 36 */
 
 struct Net { const char *ssid; UBYTE id; UWORD chanspec; WORD rssi; };
 
@@ -186,6 +196,18 @@ int main(void)
         { "Five20", 4, CS_5G_149_20,   -77 },
         { "Two4",   1, CS_2G_6_20,     -41 },      /* duplicate: dropped */
     };
+    static const struct Net sidebands[] = {
+        { "U40",    5, CS_5G_46_40_U,  -50 },
+        { "LU80",   6, CS_5G_42_80_LU, -51 },
+        { "UL80",   7, CS_5G_42_80_UL, -52 },
+        { "UU80",   8, CS_5G_42_80_UU, -53 },
+        { "Two4U",  9, CS_2G_3_40_U,   -54 },
+        { "Two4",   1, CS_2G_11_20,    -42 },      /* same BSSID, other channel: kept */
+    };
+    static const struct Net d11n[] = {
+        { "N20",   10, CSN_2G_1_20,    -60 },
+        { "N40",   11, CSN_5G_38_40_L, -61 },
+    };
     struct Library *UtilityBase;
     UBYTE buf[SCAN_PARAMS_SIZE];
     const UBYTE *p;
@@ -259,6 +281,29 @@ int main(void)
     check_net(io, "Five20", 149, S2BAND_A, -77);
     complete();
     expect_eq(replies(io), 0, "a second completion replies nothing");
+
+    PutStr("sidebands\n");
+    start(io, 1500);
+    escan(sidebands, 6);
+    complete();
+    expect_eq(replies(io), 1, "sidebands: replied once");
+    expect_eq(io->ios2_DataLength, 6, "sidebands: six networks");
+    check_net(io, "U40",   48, S2BAND_A, -50);
+    check_net(io, "LU80",  40, S2BAND_A, -51);
+    check_net(io, "UL80",  44, S2BAND_A, -52);
+    check_net(io, "UU80",  48, S2BAND_A, -53);
+    check_net(io, "Two4U",  5, S2BAND_B, -54);
+    check_net(io, "Two4",  11, S2BAND_B, -42);
+
+    PutStr("d11n\n");
+    fchip.c_D11Type = 1;                        /* BRCMU_D11N_IOTYPE */
+    start(io, 1700);
+    escan(d11n, 2);
+    complete();
+    expect_eq(replies(io), 1, "d11n: replied once");
+    check_net(io, "N20",  1, S2BAND_B, -60);
+    check_net(io, "N40", 36, S2BAND_A, -61);
+    fchip.c_D11Type = 2;
 
     PutStr("empty\n");
     start(io, 2000);

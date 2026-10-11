@@ -3125,10 +3125,10 @@ int PacketUploadCLM(struct SDIO *sdio)
     return 1;
 }
 
-/* THis needs to be gone! The paramsv2 layout is known...
+/* wl_escan_params, laid out as brcmfmac's brcmf_escan_params_le.
    channel_num is 0: the firmware scans every channel its country and
    regulatory revision allow, on both bands, active or passive as each
-   channel requires (brcmfmac does the same for a scan that names no
+   channel requires (the firmware's rule for a scan that names no
    channels).  It used to list 1-14 as d11n chanspecs, which this
    d11ac chip reads as 160 MHz 2.4 GHz channels: none is valid. */
 static const UBYTE params[SCAN_PARAMS_SIZE] = {
