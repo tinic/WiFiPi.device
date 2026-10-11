@@ -637,10 +637,6 @@ void ParseConfig(struct WiFiBase *WiFiBase)
         {
             D(bug("[WiFi]   SSID='%s'\n", (ULONG)WiFiBase->w_NetworkConfig.nc_SSID));
         }
-        if (WiFiBase->w_NetworkConfig.nc_PSK)
-        {
-            D(bug("[WiFi]   PSK='%s'\n", (ULONG)WiFiBase->w_NetworkConfig.nc_PSK));
-        }
         D(bug("[WiFi]   Open network=%s\n", (ULONG)(WiFiBase->w_NetworkConfig.nc_Open ? "YES" : "NO")));
     }
 }
@@ -932,7 +928,9 @@ struct WiFiBase * WiFi_Init(REGARG(struct WiFiBase *base, "d0"), REGARG(BPTR seg
         D(bug("[WiFi] EXT GPIO:"));
         for (int i=0; i < 8; i++)
         {
-            D(bug(" %ld", get_extgpio_state(i, WiFiBase)));
+            /* read in every build: the firmware sees the same requests */
+            ULONG state = get_extgpio_state(i, WiFiBase);
+            D(bug(" %ld", state));
         }
         D(bug("\n"));
 
