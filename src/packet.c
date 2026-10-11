@@ -3,6 +3,7 @@
 #include <exec/ports.h>
 #include <exec/io.h>
 #include <exec/alerts.h>
+#include <exec/errors.h>
 #include <devices/timer.h>
 #include <devices/sana2wireless.h>
 
@@ -476,8 +477,9 @@ void UpdateNetwork(struct WiFiUnit *unit, struct BSSInfo *info)
     struct IOSana2Req *io = unit->wu_ScanRequest;
     struct TagItem *net;
 
-    /* Ignore event if no scan request is active */
-    if (io == NULL)
+    /* Ignore event if no scan request is active, or the active one was
+       aborted (it is replied empty when the scan completes) */
+    if (io == NULL || io->ios2_Req.io_Error != 0)
     {
         return;
     }
@@ -629,6 +631,30 @@ void UpdateNetwork(struct WiFiUnit *unit, struct BSSInfo *info)
     tags++;
 }
 
+/* The firmware finished the running scan: reply it, once.  One that was
+   aborted on the way (WiFi_AbortIO) goes back with no networks; what was
+   allocated for them stays in the caller's pool, which owns it. */
+void ReplyScan(struct WiFiUnit *unit)
+{
+    struct ExecBase *SysBase = unit->wu_Base->w_SysBase;
+    struct IOSana2Req *io;
+
+    Forbid();
+    io = unit->wu_ScanRequest;
+    unit->wu_ScanRequest = NULL;
+    Permit();
+
+    if (io == NULL)
+        return;
+    if (io->ios2_Req.io_Error == IOERR_ABORTED)
+    {
+        io->ios2_WireError = S2WERR_GENERIC_ERROR;
+        io->ios2_DataLength = 0;
+        io->ios2_StatData = NULL;
+    }
+    ReplyMsg((struct Message *)io);
+}
+
 void ProcessEvent(struct SDIO *sdio, struct PacketEvent *pe)
 {
     struct WiFiBase *base = sdio->s_WiFiBase;
@@ -644,14 +670,14 @@ void ProcessEvent(struct SDIO *sdio, struct PacketEvent *pe)
             struct EScanResult *escan = (APTR)((ULONG)pe + sizeof(struct PacketEvent));
             //D(bug("[WiFi] EScan result. Length %ld, BSS count %ld\n", LE32(escan->esr_Length), LE16(escan->esr_BSSCount)));
             
+            /* Forbid: CMD_FLUSH and S2_OFFLINE reply the running scan from
+               another task, and WiFi_AbortIO marks it; none of them may
+               land while a result is being written into it. */
+            Forbid();
             if (escan->esr_BSSCount == LE16(0))
             {
                 // Scan complete
-                if (unit->wu_ScanRequest)
-                {
-                    ReplyMsg((struct Message *)unit->wu_ScanRequest);
-                    unit->wu_ScanRequest = NULL;
-                }
+                ReplyScan(unit);
                 //D(bug("[WiFi] EScan complete\n"));
             }
 
@@ -659,6 +685,7 @@ void ProcessEvent(struct SDIO *sdio, struct PacketEvent *pe)
             {
                 UpdateNetwork(unit, &escan->esr_BSSInfo[i]);
             }
+            Permit();
             break;
         }
 
@@ -3248,6 +3275,7 @@ void StartNetworkScan(struct IOSana2Req *io)
 
     io->ios2_DataLength = 0;
     io->ios2_StatData = NULL;
+    io->ios2_Req.io_Error = 0;      /* WiFi_AbortIO marks it from here on */
 
     unit->wu_ScanRequest = io;
 
