@@ -190,6 +190,7 @@ struct WiFiUnit
     struct MsgPort *        wu_CmdQueue;
     struct MsgPort *        wu_ScanQueue;
     struct IOSana2Req *     wu_ScanRequest;
+    ULONG                   wu_ScanStart;       // CLO when wu_ScanRequest started
     struct Sana2DeviceStats wu_Stats;
     struct TimerBase *      wu_TimerBase;
     ULONG                   wu_Flags;

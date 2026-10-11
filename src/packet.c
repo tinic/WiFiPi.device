@@ -337,6 +337,7 @@ int SetWPAVersion(struct SDIO *sdio, struct WiFiNetwork *network, ULONG wpa_vers
 }
 
 #define SCANNER_STACKSIZE       (16384 / sizeof(ULONG))
+#define SCAN_TIMEOUT_US         10000000    /* brcmfmac BRCMF_ESCAN_TIMER_INTERVAL_MS */
 #define SCANNER_PRIORITY         0
 
 
@@ -1230,6 +1231,18 @@ STACKARGS void PacketReceiver(struct SDIO *sdio, struct Task *caller)
                     */
                 }
             }
+        }
+
+        /* A scan the firmware never completes (an escan it refused sends no
+           completion) would hold the request, and a caller waiting out its
+           AbortIO, for ever.  Ended after SCAN_TIMEOUT_US as brcmfmac's escan
+           timer does: it goes back with the networks reported so far. */
+        if (WiFiBase->w_Unit && WiFiBase->w_Unit->wu_ScanRequest != NULL &&
+            WiFiBase->w_SysTimer != NULL &&
+            (ULONG)(PollClock(WiFiBase) - WiFiBase->w_Unit->wu_ScanStart) > SCAN_TIMEOUT_US)
+        {
+            D(bug("[WiFi] Scan timed out\n"));
+            ReplyScan(WiFiBase->w_Unit);
         }
 
         /* If no scan request is in progress start another one (if needed) */
@@ -3277,6 +3290,8 @@ void StartNetworkScan(struct IOSana2Req *io)
     io->ios2_StatData = NULL;
     io->ios2_Req.io_Error = 0;      /* WiFi_AbortIO marks it from here on */
 
+    if (base->w_SysTimer != NULL)
+        unit->wu_ScanStart = PollClock(base);
     unit->wu_ScanRequest = io;
 
     PacketCmdIntAsync(sdio, BRCMF_C_SET_PASSIVE_SCAN, 0);

@@ -114,7 +114,7 @@ static int port_empty(struct MsgPort *port)
            l->lh_TailPred == (struct Node *)&l->lh_Head && l->lh_Tail == NULL;
 }
 
-static void running_scan(Req *r, struct MsgPort *pending, struct MsgPort *reply)
+static struct IOSana2Req *open_scan(Req *r, struct MsgPort *reply)
 {
     struct IOSana2Req *io = (struct IOSana2Req *)r->req;
     const UWORD mn_length = sizeof(struct IOSana2Req);
@@ -128,6 +128,34 @@ static void running_scan(Req *r, struct MsgPort *pending, struct MsgPort *reply)
     expect_eq(io->ios2_Req.io_Error, 0, "scan: Open");
     io->ios2_Req.io_Command = S2_GETNETWORKS;
     io->ios2_Req.io_Flags = 0;
+    return io;
+}
+
+/* Two scans queued; the receiver takes the first, the second is aborted
+   (legitimately: it is still queued), then the first.  Unlinking the
+   first through its stale links would put the second, already replied,
+   back at the head of the scan queue. */
+static void stale_links(Req *ra, Req *rb, struct MsgPort *pending, struct MsgPort *reply)
+{
+    struct IOSana2Req *a = open_scan(ra, reply);
+    struct IOSana2Req *b = open_scan(rb, reply);
+
+    PutMsg(pending, (struct Message *)a);
+    PutMsg(pending, (struct Message *)b);
+    expect(GetMsg(pending) == (struct Message *)a, "stale: first dequeued");
+    WiFi_AbortIO(b);
+    expect(GetMsg(reply) == (struct Message *)b, "stale: queued second aborted");
+    WiFi_AbortIO(a);
+    expect(GetMsg(reply) == NULL, "stale: dequeued first not replied");
+    expect(port_empty(pending), "stale: scan queue list whole");
+    WiFi_Close(b);
+    WiFi_Close(a);
+}
+
+static void running_scan(Req *r, struct MsgPort *pending, struct MsgPort *reply)
+{
+    struct IOSana2Req *io = open_scan(r, reply);
+    const UWORD mn_length = sizeof(struct IOSana2Req);
 
     /* taken off the scan queue by the receiver, not yet the running scan */
     PutMsg(pending, (struct Message *)io);
@@ -165,7 +193,7 @@ static void running_scan(Req *r, struct MsgPort *pending, struct MsgPort *reply)
 
 int main(void)
 {
-    static Req r;
+    static Req r, r2;
     struct MsgPort *pending, *reply;
     ULONG lib0, unit0;
 
@@ -197,6 +225,8 @@ int main(void)
     abort_one(&r, sizeof(struct IOSana2Req), pending, reply);
     PutStr("running and dequeued scan\n");
     running_scan(&r, pending, reply);
+    PutStr("stale links of a dequeued scan\n");
+    stale_links(&r, &r2, pending, reply);
 
     expect_eq(fbase.w_Device.dd_Library.lib_OpenCnt, lib0, "device count balanced");
     expect_eq(funit.wu_Unit.unit_OpenCnt, unit0, "unit count balanced");
