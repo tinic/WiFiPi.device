@@ -428,17 +428,61 @@ void WiFi_BeginIO(REGARG(struct IOSana2Req * io, "a1"))
     }
 }
 
+/* A request is pending only while it is linked into one of the unit's
+   queues.  One a task has taken off its port with GetMsg() is still
+   NT_MESSAGE, but its links are stale: Remove() through them corrupts the
+   list it used to be on. */
+static BOOL OnPort(struct MsgPort *port, struct Node *node)
+{
+    struct Node *n;
+
+    if (port == NULL)
+        return FALSE;
+    for (n = port->mp_MsgList.lh_Head; n->ln_Succ != NULL; n = n->ln_Succ)
+        if (n == node)
+            return TRUE;
+    return FALSE;
+}
+
+static BOOL Queued(struct WiFiUnit *unit, struct Node *node)
+{
+    struct SDIO *sdio = unit->wu_Base->w_SDIO;
+    struct Opener *opener;
+
+    if (OnPort(unit->wu_CmdQueue, node) || OnPort(unit->wu_ScanQueue, node))
+        return TRUE;
+    if (sdio != NULL && OnPort(sdio->s_SenderPort, node))
+        return TRUE;
+    ForeachNode(&unit->wu_Openers, opener)
+    {
+        if (OnPort(&opener->o_ReadPort, node) ||
+            OnPort(&opener->o_OrphanListeners, node) ||
+            OnPort(&opener->o_EventListeners, node))
+            return TRUE;
+    }
+    return FALSE;
+}
+
 LONG WiFi_AbortIO(REGARG(struct IOSana2Req *io, "a1"))
 {
     struct WiFiBase *WiFiBase = (struct WiFiBase *)io->ios2_Req.io_Device;
     struct ExecBase *SysBase = WiFiBase->w_SysBase;
+    struct WiFiUnit *unit = (struct WiFiUnit *)io->ios2_Req.io_Unit;
 
     /* AbortIO is a *wish* call. Someone would like to abort current IORequest */
-    if (io->ios2_Req.io_Unit != NULL)
+    if (unit != NULL && unit != (struct WiFiUnit *)-1)
     {
         Forbid();
-        /* If the IO was not quick and is of type message (not handled yet or in process), abord it and remove from queue */
-        if ((io->ios2_Req.io_Flags & IOF_QUICK) == 0 && io->ios2_Req.io_Message.mn_Node.ln_Type == NT_MESSAGE)
+        if (io == unit->wu_ScanRequest)
+        {
+            /* The scan the firmware is running.  The receiver writes into it
+               until the scan completes, so it is only marked here; the
+               completion replies it once, aborted and empty (ReplyScan). */
+            io->ios2_Req.io_Error = IOERR_ABORTED;
+        }
+        else if ((io->ios2_Req.io_Flags & IOF_QUICK) == 0 &&
+                 io->ios2_Req.io_Message.mn_Node.ln_Type == NT_MESSAGE &&
+                 Queued(unit, &io->ios2_Req.io_Message.mn_Node))
         {
             Remove(&io->ios2_Req.io_Message.mn_Node);
             io->ios2_Req.io_Error = IOERR_ABORTED;

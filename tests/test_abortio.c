@@ -1,22 +1,29 @@
 /*
- * WiFi_AbortIO on a limited (48-byte) request, run under an emulator: no Pi
+ * WiFi_AbortIO on a limited (48-byte) request and on a scan, run under an emulator: no Pi
  * hardware.  In an IOStdReq offset 32 is io_Actual; ios2_WireError is the
  * same longword only in a full IOSana2Req.  A write there stays inside the
  * request, where no outer canary sees it, so io_Actual is checked by value.
  *
- * The request is made pending by hand (queued on a private port, IOF_QUICK
- * clear), as AbortIO sees any request still in a queue.  Built like
- * test_devquery (tests/README); it uses nothing newer than device.c's AbortIO,
- * so the same file builds against the parent revision.
+ * The request is made pending by hand (queued on the unit's scan queue,
+ * IOF_QUICK clear): AbortIO takes only a request linked into one of the
+ * unit's queues.  Built like test_devquery (tests/README).
+ *
+ * The running scan: a request the receiver has taken off the scan queue
+ * (GetMsg leaves it NT_MESSAGE, links stale) is left alone, and the scan the
+ * firmware is running is marked, not replied; ReplyScan() then replies it
+ * once, empty.  Before the fix AbortIO unlinked both through stale links and
+ * replied them, and the completion replied the scan a second time.
  */
 #include <exec/exec.h>
 #include <exec/io.h>
 #include <devices/sana2.h>
+#include <devices/sana2wireless.h>
 #include <proto/exec.h>
 #include <proto/dos.h>
 #include <string.h>
 
 #include "../src/wifipi.h"
+#include "../src/packet.h"
 
 void  WiFi_Open(REGARG(struct IOSana2Req *io, "a1"), REGARG(LONG unitNumber, "d0"), REGARG(ULONG flags, "d1"));
 ULONG WiFi_Close(REGARG(struct IOSana2Req *io, "a1"));
@@ -99,9 +106,94 @@ static void abort_one(Req *r, UWORD mn_length, struct MsgPort *pending, struct M
     WiFi_Close(io);
 }
 
+/* A queue's list is whole: empty, head and tail pointing at each other */
+static int port_empty(struct MsgPort *port)
+{
+    struct List *l = &port->mp_MsgList;
+    return l->lh_Head == (struct Node *)&l->lh_Tail &&
+           l->lh_TailPred == (struct Node *)&l->lh_Head && l->lh_Tail == NULL;
+}
+
+static struct IOSana2Req *open_scan(Req *r, struct MsgPort *reply)
+{
+    struct IOSana2Req *io = (struct IOSana2Req *)r->req;
+    const UWORD mn_length = sizeof(struct IOSana2Req);
+
+    memset(r, CANARY, sizeof(*r));
+    memset(r->req, 0, mn_length);
+    io->ios2_Req.io_Message.mn_Length = mn_length;
+    io->ios2_Req.io_Message.mn_ReplyPort = reply;
+    io->ios2_Req.io_Device = (struct Device *)&fbase;
+    WiFi_Open(io, 0, 0);
+    expect_eq(io->ios2_Req.io_Error, 0, "scan: Open");
+    io->ios2_Req.io_Command = S2_GETNETWORKS;
+    io->ios2_Req.io_Flags = 0;
+    return io;
+}
+
+/* Two scans queued; the receiver takes the first, the second is aborted
+   (legitimately: it is still queued), then the first.  Unlinking the
+   first through its stale links would put the second, already replied,
+   back at the head of the scan queue. */
+static void stale_links(Req *ra, Req *rb, struct MsgPort *pending, struct MsgPort *reply)
+{
+    struct IOSana2Req *a = open_scan(ra, reply);
+    struct IOSana2Req *b = open_scan(rb, reply);
+
+    PutMsg(pending, (struct Message *)a);
+    PutMsg(pending, (struct Message *)b);
+    expect(GetMsg(pending) == (struct Message *)a, "stale: first dequeued");
+    WiFi_AbortIO(b);
+    expect(GetMsg(reply) == (struct Message *)b, "stale: queued second aborted");
+    WiFi_AbortIO(a);
+    expect(GetMsg(reply) == NULL, "stale: dequeued first not replied");
+    expect(port_empty(pending), "stale: scan queue list whole");
+    WiFi_Close(b);
+    WiFi_Close(a);
+}
+
+static void running_scan(Req *r, struct MsgPort *pending, struct MsgPort *reply)
+{
+    struct IOSana2Req *io = open_scan(r, reply);
+    const UWORD mn_length = sizeof(struct IOSana2Req);
+
+    /* taken off the scan queue by the receiver, not yet the running scan */
+    PutMsg(pending, (struct Message *)io);
+    expect(GetMsg(pending) == (struct Message *)io, "scan: dequeued");
+    WiFi_AbortIO(io);
+    expect(GetMsg(reply) == NULL, "dequeued scan: not replied");
+    expect_eq(io->ios2_Req.io_Error, 0, "dequeued scan: io_Error untouched");
+    expect(port_empty(pending), "dequeued scan: scan queue list whole");
+
+    /* the running scan, taken off the queue as the receiver takes it
+       (NT_MESSAGE, stale links): marked, replied once by the completion,
+       empty */
+    io->ios2_Req.io_Error = 0;
+    PutMsg(pending, (struct Message *)io);
+    expect(GetMsg(pending) == (struct Message *)io, "running scan: dequeued");
+    funit.wu_ScanRequest = io;
+    io->ios2_DataLength = 3;
+    io->ios2_StatData = r;                      /* any non-NULL list */
+    WiFi_AbortIO(io);
+    expect(GetMsg(reply) == NULL, "running scan: not replied by AbortIO");
+    expect_eq(io->ios2_Req.io_Error, IOERR_ABORTED, "running scan: marked aborted");
+    expect(funit.wu_ScanRequest == io, "running scan: still the unit's");
+    ReplyScan(&funit);
+    expect(GetMsg(reply) == (struct Message *)io, "running scan: replied at completion");
+    expect(GetMsg(reply) == NULL, "running scan: replied once");
+    expect(funit.wu_ScanRequest == NULL, "running scan: unit released it");
+    expect_eq(io->ios2_Req.io_Error, IOERR_ABORTED, "running scan: io_Error IOERR_ABORTED");
+    expect_eq(io->ios2_DataLength, 0, "running scan: no networks");
+    expect(io->ios2_StatData == NULL, "running scan: no list");
+    ReplyScan(&funit);
+    expect(GetMsg(reply) == NULL, "second completion: nothing replied");
+    expect(guards(r, mn_length), "scan: nothing written past the request");
+    WiFi_Close(io);
+}
+
 int main(void)
 {
-    static Req r;
+    static Req r, r2;
     struct MsgPort *pending, *reply;
     ULONG lib0, unit0;
 
@@ -116,6 +208,7 @@ int main(void)
     funit.wu_Openers.mlh_TailPred = (struct MinNode *)&funit.wu_Openers.mlh_Head;
     pending = CreateMsgPort();
     reply = CreateMsgPort();
+    funit.wu_ScanQueue = pending;
 
     PutStr("wifipi.device AbortIO on limited and full requests\n");
     if (fbase.w_UtilityBase == NULL || pending == NULL || reply == NULL)
@@ -130,6 +223,10 @@ int main(void)
     abort_one(&r, sizeof(struct IOStdReq), pending, reply);
     PutStr("full 88-byte request\n");
     abort_one(&r, sizeof(struct IOSana2Req), pending, reply);
+    PutStr("running and dequeued scan\n");
+    running_scan(&r, pending, reply);
+    PutStr("stale links of a dequeued scan\n");
+    stale_links(&r, &r2, pending, reply);
 
     expect_eq(fbase.w_Device.dd_Library.lib_OpenCnt, lib0, "device count balanced");
     expect_eq(funit.wu_Unit.unit_OpenCnt, unit0, "unit count balanced");

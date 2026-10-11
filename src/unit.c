@@ -453,6 +453,13 @@ static int Do_S2_GETSIGNALQUALITY(struct IOSana2Req *io)
 
     D(bug("[WiFi.0] S2_GETSIGNALQUALITY\n"));
 
+    if (io->ios2_StatData == NULL)
+    {
+        io->ios2_Req.io_Error = S2ERR_BAD_ARGUMENT;
+        io->ios2_WireError = S2WERR_NULL_POINTER;
+        return 1;
+    }
+
     /* If expected flags match preset, return back (almost) immediately */
     if ((unit->wu_Flags & IFF_ONLINE) == 0)
     {
@@ -527,6 +534,15 @@ static int Do_S2_SETKEY(struct IOSana2Req *io)
     }
     else { D(bug("\n")); }
 
+    /* A key the firmware's record cannot hold, or one that is not there */
+    if (io->ios2_DataLength > sizeof(((struct bwfm_wsec_key *)0)->k_Data) ||
+        (io->ios2_DataLength != 0 && io->ios2_Data == NULL))
+    {
+        io->ios2_Req.io_Error = S2ERR_BAD_ARGUMENT;
+        io->ios2_WireError = S2WERR_GENERIC_ERROR;
+        return 1;
+    }
+
     if (unit->wu_Keys[idx].k_Key)
         FreeVecPooled(WiFiBase->w_MemPool, unit->wu_Keys[idx].k_Key);
     
@@ -576,8 +592,12 @@ static int Do_S2_SETKEY(struct IOSana2Req *io)
         key.k_Flags = LE32(WSEC_PRIMARY_KEY);
         key.k_Length = LE32(io->ios2_DataLength);
 
-        key.k_RXIV.riv_High = LE32(*(ULONG*)(rx_counter + 2));
-        key.k_RXIV.riv_Low = LE16(*(UWORD*)(rx_counter));
+        /* No receive counter given: the IV starts at zero (_bzero above) */
+        if (rx_counter != NULL)
+        {
+            key.k_RXIV.riv_High = LE32(*(ULONG*)(rx_counter + 2));
+            key.k_RXIV.riv_Low = LE16(*(UWORD*)(rx_counter));
+        }
 
         /* Copy key itself */
         CopyMem(io->ios2_Data, key.k_Data, io->ios2_DataLength);
@@ -992,6 +1012,13 @@ static int Do_S2_GETNETWORKINFO(struct IOSana2Req *io)
 
     D(bug("[WiFi.0] S2_GETNETWORKINFO\n"));
 
+    if (memPool == NULL)
+    {
+        io->ios2_Req.io_Error = S2ERR_BAD_ARGUMENT;
+        io->ios2_WireError = S2WERR_NULL_POINTER;
+        return 1;
+    }
+
     if ((unit->wu_Flags & IFF_ONLINE) == 0)
     {
         io->ios2_WireError = S2WERR_UNIT_OFFLINE;
@@ -1079,6 +1106,12 @@ static int Do_S2_GETNETWORKINFO(struct IOSana2Req *io)
     {
         tags->ti_Tag = S2INFO_WPAInfo;
         tags->ti_Data = (ULONG)AllocPooled(memPool, unit->wu_WPAInfo[1] + 2);
+        if (tags->ti_Data == 0)
+        {
+            io->ios2_WireError = S2WERR_BUFF_ERROR;
+            io->ios2_Req.io_Error = S2ERR_NO_RESOURCES;
+            return 1;
+        }
         CopyMem(unit->wu_WPAInfo, (APTR)tags->ti_Data, unit->wu_WPAInfo[1] + 2);
         tags++;
     }

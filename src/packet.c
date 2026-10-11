@@ -3,6 +3,7 @@
 #include <exec/ports.h>
 #include <exec/io.h>
 #include <exec/alerts.h>
+#include <exec/errors.h>
 #include <devices/timer.h>
 #include <devices/sana2wireless.h>
 
@@ -336,6 +337,7 @@ int SetWPAVersion(struct SDIO *sdio, struct WiFiNetwork *network, ULONG wpa_vers
 }
 
 #define SCANNER_STACKSIZE       (16384 / sizeof(ULONG))
+#define SCAN_TIMEOUT_US         10000000    /* brcmfmac BRCMF_ESCAN_TIMER_INTERVAL_MS */
 #define SCANNER_PRIORITY         0
 
 
@@ -476,8 +478,9 @@ void UpdateNetwork(struct WiFiUnit *unit, struct BSSInfo *info)
     struct IOSana2Req *io = unit->wu_ScanRequest;
     struct TagItem *net;
 
-    /* Ignore event if no scan request is active */
-    if (io == NULL)
+    /* Ignore event if no scan request is active, or the active one was
+       aborted (it is replied empty when the scan completes) */
+    if (io == NULL || io->ios2_Req.io_Error != 0)
     {
         return;
     }
@@ -629,6 +632,30 @@ void UpdateNetwork(struct WiFiUnit *unit, struct BSSInfo *info)
     tags++;
 }
 
+/* The firmware finished the running scan: reply it, once.  One that was
+   aborted on the way (WiFi_AbortIO) goes back with no networks; what was
+   allocated for them stays in the caller's pool, which owns it. */
+void ReplyScan(struct WiFiUnit *unit)
+{
+    struct ExecBase *SysBase = unit->wu_Base->w_SysBase;
+    struct IOSana2Req *io;
+
+    Forbid();
+    io = unit->wu_ScanRequest;
+    unit->wu_ScanRequest = NULL;
+    Permit();
+
+    if (io == NULL)
+        return;
+    if (io->ios2_Req.io_Error == IOERR_ABORTED)
+    {
+        io->ios2_WireError = S2WERR_GENERIC_ERROR;
+        io->ios2_DataLength = 0;
+        io->ios2_StatData = NULL;
+    }
+    ReplyMsg((struct Message *)io);
+}
+
 void ProcessEvent(struct SDIO *sdio, struct PacketEvent *pe)
 {
     struct WiFiBase *base = sdio->s_WiFiBase;
@@ -644,14 +671,14 @@ void ProcessEvent(struct SDIO *sdio, struct PacketEvent *pe)
             struct EScanResult *escan = (APTR)((ULONG)pe + sizeof(struct PacketEvent));
             //D(bug("[WiFi] EScan result. Length %ld, BSS count %ld\n", LE32(escan->esr_Length), LE16(escan->esr_BSSCount)));
             
+            /* Forbid: CMD_FLUSH and S2_OFFLINE reply the running scan from
+               another task, and WiFi_AbortIO marks it; none of them may
+               land while a result is being written into it. */
+            Forbid();
             if (escan->esr_BSSCount == LE16(0))
             {
                 // Scan complete
-                if (unit->wu_ScanRequest)
-                {
-                    ReplyMsg((struct Message *)unit->wu_ScanRequest);
-                    unit->wu_ScanRequest = NULL;
-                }
+                ReplyScan(unit);
                 //D(bug("[WiFi] EScan complete\n"));
             }
 
@@ -659,6 +686,7 @@ void ProcessEvent(struct SDIO *sdio, struct PacketEvent *pe)
             {
                 UpdateNetwork(unit, &escan->esr_BSSInfo[i]);
             }
+            Permit();
             break;
         }
 
@@ -1203,6 +1231,18 @@ STACKARGS void PacketReceiver(struct SDIO *sdio, struct Task *caller)
                     */
                 }
             }
+        }
+
+        /* A scan the firmware never completes (an escan it refused sends no
+           completion) would hold the request, and a caller waiting out its
+           AbortIO, for ever.  Ended after SCAN_TIMEOUT_US as brcmfmac's escan
+           timer does: it goes back with the networks reported so far. */
+        if (WiFiBase->w_Unit && WiFiBase->w_Unit->wu_ScanRequest != NULL &&
+            WiFiBase->w_SysTimer != NULL &&
+            (ULONG)(PollClock(WiFiBase) - WiFiBase->w_Unit->wu_ScanStart) > SCAN_TIMEOUT_US)
+        {
+            D(bug("[WiFi] Scan timed out\n"));
+            ReplyScan(WiFiBase->w_Unit);
         }
 
         /* If no scan request is in progress start another one (if needed) */
@@ -3248,7 +3288,10 @@ void StartNetworkScan(struct IOSana2Req *io)
 
     io->ios2_DataLength = 0;
     io->ios2_StatData = NULL;
+    io->ios2_Req.io_Error = 0;      /* WiFi_AbortIO marks it from here on */
 
+    if (base->w_SysTimer != NULL)
+        unit->wu_ScanStart = PollClock(base);
     unit->wu_ScanRequest = io;
 
     PacketCmdIntAsync(sdio, BRCMF_C_SET_PASSIVE_SCAN, 0);

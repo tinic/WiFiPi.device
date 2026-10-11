@@ -187,6 +187,8 @@ void PacketCtrlComplete(struct SDIO *sdio, struct Packet *pkt, ULONG pktLen);
 void PacketCtrlSweep(struct SDIO *sdio);
 void PacketCtrlShutdown(struct SDIO *sdio, struct MsgPort *ctrl);
 void StartNetworkScan(struct IOSana2Req *io);
+struct WiFiUnit;
+void ReplyScan(struct WiFiUnit *unit);
 int PacketUploadCLM(struct SDIO *sdio);
 int Connect(struct SDIO *sdio, struct WiFiNetwork *network);
 int SendDataPacket(struct SDIO *sdio, struct IOSana2Req *io);
