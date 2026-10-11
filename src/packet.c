@@ -3234,7 +3234,7 @@ void StartNetworkScan(struct IOSana2Req *io)
         networkName = (UBYTE*)GetTagData(S2INFO_SSID, 0, tags);
     }
 
-    if (networkName) D(bug(networkName));
+    if (networkName) D(bug("%s", (ULONG)networkName));
     
     D(bug(")\n"));
 
