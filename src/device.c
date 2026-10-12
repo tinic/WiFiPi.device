@@ -110,22 +110,26 @@ static BPTR WiFi_Expunge(REGARG(struct WiFiBase * WiFiBase, "a6"))
             OpenDevice((CONST_STRPTR)"timer.device", UNIT_VBLANK, (struct IORequest *)tr, 0);
         }
 
-        /* Stop tasks */
-        D(bug("[WiFi] Killing receiver task\n"));
-        Signal(WiFiBase->w_SDIO->s_ReceiverTask, SIGBREAKF_CTRL_C);
-        D(bug("[WiFi] Killing unit task\n"));
-        Signal(WiFiBase->w_Unit->wu_Task, SIGBREAKF_CTRL_C);
+        /* Stop tasks.  WiFi_Init starts them only with the unit: without
+           one there is nothing to stop, and w_SDIO may be NULL too. */
+        if (WiFiBase->w_Unit != NULL)
+        {
+            D(bug("[WiFi] Killing receiver task\n"));
+            Signal(WiFiBase->w_SDIO->s_ReceiverTask, SIGBREAKF_CTRL_C);
+            D(bug("[WiFi] Killing unit task\n"));
+            Signal(WiFiBase->w_Unit->wu_Task, SIGBREAKF_CTRL_C);
 
-        /* Wait for unit and receiver tasks to finish */
-        do {
-            if (tr) {
-                tr->tr_time.tv_micro = 250000;
-                tr->tr_time.tv_secs = 0;
-                tr->tr_node.io_Command = TR_ADDREQUEST;
-                DoIO(&tr->tr_node);
-            }
-            D(bug("[WiFi] Receiver: %08lx, Unit: %08lx\n", (ULONG)WiFiBase->w_SDIO->s_ReceiverTask, (ULONG)WiFiBase->w_Unit->wu_Task));
-        } while(WiFiBase->w_SDIO->s_ReceiverTask != 0 || WiFiBase->w_Unit->wu_Task != 0);
+            /* Wait for unit and receiver tasks to finish */
+            do {
+                if (tr) {
+                    tr->tr_time.tv_micro = 250000;
+                    tr->tr_time.tv_secs = 0;
+                    tr->tr_node.io_Command = TR_ADDREQUEST;
+                    DoIO(&tr->tr_node);
+                }
+                D(bug("[WiFi] Receiver: %08lx, Unit: %08lx\n", (ULONG)WiFiBase->w_SDIO->s_ReceiverTask, (ULONG)WiFiBase->w_Unit->wu_Task));
+            } while(WiFiBase->w_SDIO->s_ReceiverTask != 0 || WiFiBase->w_Unit->wu_Task != 0);
+        }
 
         CloseDevice(&tr->tr_node);
         DeleteIORequest(tr);
@@ -179,7 +183,10 @@ void WiFi_Open(REGARG(struct IOSana2Req * io, "a1"), REGARG(LONG unitNumber, "d0
 
     D(bug("[WiFi] WiFi_Open(%08lx, %ld, %lx)\n", (ULONG)io, unitNumber, flags));
 
-    if (unitNumber != 0)
+    /* No unit: WiFi_Init found no devicetree.resource (not a Pi under
+       Emu68), or the SDIO host or the chip did not come up.  Every path
+       below reads the unit, so the open fails here with nothing touched. */
+    if (unitNumber != 0 || unit == NULL)
     {
         error = IOERR_OPENFAIL;
     }

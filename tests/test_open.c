@@ -4,7 +4,8 @@
  * real control path are linked in; a helper task stands in for the receiver
  * and answers the cur_etheraddr get as each step scripts it.
  *
- * Covered: a lost and a short address reply fail the open with nothing
+ * Covered: no unit (WiFi_Init found no Pi) fails full and limited opens;
+ * a lost and a short address reply fail the open with nothing
  * changed; a whole reply opens, and Close balances; a retry after a failure;
  * exclusive against shared on a running unit (no restart, nothing touched);
  * limited opens; an open started and then refused as busy; a second open
@@ -272,6 +273,19 @@ int main(void)
     fsdio.s_ReceiverPort = (struct MsgPort *)ctrlPort;
 
 #define NOW() (DateStamp(&ds), (ULONG)(ds.ds_Minute * 3000 + ds.ds_Tick))
+
+    PutStr("step 0 no unit (not a Pi): full and limited opens fail, nothing touched\n");
+    fbase.w_Unit = NULL;
+    snap(&s);
+    io = frame(&f1, FULL);
+    WiFi_Open(io, 0, 0);
+    refused(io, IOERR_OPENFAIL, "no unit, full: IOERR_OPENFAIL");
+    io3 = frame(&f3, SHORT);
+    WiFi_Open(io3, 0, 0);
+    expect_eq(io3->ios2_Req.io_Error, IOERR_OPENFAIL, "no unit, limited: IOERR_OPENFAIL");
+    expect(io3->ios2_Req.io_Unit == NULL, "no unit, limited: io_Unit NULL");
+    unchanged(&s, 0, "no unit: counters, flags, openers untouched, nothing sent");
+    fbase.w_Unit = &funit;
 
     PutStr("step 1 address lost: the open fails, nothing changed\n");
     reset_unit();
