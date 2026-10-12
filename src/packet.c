@@ -258,7 +258,9 @@ int SetWPAVersion(struct SDIO *sdio, struct WiFiNetwork *network, ULONG wpa_vers
 }
 
 #define SCANNER_STACKSIZE       (16384 / sizeof(ULONG))
-#define SCAN_TIMEOUT_US         10000000    /* brcmfmac BRCMF_ESCAN_TIMER_INTERVAL_MS */
+/* brcmfmac's escan timer is 10 s for 120 ms passive dwell; at 230 ms the 5 GHz
+   band alone is ~5.5 s unassociated, more with home-channel visits */
+#define SCAN_TIMEOUT_US         20000000
 #define SCANNER_PRIORITY         0
 
 
@@ -404,6 +406,16 @@ void UpdateNetwork(struct WiFiUnit *unit, struct BSSInfo *info)
     if (io == NULL || io->ios2_Req.io_Error != 0)
     {
         return;
+    }
+
+    {
+        struct ChannelInfo band = { 0 };
+        band.ci_CHSpec = LE16(info->bssi_ChanSpec);
+        DecodeChanSpec(&band, sdio->s_Chip->c_D11Type);
+        if (band.ci_Band == BRCMU_CHAN_BAND_2G)
+            sdio->s_StatScan2G++;
+        else
+            sdio->s_StatScan5G++;
     }
 
     /* Ignore network duplicates, later maybe update them */
@@ -555,6 +567,8 @@ void UpdateNetwork(struct WiFiUnit *unit, struct BSSInfo *info)
     tags++;
 }
 
+static inline ULONG PollClock(struct WiFiBase *WiFiBase);
+
 /* The firmware finished the running scan: reply it, once.  One that was
    aborted on the way (WiFi_AbortIO) goes back with no networks; what was
    allocated for them stays in the caller's pool, which owns it. */
@@ -570,6 +584,9 @@ void ReplyScan(struct WiFiUnit *unit)
 
     if (io == NULL)
         return;
+    if (unit->wu_Base->w_SysTimer != NULL && unit->wu_Base->w_SDIO != NULL)
+        unit->wu_Base->w_SDIO->s_StatScanMs =
+            (ULONG)(PollClock(unit->wu_Base) - unit->wu_ScanStart) / 1000;
     if (io->ios2_Req.io_Error == IOERR_ABORTED)
     {
         io->ios2_WireError = S2WERR_GENERIC_ERROR;
@@ -598,16 +615,23 @@ void ProcessEvent(struct SDIO *sdio, struct PacketEvent *pe)
                another task, and WiFi_AbortIO marks it; none of them may
                land while a result is being written into it. */
             Forbid();
-            if (escan->esr_BSSCount == LE16(0))
-            {
-                // Scan complete
-                ReplyScan(unit);
-                //D(bug("[WiFi] EScan complete\n"));
-            }
-
             for (int i=0; i < LE16(escan->esr_BSSCount); i++)
             {
                 UpdateNetwork(unit, &escan->esr_BSSInfo[i]);
+            }
+            /* Only PARTIAL carries results and keeps the scan going, as in
+               brcmfmac's brcmf_cfg80211_escan_handler: the end is the status,
+               not an empty event */
+            if (pe->e_Status != BRCMF_E_STATUS_PARTIAL)
+            {
+                sdio->s_StatScans++;
+                sdio->s_StatScanStatus = pe->e_Status;
+                if (pe->e_Status != BRCMF_E_STATUS_SUCCESS)
+                {
+                    sdio->s_StatScanEnds++;
+                    D(bug("[WiFi] EScan ended with status %ld\n", pe->e_Status));
+                }
+                ReplyScan(unit);
             }
             Permit();
             break;
@@ -798,6 +822,8 @@ void ScanWatchdog(struct WiFiBase *WiFiBase)
         (ULONG)(PollClock(WiFiBase) - unit->wu_ScanStart) > SCAN_TIMEOUT_US)
     {
         D(bug("[WiFi] Scan timed out\n"));
+        if (WiFiBase->w_SDIO != NULL)
+            WiFiBase->w_SDIO->s_StatScanTimeouts++;
         ReplyScan(unit);
     }
 }
@@ -3126,6 +3152,10 @@ int PacketUploadCLM(struct SDIO *sdio)
 }
 
 /* wl_escan_params, laid out as brcmfmac's brcmf_escan_params_le.
+   passive_time is SCAN_PASSIVE_MS, not the 120 ms set at configure: a
+   passive channel (all of 5 GHz until the firmware has a country) is heard
+   only through a beacon, and 120 ms holds one 102.4 ms beacon interval, so
+   one lost beacon lost the network for the whole scan.  230 ms holds two.
    channel_num is 0: the firmware scans every channel its country and
    regulatory revision allow, on both bands, active or passive as each
    channel requires (the firmware's rule for a scan that names no
@@ -3140,10 +3170,10 @@ static const UBYTE params[SCAN_PARAMS_SIZE] = {
     0xff,0xff,0xff,0xff,0xff,0xff,
     2,
     0,
-    0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,
+    0xff,0xff,0xff,0xff,                /* nprobes: firmware default */
+    0xff,0xff,0xff,0xff,                /* active_time: SET_SCAN_UNASSOC_TIME, 40 ms */
+    SCAN_PASSIVE_MS & 0xff, SCAN_PASSIVE_MS >> 8, 0, 0,     /* passive_time */
+    0xff,0xff,0xff,0xff,                /* home_time: firmware default */
     0,0,
     0,0,
     0,0,0,0,0,0,0,0,0,0,0,0,0,0,
@@ -3199,6 +3229,8 @@ void StartNetworkScan(struct IOSana2Req *io)
     io->ios2_DataLength = 0;
     io->ios2_StatData = NULL;
     io->ios2_Req.io_Error = 0;      /* WiFi_AbortIO marks it from here on */
+    sdio->s_StatScan2G = 0;
+    sdio->s_StatScan5G = 0;
 
     if (base->w_SysTimer != NULL)
         unit->wu_ScanStart = PollClock(base);

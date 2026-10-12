@@ -309,6 +309,13 @@ struct SDIO {
     ULONG               s_StatIntStatus;    // the card's last non-zero intstatus, as cleared
     ULONG               s_StatMailboxes;    // host mailbox interrupts acknowledged
     ULONG               s_StatMailboxData;  // the last tohostmailboxdata
+    ULONG               s_StatScans;        // scans the firmware ended
+    ULONG               s_StatScanEnds;     // of those, ended with a status other than SUCCESS
+    ULONG               s_StatScanStatus;   // the last scan's end status (BRCMF_E_STATUS_*)
+    ULONG               s_StatScanTimeouts; // scans ended by the watchdog, no end event
+    ULONG               s_StatScanMs;       // the last scan's length, ms
+    ULONG               s_StatScan2G;       // 2.4 GHz results in the last scan, duplicates included
+    ULONG               s_StatScan5G;       // 5 GHz results in the last scan, duplicates included
 
     /* The card interrupt: a server on the GIC through gic400.library */
     struct Interrupt    s_Interrupt;
