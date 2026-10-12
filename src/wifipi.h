@@ -196,6 +196,7 @@ struct WiFiUnit
     struct Sana2DeviceStats wu_Stats;
     struct TimerBase *      wu_TimerBase;
     ULONG                   wu_Flags;
+    APTR                    wu_JoinOpener;      /* the opener whose S2_SETOPTIONS joined */
     UBYTE                   wu_OrigEtherAddr[6];
     UBYTE                   wu_EtherAddr[6];
 

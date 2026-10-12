@@ -962,6 +962,9 @@ static int Do_S2_SETOPTIONS(struct IOSana2Req *io)
     }
 
     PacketSetVar(WiFiBase->w_SDIO, "join", &unit->wu_JoinParams, sizeof(struct ExtJoinParams));
+    /* The supplicant that joined: its CloseDevice leaves the network. */
+    if (io->ios2_Req.io_Message.mn_Length >= sizeof(struct IOSana2Req))
+        unit->wu_JoinOpener = io->ios2_BufferManagement;
 
     return 1;
 }
@@ -1850,6 +1853,11 @@ static int Do_S2_OFFLINE(struct IOSana2Req *io)
         req->ios2_WireError = S2WERR_UNIT_OFFLINE;
         ReplyMsg((struct Message *)req);
     }
+
+    /* Offline is off the network as well, as prism2.device's disabled port
+       is: the firmware's link-down then reports S2EVENT_DISCONNECT. */
+    if (unit->wu_Flags & IFF_CONNECTED)
+        PacketCmdInt(sdio, BRCMF_C_DISASSOC, 0);
 
     /* If unit was ONLINE before, report offline event now */
     if (wasOnline)
