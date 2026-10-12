@@ -16,7 +16,10 @@
  *   empty      a scan that finds nothing: io_Error 0, no list
  *   abort      AbortIO between 5 GHz results: replied once at completion,
  *              aborted and empty; later results are not written into it
- *   watchdog   a scan with no completion ends after 10 s (fake CLO), with
+ *   late 5 GHz  results one an event, 2.4 GHz first, an empty PARTIAL
+ *              event, the 5 GHz results last: all kept, the end is the
+ *              status; a firmware ABORT ends the scan with what came
+ *   watchdog   a scan with no completion ends after 20 s (fake CLO), with
  *              what it found, or aborted and empty; not before
  *
  * Built like test_devquery (tests/README).
@@ -98,8 +101,10 @@ static void set_clock(ULONG us) { fclock[1] = __builtin_bswap32(us); }
 
 struct Net { const char *ssid; UBYTE id; UWORD chanspec; WORD rssi; };
 
-/* One BRCMF_E_ESCAN_RESULT event as the receiver hands it to ProcessEvent */
-static void escan(const struct Net *nets, int count)
+/* One BRCMF_E_ESCAN_RESULT event as the receiver hands it to ProcessEvent:
+   results come with status PARTIAL, the end with any other */
+static UWORD syncID;                    /* the id the event echoes */
+static void escan_status(const struct Net *nets, int count, ULONG status)
 {
     static UBYTE buf[sizeof(struct PacketEvent) + sizeof(struct EScanResult) + 8 * sizeof(struct BSSInfo)];
     struct PacketEvent *pe = (struct PacketEvent *)buf;
@@ -107,7 +112,9 @@ static void escan(const struct Net *nets, int count)
 
     memset(buf, 0, sizeof(buf));
     pe->e_EventType = BRCMF_E_ESCAN_RESULT;     /* network order = native */
+    pe->e_Status = status;
     esr->esr_BSSCount = __builtin_bswap16(count);
+    esr->esr_SyncID = __builtin_bswap16(syncID);
     for (int i = 0; i < count; i++)
     {
         struct BSSInfo *b = &esr->esr_BSSInfo[i];
@@ -121,7 +128,8 @@ static void escan(const struct Net *nets, int count)
     }
     ProcessEvent(&fsdio, pe);
 }
-static void complete(void) { escan(NULL, 0); }
+static void escan(const struct Net *nets, int count) { escan_status(nets, count, BRCMF_E_STATUS_PARTIAL); }
+static void complete(void) { escan_status(NULL, 0, BRCMF_E_STATUS_SUCCESS); }
 
 static struct TagItem *find(struct IOSana2Req *io, const char *ssid)
 {
@@ -156,6 +164,8 @@ static void start(struct IOSana2Req *io, ULONG now)
     io->ios2_DataLength = 0;
     io->ios2_StatData = NULL;
     io->ios2_Req.io_Error = 0;
+    fsdio.s_StatScan2G = 0;
+    fsdio.s_StatScan5G = 0;
     funit.wu_ScanStart = now;
     funit.wu_ScanRequest = io;
 }
@@ -241,14 +251,17 @@ int main(void)
     }
 
     PutStr("params\n");
-    p = ScanParams(buf, NULL);
+    ScanParams(buf, NULL, 0x0102);
+    p = buf;
     expect_eq(p[0] | p[1] << 8, 1, "escan version 1");
     expect_eq(p[4] | p[5] << 8, 1, "action start");
+    expect_eq(p[6] | p[7] << 8, 0x0102, "sync_id as given, little-endian");
     expect_eq(p[SCAN_PARAMS_NCHAN] | p[SCAN_PARAMS_NCHAN + 1] << 8, 0, "no channel named: all, both bands");
     expect_eq(p[SCAN_PARAMS_NCHAN + 2] | p[SCAN_PARAMS_NCHAN + 3] << 8, 0, "no SSID");
     expect_eq(p[8], 0, "broadcast scan: SSID length 0");
-    p = ScanParams(buf, (const UBYTE *)"Hidden");
-    expect(p == buf, "directed scan in the caller's buffer");
+    expect_eq(p[SCAN_PARAMS_PASSIVE] | p[SCAN_PARAMS_PASSIVE + 1] << 8, 230, "passive dwell 230 ms: two beacons");
+    expect_eq(p[SCAN_PARAMS_PASSIVE - 4] | p[SCAN_PARAMS_PASSIVE - 3] << 8, 0xffff, "active dwell: the configured 40 ms");
+    ScanParams(buf, (const UBYTE *)"Hidden", 7);
     expect_eq(p[8], 6, "directed scan: SSID length");
     expect(memcmp(p + 12, "Hidden", 6) == 0, "directed scan: SSID");
     expect_eq(p[SCAN_PARAMS_NCHAN] | p[SCAN_PARAMS_NCHAN + 1] << 8, 0, "directed scan: all channels");
@@ -261,7 +274,7 @@ int main(void)
         WiFi_BeginIO(io);
         expect(GetMsg(reply) == NULL, "queued, not replied");
         expect(GetMsg(funit.wu_ScanQueue) == (struct Message *)io, "on the scan queue");
-        p = ScanParams(buf, (const UBYTE *)GetTagData(S2INFO_SSID, 0, tags));
+        ScanParams(buf, (const UBYTE *)GetTagData(S2INFO_SSID, 0, tags), 1);
         expect(memcmp(p + 12, "Five80", 6) == 0, "WM's SSID is the probe");
     }
 
@@ -305,6 +318,87 @@ int main(void)
     check_net(io, "N40", 36, S2BAND_A, -61);
     fchip.c_D11Type = 2;
 
+    PutStr("late 5 GHz\n");
+    {
+        /* As the A1200 sees it: the 2.4 GHz band first, one result an event,
+           an empty PARTIAL event between the bands, the 5 GHz results last,
+           then the end */
+        static const struct Net early[] = {
+            { "A1", 20, CS_2G_6_20, -70 }, { "A2", 21, CS_2G_11_20, -71 },
+            { "A3", 22, CS_2G_6_20, -72 }, { "A4", 23, CS_2G_11_20, -73 },
+            { "A5", 24, CS_2G_6_20, -74 }, { "A6", 25, CS_2G_11_20, -75 },
+            { "A7", 26, CS_2G_6_20, -76 }, { "A8", 27, CS_2G_11_20, -77 },
+        };
+        static const struct Net late[] = {
+            { "RhodeIsland5", 30, CS_5G_46_40_L, -79 },
+            { "xfinitywifi",  31, CS_5G_46_40_L, -78 },
+            { "MR",           32, CS_5G_42_80_LL, -82 },
+        };
+        start(io, 1800);
+        for (int k = 0; k < 8; k++)
+            escan(&early[k], 1);
+        escan(NULL, 0);                         /* PARTIAL, no BSS: not the end */
+        expect_eq(replies(io), 0, "late: an empty PARTIAL event does not end the scan");
+        for (int k = 0; k < 3; k++)
+            escan(&late[k], 1);
+        expect_eq(fsdio.s_StatScan2G, 8, "late: 2.4 GHz results counted");
+        expect_eq(fsdio.s_StatScan5G, 3, "late: 5 GHz results counted");
+        set_clock(1800 + 5500000);
+        complete();
+        expect_eq(replies(io), 1, "late: replied once at the end");
+        expect_eq(io->ios2_DataLength, 11, "late: all eleven networks");
+        check_net(io, "RhodeIsland5", 44, S2BAND_A, -79);
+        check_net(io, "xfinitywifi", 44, S2BAND_A, -78);
+        check_net(io, "MR", 36, S2BAND_A, -82);
+        check_net(io, "A8", 11, S2BAND_B, -77);
+        expect_eq(fsdio.s_StatScanMs, 5500, "late: scan length in ms");
+        expect_eq(fsdio.s_StatScanStatus, BRCMF_E_STATUS_SUCCESS, "late: end status SUCCESS");
+
+        /* the firmware ends a scan early (ABORT, 4): replied with what came.
+           brcmfmac ignores ABORT (its own abort path completes the scan);
+           this driver has none, so ABORT ends the scan here */
+        ULONG ends = fsdio.s_StatScanEnds, scans = fsdio.s_StatScans;
+        start(io, 1900);
+        escan(early, 2);
+        escan_status(NULL, 0, 4);
+        expect_eq(replies(io), 1, "firmware abort: replied once");
+        expect_eq(io->ios2_Req.io_Error, 0, "firmware abort: io_Error 0");
+        expect_eq(io->ios2_DataLength, 2, "firmware abort: the results so far");
+        expect_eq(fsdio.s_StatScans - scans, 1, "firmware abort: one scan counted");
+        expect_eq(fsdio.s_StatScanEnds - ends, 1, "firmware abort: counted as ended early");
+        expect_eq(fsdio.s_StatScanStatus, 4, "firmware abort: its status kept");
+        escan(late, 1);
+        complete();
+        expect_eq(replies(io), 0, "firmware abort: a late result and end reply nothing");
+    }
+
+    PutStr("stale sync_id\n");
+    {
+        /* the watchdog gave up on scan 5; scan 6 is running when the
+           firmware ends 5 late: its result and end are dropped */
+        funit.wu_ScanStaleID = 5;
+        funit.wu_ScanSyncID = 6;
+        start(io, 1950);
+        syncID = 5;
+        escan(mixed, 1);
+        escan_status(NULL, 0, 4);
+        expect_eq(replies(io), 0, "stale: scan 5's end does not end scan 6");
+        expect_eq(io->ios2_DataLength, 0, "stale: scan 5's result not taken");
+        syncID = 6;
+        escan(mixed + 1, 1);
+        complete();
+        expect_eq(replies(io), 1, "stale: scan 6 ends on its own end");
+        expect_eq(io->ios2_DataLength, 1, "stale: scan 6's result only");
+        /* a firmware that echoes no id (0): taken */
+        start(io, 1960);
+        syncID = 0;
+        escan(mixed, 1);
+        complete();
+        expect_eq(replies(io), 1, "id 0: replied");
+        expect_eq(io->ios2_DataLength, 1, "id 0: result taken");
+        funit.wu_ScanStaleID = funit.wu_ScanSyncID = 0;
+    }
+
     PutStr("empty\n");
     start(io, 2000);
     complete();
@@ -329,15 +423,16 @@ int main(void)
     PutStr("watchdog\n");
     start(io, 0xfffff000);                      /* across the CLO wrap */
     escan(mixed, 2);
-    set_clock(0xfffff000 + 9000000);
+    set_clock(0xfffff000 + 19000000);
     ScanWatchdog(&fbase);
-    expect_eq(replies(io), 0, "watchdog: 9 s, still running");
-    set_clock(0xfffff000 + 10000001);
+    expect_eq(replies(io), 0, "watchdog: 19 s, still running");
+    set_clock(0xfffff000 + 20000001);
     ScanWatchdog(&fbase);
-    expect_eq(replies(io), 1, "watchdog: past 10 s, replied");
+    expect_eq(replies(io), 1, "watchdog: past 20 s, replied");
     expect(funit.wu_ScanRequest == NULL, "watchdog: unit released it");
     expect_eq(io->ios2_Req.io_Error, 0, "watchdog: io_Error 0");
     expect_eq(io->ios2_DataLength, 2, "watchdog: the networks found so far");
+    expect_eq(fsdio.s_StatScanTimeouts, 1, "watchdog: counted");
     ScanWatchdog(&fbase);
     complete();
     expect_eq(replies(io), 0, "watchdog: late completion replies nothing");
@@ -345,7 +440,7 @@ int main(void)
     start(io, 5000);
     escan(mixed, 1);
     WiFi_AbortIO(io);
-    set_clock(5000 + 10000001);
+    set_clock(5000 + 20000001);
     ScanWatchdog(&fbase);
     expect_eq(replies(io), 1, "watchdog after abort: replied once");
     expect_eq(io->ios2_Req.io_Error, IOERR_ABORTED, "watchdog after abort: IOERR_ABORTED");

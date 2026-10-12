@@ -142,6 +142,10 @@
 #define BRCMF_E_DFS_AP_STOP                     65
 #define BRCMF_E_DFS_AP_RESUME                   66
 #define BRCMF_E_ESCAN_RESULT                    69
+/* e_Status of an escan event: PARTIAL carries results, any other ends the
+   scan (SUCCESS when it ran to the end) */
+#define BRCMF_E_STATUS_SUCCESS                  0
+#define BRCMF_E_STATUS_PARTIAL                  8
 #define BRCMF_E_ACTION_FRAME_OFF_CHAN_COMPLETE  70
 #define BRCMF_E_PROBERESP_MSG                   71
 #define BRCMF_E_P2P_PROBEREQ_MSG                72
@@ -200,7 +204,9 @@ void ScanWatchdog(struct WiFiBase *WiFiBase);
    channel list of 14 and room for one SSID */
 #define SCAN_PARAMS_SIZE    (4+2+2+4+32+6+1+1+4*4+2+2+14*2+32+4)
 #define SCAN_PARAMS_NCHAN   68      /* channel_num: channels low, SSIDs high */
-const UBYTE *ScanParams(UBYTE *buf, const UBYTE *networkName);
+#define SCAN_PARAMS_PASSIVE 60      /* passive_time, ms */
+#define SCAN_PASSIVE_MS     230     /* two beacon intervals of 102.4 ms and the switch */
+void ScanParams(UBYTE *buf, const UBYTE *networkName, UWORD syncID);
 int PacketUploadCLM(struct SDIO *sdio);
 int Connect(struct SDIO *sdio, struct WiFiNetwork *network);
 int SendDataPacket(struct SDIO *sdio, struct IOSana2Req *io);
