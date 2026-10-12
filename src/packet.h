@@ -206,7 +206,7 @@ void ScanWatchdog(struct WiFiBase *WiFiBase);
 #define SCAN_PARAMS_NCHAN   68      /* channel_num: channels low, SSIDs high */
 #define SCAN_PARAMS_PASSIVE 60      /* passive_time, ms */
 #define SCAN_PASSIVE_MS     230     /* two beacon intervals of 102.4 ms and the switch */
-const UBYTE *ScanParams(UBYTE *buf, const UBYTE *networkName);
+void ScanParams(UBYTE *buf, const UBYTE *networkName, UWORD syncID);
 int PacketUploadCLM(struct SDIO *sdio);
 int Connect(struct SDIO *sdio, struct WiFiNetwork *network);
 int SendDataPacket(struct SDIO *sdio, struct IOSana2Req *io);

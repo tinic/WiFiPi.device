@@ -191,6 +191,8 @@ struct WiFiUnit
     struct MsgPort *        wu_ScanQueue;
     struct IOSana2Req *     wu_ScanRequest;
     ULONG                   wu_ScanStart;       // CLO when wu_ScanRequest started
+    UWORD                   wu_ScanSyncID;      // sync_id of the escan last started
+    UWORD                   wu_ScanStaleID;     // the one before: its events are dropped
     struct Sana2DeviceStats wu_Stats;
     struct TimerBase *      wu_TimerBase;
     ULONG                   wu_Flags;

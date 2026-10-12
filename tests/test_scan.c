@@ -103,6 +103,7 @@ struct Net { const char *ssid; UBYTE id; UWORD chanspec; WORD rssi; };
 
 /* One BRCMF_E_ESCAN_RESULT event as the receiver hands it to ProcessEvent:
    results come with status PARTIAL, the end with any other */
+static UWORD syncID;                    /* the id the event echoes */
 static void escan_status(const struct Net *nets, int count, ULONG status)
 {
     static UBYTE buf[sizeof(struct PacketEvent) + sizeof(struct EScanResult) + 8 * sizeof(struct BSSInfo)];
@@ -113,6 +114,7 @@ static void escan_status(const struct Net *nets, int count, ULONG status)
     pe->e_EventType = BRCMF_E_ESCAN_RESULT;     /* network order = native */
     pe->e_Status = status;
     esr->esr_BSSCount = __builtin_bswap16(count);
+    esr->esr_SyncID = __builtin_bswap16(syncID);
     for (int i = 0; i < count; i++)
     {
         struct BSSInfo *b = &esr->esr_BSSInfo[i];
@@ -249,16 +251,17 @@ int main(void)
     }
 
     PutStr("params\n");
-    p = ScanParams(buf, NULL);
+    ScanParams(buf, NULL, 0x0102);
+    p = buf;
     expect_eq(p[0] | p[1] << 8, 1, "escan version 1");
     expect_eq(p[4] | p[5] << 8, 1, "action start");
+    expect_eq(p[6] | p[7] << 8, 0x0102, "sync_id as given, little-endian");
     expect_eq(p[SCAN_PARAMS_NCHAN] | p[SCAN_PARAMS_NCHAN + 1] << 8, 0, "no channel named: all, both bands");
     expect_eq(p[SCAN_PARAMS_NCHAN + 2] | p[SCAN_PARAMS_NCHAN + 3] << 8, 0, "no SSID");
     expect_eq(p[8], 0, "broadcast scan: SSID length 0");
     expect_eq(p[SCAN_PARAMS_PASSIVE] | p[SCAN_PARAMS_PASSIVE + 1] << 8, 230, "passive dwell 230 ms: two beacons");
     expect_eq(p[SCAN_PARAMS_PASSIVE - 4] | p[SCAN_PARAMS_PASSIVE - 3] << 8, 0xffff, "active dwell: the configured 40 ms");
-    p = ScanParams(buf, (const UBYTE *)"Hidden");
-    expect(p == buf, "directed scan in the caller's buffer");
+    ScanParams(buf, (const UBYTE *)"Hidden", 7);
     expect_eq(p[8], 6, "directed scan: SSID length");
     expect(memcmp(p + 12, "Hidden", 6) == 0, "directed scan: SSID");
     expect_eq(p[SCAN_PARAMS_NCHAN] | p[SCAN_PARAMS_NCHAN + 1] << 8, 0, "directed scan: all channels");
@@ -271,7 +274,7 @@ int main(void)
         WiFi_BeginIO(io);
         expect(GetMsg(reply) == NULL, "queued, not replied");
         expect(GetMsg(funit.wu_ScanQueue) == (struct Message *)io, "on the scan queue");
-        p = ScanParams(buf, (const UBYTE *)GetTagData(S2INFO_SSID, 0, tags));
+        ScanParams(buf, (const UBYTE *)GetTagData(S2INFO_SSID, 0, tags), 1);
         expect(memcmp(p + 12, "Five80", 6) == 0, "WM's SSID is the probe");
     }
 
@@ -351,7 +354,9 @@ int main(void)
         expect_eq(fsdio.s_StatScanMs, 5500, "late: scan length in ms");
         expect_eq(fsdio.s_StatScanStatus, BRCMF_E_STATUS_SUCCESS, "late: end status SUCCESS");
 
-        /* the firmware ends a scan early (ABORT, 4): replied with what came */
+        /* the firmware ends a scan early (ABORT, 4): replied with what came.
+           brcmfmac ignores ABORT (its own abort path completes the scan);
+           this driver has none, so ABORT ends the scan here */
         ULONG ends = fsdio.s_StatScanEnds, scans = fsdio.s_StatScans;
         start(io, 1900);
         escan(early, 2);
@@ -365,6 +370,33 @@ int main(void)
         escan(late, 1);
         complete();
         expect_eq(replies(io), 0, "firmware abort: a late result and end reply nothing");
+    }
+
+    PutStr("stale sync_id\n");
+    {
+        /* the watchdog gave up on scan 5; scan 6 is running when the
+           firmware ends 5 late: its result and end are dropped */
+        funit.wu_ScanStaleID = 5;
+        funit.wu_ScanSyncID = 6;
+        start(io, 1950);
+        syncID = 5;
+        escan(mixed, 1);
+        escan_status(NULL, 0, 4);
+        expect_eq(replies(io), 0, "stale: scan 5's end does not end scan 6");
+        expect_eq(io->ios2_DataLength, 0, "stale: scan 5's result not taken");
+        syncID = 6;
+        escan(mixed + 1, 1);
+        complete();
+        expect_eq(replies(io), 1, "stale: scan 6 ends on its own end");
+        expect_eq(io->ios2_DataLength, 1, "stale: scan 6's result only");
+        /* a firmware that echoes no id (0): taken */
+        start(io, 1960);
+        syncID = 0;
+        escan(mixed, 1);
+        complete();
+        expect_eq(replies(io), 1, "id 0: replied");
+        expect_eq(io->ios2_DataLength, 1, "id 0: result taken");
+        funit.wu_ScanStaleID = funit.wu_ScanSyncID = 0;
     }
 
     PutStr("empty\n");

@@ -614,6 +614,15 @@ void ProcessEvent(struct SDIO *sdio, struct PacketEvent *pe)
             /* Forbid: CMD_FLUSH and S2_OFFLINE reply the running scan from
                another task, and WiFi_AbortIO marks it; none of them may
                land while a result is being written into it. */
+            /* An event of the scan before (it ended by the watchdog, and the
+               firmware ends it late) belongs to no request.  Only the id
+               the driver sent last time is refused: a firmware that does
+               not echo sync_id still has its events taken; 0 is no scan. */
+            if (unit->wu_ScanStaleID != 0 &&
+                unit->wu_ScanSyncID != unit->wu_ScanStaleID &&
+                LE16(escan->esr_SyncID) == unit->wu_ScanStaleID)
+                break;
+
             Forbid();
             for (int i=0; i < LE16(escan->esr_BSSCount); i++)
             {
@@ -621,8 +630,11 @@ void ProcessEvent(struct SDIO *sdio, struct PacketEvent *pe)
             }
             /* Only PARTIAL carries results and keeps the scan going, as in
                brcmfmac's brcmf_cfg80211_escan_handler: the end is the status,
-               not an empty event */
-            if (pe->e_Status != BRCMF_E_STATUS_PARTIAL)
+               not an empty event.  Unlike there, ABORT ends it too: brcmfmac
+               completes an aborted scan from its own abort path, and this
+               driver has none (a join that aborts the scan would otherwise
+               leave the request to the watchdog). */
+            if (pe->e_Status != BRCMF_E_STATUS_PARTIAL && unit->wu_ScanRequest != NULL)
             {
                 sdio->s_StatScans++;
                 sdio->s_StatScanStatus = pe->e_Status;
@@ -3181,23 +3193,24 @@ static const UBYTE params[SCAN_PARAMS_SIZE] = {
     0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
 };
 
-/* The escan parameters for a scan of every network, or with buf, of the
-   one named (a directed probe for a hidden SSID) */
-const UBYTE *ScanParams(UBYTE *buf, const UBYTE *networkName)
+/* The escan parameters, in buf: a scan of every network, or of the one
+   named (a directed probe for a hidden SSID), numbered syncID */
+void ScanParams(UBYTE *buf, const UBYTE *networkName, UWORD syncID)
 {
-    ULONG len;
+    ULONG len = 0;
 
+    for (ULONG i = 0; i < sizeof(params); i++)
+        buf[i] = params[i];
+    buf[6] = syncID & 0xff;
+    buf[7] = syncID >> 8;
     if (networkName == NULL)
-        return params;
+        return;
 
     len = _strlen((CONST_STRPTR)networkName);
     if (len > 32) len = 32;
-    for (ULONG i = 0; i < sizeof(params); i++)
-        buf[i] = params[i];
     buf[8] = len;
     for (ULONG i = 0; i < len; i++)
         buf[12 + i] = networkName[i];
-    return buf;
 }
 
 void StartNetworkScan(struct IOSana2Req *io)
@@ -3210,8 +3223,7 @@ void StartNetworkScan(struct IOSana2Req *io)
     UBYTE *networkName = NULL;
     struct TagItem *tags = io->ios2_StatData;
 
-    UBYTE buf[SCAN_PARAMS_SIZE];    /* the receiver's stack, not w_MemPool (#94) */
-    const UBYTE *data;
+    UBYTE data[SCAN_PARAMS_SIZE];   /* the receiver's stack, not w_MemPool (#94) */
     
     D(bug("[WiFi] StartNetworkScan("));
 
@@ -3224,7 +3236,12 @@ void StartNetworkScan(struct IOSana2Req *io)
     
     D(bug(")\n"));
 
-    data = ScanParams(buf, networkName);
+    /* Numbered, so the end of a scan the watchdog gave up on (the
+       firmware aborts it when this one starts) cannot end this one */
+    unit->wu_ScanStaleID = unit->wu_ScanSyncID;
+    if (++unit->wu_ScanSyncID == 0)
+        unit->wu_ScanSyncID = 1;
+    ScanParams(data, networkName, unit->wu_ScanSyncID);
 
     io->ios2_DataLength = 0;
     io->ios2_StatData = NULL;
