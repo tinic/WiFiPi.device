@@ -379,6 +379,18 @@ ULONG WiFi_Close(REGARG(struct IOSana2Req * io, "a1"))
 
         if (opener)
         {
+            /* The supplicant that joined has gone (WirelessManager quit by
+               Ctrl-C, NetWirelessPrefs' Disconnect): leave the network, so
+               the link is down and every other opener hears DISCONNECT from
+               the firmware's link-down, instead of an association that no
+               longer carries traffic.  Queued: Close runs on its caller. */
+            if (u != NULL && u->wu_JoinOpener == opener)
+            {
+                u->wu_JoinOpener = NULL;
+                if (u->wu_Flags & IFF_CONNECTED)
+                    PacketCmdIntAsync(WiFiBase->w_SDIO, BRCMF_C_DISASSOC, 0);
+            }
+
             Disable();
             Remove((struct Node *)opener);
             if (!opener->o_OpenReqUsed && u != NULL)
