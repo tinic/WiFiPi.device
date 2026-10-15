@@ -101,13 +101,28 @@ static BPTR WiFi_Expunge(REGARG(struct WiFiBase * WiFiBase, "a6"))
     {
         struct MsgPort *port = CreateMsgPort();
         struct timerequest *tr = CreateIORequest(port, sizeof(struct timerequest));
+        BYTE timerError = IOERR_OPENFAIL;
 
         UWORD negSize = WiFiBase->w_Device.dd_Library.lib_NegSize;
         UWORD posSize = WiFiBase->w_Device.dd_Library.lib_PosSize;
 
         if (tr != NULL && port != NULL)
         {
-            OpenDevice((CONST_STRPTR)"timer.device", UNIT_VBLANK, (struct IORequest *)tr, 0);
+            timerError = OpenDevice((CONST_STRPTR)"timer.device", UNIT_VBLANK, (struct IORequest *)tr, 0);
+        }
+
+        /* Without the timer the tasks cannot be waited for: keep the device
+           and let a later expunge try again. */
+        if (WiFiBase->w_Unit != NULL && timerError != 0)
+        {
+            if (tr != NULL)
+                DeleteIORequest(tr);
+            if (port != NULL)
+                DeleteMsgPort(port);
+
+            WiFiBase->w_Device.dd_Library.lib_Flags |= LIBF_DELEXP;
+
+            return 0;
         }
 
         /* Stop tasks.  WiFi_Init starts them only with the unit: without
@@ -131,9 +146,12 @@ static BPTR WiFi_Expunge(REGARG(struct WiFiBase * WiFiBase, "a6"))
             } while(WiFiBase->w_SDIO->s_ReceiverTask != 0 || WiFiBase->w_Unit->wu_Task != 0);
         }
 
-        CloseDevice(&tr->tr_node);
-        DeleteIORequest(tr);
-        DeleteMsgPort(port);
+        if (timerError == 0)
+            CloseDevice(&tr->tr_node);
+        if (tr != NULL)
+            DeleteIORequest(tr);
+        if (port != NULL)
+            DeleteMsgPort(port);
 
         D(bug("[WiFi] Both tasks finished\n"));
 
