@@ -81,196 +81,103 @@ static void mbox_send(uint32_t channel, uint32_t data, struct WiFiBase * WiFiBas
 	*mbox_write = LE32(data);
 }
 
-uint32_t get_clock_rate(uint32_t clock_id, struct WiFiBase * WiFiBase)
+/*
+ * mailbox.resource (in Emu68 1.1+ ROMs) serialises every mailbox user and
+ * copies the request into its own aligned buffer, swapping it to the VC's
+ * little-endian order.  MB_RawCommand(command) (A0), LVO -6: the request goes
+ * in and comes back in the 68k's byte order, command[0] = 0xffffffff on a
+ * failure.  Without the resource (Emu68 < 1.1) the registers are driven here.
+ */
+static inline void MB_RawCommand(APTR MailboxBase, ULONG *command)
+{
+    register APTR _a6 asm("a6") = MailboxBase;
+    register ULONG *_a0 asm("a0") = command;
+
+    asm volatile("jsr %%a6@(-6)"
+        : "+r"(_a0)
+        : "r"(_a6)
+        : "d0", "d1", "a1", "cc", "memory");
+}
+
+/* Run one property request; cmd[] is in the 68k's byte order. */
+static uint32_t mbox_property(ULONG *cmd, struct WiFiBase * WiFiBase)
 {
     struct ExecBase *SysBase = WiFiBase->w_SysBase;
 
-    ULONG *FBReq = WiFiBase->w_Request;
-    ULONG len = 8*4;
+    if (WiFiBase->w_MailboxBase)
+    {
+        MB_RawCommand(WiFiBase->w_MailboxBase, cmd);
+        return cmd[6];
+    }
 
-    FBReq[0] = LE32(4*8);       // Length
-    FBReq[1] = 0;               // Request
-    FBReq[2] = LE32(0x00030047);// GetClockRate
-    FBReq[3] = LE32(8);
-    FBReq[4] = 0;
-    FBReq[5] = LE32(clock_id);
-    FBReq[6] = 0;
-    FBReq[7] = 0;
+    ULONG *FBReq = WiFiBase->w_Request;
+    ULONG len = cmd[0];
+
+    for (ULONG i = 0; i < len / 4; i++)
+        FBReq[i] = LE32(cmd[i]);
 
     CachePreDMA(FBReq, &len, 0);
     mbox_send(8, (ULONG)FBReq, WiFiBase);
-    mbox_recv(8, WiFiBase); 
+    mbox_recv(8, WiFiBase);
     CachePostDMA(FBReq, &len, 0);
 
     return LE32(FBReq[6]);
+}
+
+/* One tag with a value buffer of 8 or 12 bytes: two argument words */
+static uint32_t mbox_tag(ULONG tag, ULONG size, ULONG arg0, ULONG arg1, struct WiFiBase * WiFiBase)
+{
+    ULONG cmd[9];
+
+    cmd[0] = size == 12 ? 4*9 : 4*8;    // Length
+    cmd[1] = 0;                         // Request
+    cmd[2] = tag;
+    cmd[3] = size;
+    cmd[4] = 0;
+    cmd[5] = arg0;
+    cmd[6] = arg1;
+    cmd[7] = 0;
+    cmd[8] = 0;
+
+    return mbox_property(cmd, WiFiBase);
+}
+
+uint32_t get_clock_rate(uint32_t clock_id, struct WiFiBase * WiFiBase)
+{
+    return mbox_tag(0x00030047, 8, clock_id, 0, WiFiBase);     // GetClockRate
 }
 
 uint32_t set_clock_rate(uint32_t clock_id, uint32_t speed, struct WiFiBase * WiFiBase)
 {
-    struct ExecBase *SysBase = WiFiBase->w_SysBase;
-
-    ULONG *FBReq = WiFiBase->w_Request;
-    ULONG len = 9*4;
-
-    FBReq[0] = LE32(4*9);       // Length
-    FBReq[1] = 0;               // Request
-    FBReq[2] = LE32(0x00038002);// SetClockRate
-    FBReq[3] = LE32(12);
-    FBReq[4] = 0;
-    FBReq[5] = LE32(clock_id);
-    FBReq[6] = LE32(speed);
-    FBReq[7] = 0;
-    FBReq[8] = 0;
-
-    CachePreDMA(FBReq, &len, 0);
-    mbox_send(8, (ULONG)FBReq, WiFiBase);
-    mbox_recv(8, WiFiBase);
-    CachePostDMA(FBReq, &len, 0);
-
-    return LE32(FBReq[6]);
+    return mbox_tag(0x00038002, 12, clock_id, speed, WiFiBase); // SetClockRate
 }
 
 uint32_t get_clock_state(uint32_t id, struct WiFiBase * WiFiBase)
 {
-    struct ExecBase *SysBase = WiFiBase->w_SysBase;
-
-    ULONG *FBReq = WiFiBase->w_Request;
-    ULONG len = 8*4;
-
-    FBReq[0] = LE32(4*8);       // Length
-    FBReq[1] = 0;               // Request
-    FBReq[2] = LE32(0x00030001);// GetClockRate
-    FBReq[3] = LE32(8);
-    FBReq[4] = 0;
-    FBReq[5] = LE32(id);
-    FBReq[6] = 0;
-    FBReq[7] = 0;
-
-    CachePreDMA(FBReq, &len, 0);
-    mbox_send(8, (ULONG)FBReq, WiFiBase);
-    mbox_recv(8, WiFiBase);
-    CachePostDMA(FBReq, &len, 0);
-
-    return LE32(FBReq[6]);
+    return mbox_tag(0x00030001, 8, id, 0, WiFiBase);           // GetClockState
 }
 
 uint32_t set_clock_state(uint32_t id, uint32_t state, struct WiFiBase * WiFiBase)
 {
-    struct ExecBase *SysBase = WiFiBase->w_SysBase;
-
-    ULONG *FBReq = WiFiBase->w_Request;
-    ULONG len = 8*4;
-
-    FBReq[0] = LE32(4*8);       // Length
-    FBReq[1] = 0;               // Request
-    FBReq[2] = LE32(0x00038001);// SetClockRate
-    FBReq[3] = LE32(8);
-    FBReq[4] = 0;
-    FBReq[5] = LE32(id);
-    FBReq[6] = LE32(state);
-    FBReq[7] = 0;
-
-    CachePreDMA(FBReq, &len, 0);
-    mbox_send(8, (ULONG)FBReq, WiFiBase);
-    mbox_recv(8, WiFiBase);
-    CachePostDMA(FBReq, &len, 0);
-
-    return LE32(FBReq[6]);
+    return mbox_tag(0x00038001, 8, id, state, WiFiBase);       // SetClockState
 }
 
 uint32_t get_power_state(uint32_t id, struct WiFiBase * WiFiBase)
 {
-    struct ExecBase *SysBase = WiFiBase->w_SysBase;
-
-    ULONG *FBReq = WiFiBase->w_Request;
-    ULONG len = 8*4;
-
-    FBReq[0] = LE32(4*8);       // Length
-    FBReq[1] = 0;               // Request
-    FBReq[2] = LE32(0x00020001);// GetClockRate
-    FBReq[3] = LE32(8);
-    FBReq[4] = 0;
-    FBReq[5] = LE32(id);
-    FBReq[6] = 0;
-    FBReq[7] = 0;
-
-    CachePreDMA(FBReq, &len, 0);
-    mbox_send(8, (ULONG)FBReq, WiFiBase);
-    mbox_recv(8, WiFiBase);
-    CachePostDMA(FBReq, &len, 0);
-
-    return LE32(FBReq[6]);
+    return mbox_tag(0x00020001, 8, id, 0, WiFiBase);           // GetPowerState
 }
 
 uint32_t set_power_state(uint32_t id, uint32_t state, struct WiFiBase * WiFiBase)
 {
-    struct ExecBase *SysBase = WiFiBase->w_SysBase;
-
-    ULONG *FBReq = WiFiBase->w_Request;
-    ULONG len = 9*4;
-
-    FBReq[0] = LE32(4*9);       // Length
-    FBReq[1] = 0;               // Request
-    FBReq[2] = LE32(0x00028001);// SetClockRate
-    FBReq[3] = LE32(12);
-    FBReq[4] = 0;
-    FBReq[5] = LE32(id);
-    FBReq[6] = LE32(state);
-    FBReq[7] = 0;
-    FBReq[8] = 0;
-
-    CachePreDMA(FBReq, &len, 0);
-    mbox_send(8, (ULONG)FBReq, WiFiBase);
-    mbox_recv(8, WiFiBase);
-    CachePostDMA(FBReq, &len, 0);
-
-    return LE32(FBReq[6]);
+    return mbox_tag(0x00028001, 12, id, state, WiFiBase);      // SetPowerState
 }
 
 uint32_t get_extgpio_state(uint32_t id, struct WiFiBase * WiFiBase)
 {
-    struct ExecBase *SysBase = WiFiBase->w_SysBase;
-
-    ULONG *FBReq = WiFiBase->w_Request;
-    ULONG len = 8*4;
-
-    FBReq[0] = LE32(4*8);       // Length
-    FBReq[1] = 0;               // Request
-    FBReq[2] = LE32(0x00030041);// GET_GPIO_STATE
-    FBReq[3] = LE32(8);
-    FBReq[4] = 0;
-    FBReq[5] = LE32(128 + id);
-    FBReq[6] = 0;
-    FBReq[7] = 0;
-
-    CachePreDMA(FBReq, &len, 0);
-    mbox_send(8, (ULONG)FBReq, WiFiBase);
-    mbox_recv(8, WiFiBase);
-    CachePostDMA(FBReq, &len, 0);
-
-    return LE32(FBReq[6]);
+    return mbox_tag(0x00030041, 8, 128 + id, 0, WiFiBase);     // GET_GPIO_STATE
 }
 
 uint32_t set_extgpio_state(uint32_t id, uint32_t state, struct WiFiBase * WiFiBase)
 {
-    struct ExecBase *SysBase = WiFiBase->w_SysBase;
-
-    ULONG *FBReq = WiFiBase->w_Request;
-    ULONG len = 8*4;
-
-    FBReq[0] = LE32(4*8);       // Length
-    FBReq[1] = 0;               // Request
-    FBReq[2] = LE32(0x00038041);// SET_GPIO_STATE
-    FBReq[3] = LE32(8);
-    FBReq[4] = 0;
-    FBReq[5] = LE32(128 + id);
-    FBReq[6] = LE32(state);
-    FBReq[7] = 0;
-
-    CachePreDMA(FBReq, &len, 0);
-    mbox_send(8, (ULONG)FBReq, WiFiBase);
-    mbox_recv(8, WiFiBase);
-    CachePostDMA(FBReq, &len, 0);
-
-    return LE32(FBReq[6]);
+    return mbox_tag(0x00038041, 8, 128 + id, state, WiFiBase); // SET_GPIO_STATE
 }
