@@ -923,10 +923,12 @@ static STACKARGS void PacketPoller(struct SDIO *sdio)
     }
 out:
     sdio->s_PollWake = 0;
-    sdio->s_PollTask = NULL;
-    /* the receiver waits for this before it frees the signal and goes */
-    Signal(sdio->s_ReceiverTask, 1UL << sdio->s_PollSignal);
     FreeSignal(sig);
+    /* the receiver waits for this before it frees the signal and goes; under
+       Forbid no instruction of this task runs after it hears it */
+    Forbid();
+    sdio->s_PollTask = NULL;
+    Signal(sdio->s_ReceiverTask, 1UL << sdio->s_PollSignal);
 }
 
 static void StartPoller(struct SDIO *sdio)
@@ -1215,7 +1217,8 @@ STACKARGS void PacketReceiver(struct SDIO *sdio, struct Task *caller)
         ScanWatchdog(WiFiBase);
 
         /* If no scan request is in progress start another one (if needed) */
-        if (WiFiBase->w_Unit && WiFiBase->w_Unit->wu_ScanRequest == NULL)
+        if (WiFiBase->w_Unit && WiFiBase->w_Unit->wu_ScanQueue != NULL &&
+            WiFiBase->w_Unit->wu_ScanRequest == NULL)
         {
             struct IOSana2Req *io = (struct IOSana2Req *)GetMsg(WiFiBase->w_Unit->wu_ScanQueue);
             if (io)
@@ -1513,6 +1516,8 @@ STACKARGS void PacketReceiver(struct SDIO *sdio, struct Task *caller)
     DeleteIORequest(&tr->tr_node);
     DeleteMsgPort(port);
     DeleteMsgPort(ctrl);
+    /* the expunge frees this code once this reads NULL */
+    Forbid();
     sdio->s_ReceiverTask = NULL;
 }
 
