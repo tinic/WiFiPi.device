@@ -691,6 +691,7 @@ struct WiFiBase * WiFi_Init(REGARG(struct WiFiBase *base, "d0"), REGARG(BPTR seg
     WiFiBase->w_Request = (APTR)(((ULONG)WiFiBase->w_RequestOrig + 31) & ~31);
 
     WiFiBase->w_DeviceTreeBase = DeviceTreeBase = OpenResource((CONST_STRPTR)"devicetree.resource");
+    WiFiBase->w_MailboxBase = OpenResource((CONST_STRPTR)"mailbox.resource");
 
     if (DeviceTreeBase)
     {

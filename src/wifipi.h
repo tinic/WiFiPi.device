@@ -66,6 +66,7 @@ struct WiFiBase
     APTR                w_DeviceTreeBase;
     APTR                w_SDIOBase;
     APTR                w_MailBox;
+    APTR                w_MailboxBase;      // mailbox.resource (Emu68 1.1+), NULL: drive the registers
     APTR                w_GPIOBase;
     APTR                w_RequestOrig;
     APTR                w_MemPool;
