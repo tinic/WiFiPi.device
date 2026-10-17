@@ -62,6 +62,7 @@ STACKARGS void UnitTask(struct WiFiUnit *unit, struct Task *parent)
         DeleteIORequest((struct IORequest *)tr);
         DeleteMsgPort(port);
         unit->wu_CmdQueue = NULL;
+        unit->wu_ScanQueue = NULL;
         return;
     }
 
@@ -73,6 +74,7 @@ STACKARGS void UnitTask(struct WiFiUnit *unit, struct Task *parent)
         DeleteMsgPort(unit->wu_CmdQueue);
         DeleteMsgPort(unit->wu_ScanQueue);
         unit->wu_CmdQueue = NULL;
+        unit->wu_ScanQueue = NULL;
         return;
     }
 
@@ -193,8 +195,13 @@ STACKARGS void UnitTask(struct WiFiUnit *unit, struct Task *parent)
     CloseDevice(&tr->tr_node);
     DeleteIORequest(&tr->tr_node);
     DeleteMsgPort(port);
+    /* The receiver reads wu_ScanQueue on every wake-up.  Forbid to the end:
+       the expunge frees this code once wu_Task reads NULL. */
+    Forbid();
     DeleteMsgPort(unit->wu_CmdQueue);
     DeleteMsgPort(unit->wu_ScanQueue);
+    unit->wu_CmdQueue = NULL;
+    unit->wu_ScanQueue = NULL;
     unit->wu_Task = NULL;
 }
 

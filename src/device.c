@@ -89,6 +89,22 @@ void _NewList(APTR listPTR)
     lh->lh_TailPred = (struct Node *)&(lh->lh_Head);
 }
 
+/* CTRL-C to one of the driver's tasks; it clears *task under Forbid as its
+   last act, so once that reads NULL none of its code runs again. */
+static void StopTask(struct Task *volatile *task, struct timerequest *tr, struct ExecBase *SysBase)
+{
+    if (*task == NULL)
+        return;
+    Signal(*task, SIGBREAKF_CTRL_C);
+    while (*task != NULL)
+    {
+        tr->tr_time.tv_micro = 250000;
+        tr->tr_time.tv_secs = 0;
+        tr->tr_node.io_Command = TR_ADDREQUEST;
+        DoIO(&tr->tr_node);
+    }
+}
+
 static BPTR WiFi_Expunge(REGARG(struct WiFiBase * WiFiBase, "a6"))
 {
     struct ExecBase *SysBase = WiFiBase->w_SysBase;
@@ -126,24 +142,15 @@ static BPTR WiFi_Expunge(REGARG(struct WiFiBase * WiFiBase, "a6"))
         }
 
         /* Stop tasks.  WiFi_Init starts them only with the unit: without
-           one there is nothing to stop, and w_SDIO may be NULL too. */
+           one there is nothing to stop, and w_SDIO may be NULL too.  The
+           receiver goes first: it reads the unit task's wu_ScanQueue on
+           every wake-up, and the unit task deletes that port as it leaves. */
         if (WiFiBase->w_Unit != NULL)
         {
             D(bug("[WiFi] Killing receiver task\n"));
-            Signal(WiFiBase->w_SDIO->s_ReceiverTask, SIGBREAKF_CTRL_C);
+            StopTask(&WiFiBase->w_SDIO->s_ReceiverTask, tr, SysBase);
             D(bug("[WiFi] Killing unit task\n"));
-            Signal(WiFiBase->w_Unit->wu_Task, SIGBREAKF_CTRL_C);
-
-            /* Wait for unit and receiver tasks to finish */
-            do {
-                if (tr) {
-                    tr->tr_time.tv_micro = 250000;
-                    tr->tr_time.tv_secs = 0;
-                    tr->tr_node.io_Command = TR_ADDREQUEST;
-                    DoIO(&tr->tr_node);
-                }
-                D(bug("[WiFi] Receiver: %08lx, Unit: %08lx\n", (ULONG)WiFiBase->w_SDIO->s_ReceiverTask, (ULONG)WiFiBase->w_Unit->wu_Task));
-            } while(WiFiBase->w_SDIO->s_ReceiverTask != 0 || WiFiBase->w_Unit->wu_Task != 0);
+            StopTask(&WiFiBase->w_Unit->wu_Task, tr, SysBase);
         }
 
         if (timerError == 0)
