@@ -1330,7 +1330,7 @@ static int Do_CMD_WRITE(struct IOSana2Req *io)
     }
 }
 
-static BOOL UpdateMCastList(struct WiFiUnit *unit)
+static LONG UpdateMCastList(struct WiFiUnit *unit)
 {
     struct WiFiBase *WiFiBase = unit->wu_Base;
     struct SDIO *sdio = WiFiBase->w_SDIO;
@@ -1338,18 +1338,27 @@ static BOOL UpdateMCastList(struct WiFiUnit *unit)
     ULONG totalCount = 0;
     struct MulticastRange *range;
 
-    /* Count number of multicast addresses */
+    /* Never expand more than one control message's worth of addresses.
+       PacketSetVar also accounts for its header/name and may choose the
+       existing allmulti fallback for a slightly smaller list.  Compare in
+       64 bits before narrowing, adding or multiplying any range length. */
+    const ULONG maxCount = (PACKET_CTRL_MAX_MSG - sizeof(ULONG)) / 6;
     ForeachNode(&unit->wu_MulticastRanges, range)
     {
-        LONG cnt = range->mr_UpperBound - range->mr_LowerBound;
-        if (cnt < 0) cnt = -cnt;
-
-        totalCount += cnt + 1;
+        uint64_t span = range->mr_UpperBound - range->mr_LowerBound;
+        if (span >= maxCount - totalCount)
+        {
+            LONG err = PacketSetVarInt(sdio, "allmulti", 1);
+            if (err == 0)
+                return 0;
+            return err == PACKET_CTRL_NORES ? S2ERR_NO_RESOURCES : S2ERR_OUTOFSERVICE;
+        }
+        totalCount += (ULONG)span + 1;
     }
 
     UBYTE *list = AllocVecPooled(WiFiBase->w_MemPool, totalCount * 6 + 4);
     if (list == NULL)
-        return FALSE;
+        return S2ERR_NO_RESOURCES;
     UBYTE *dst = list + 4;
 
     /* Put number of entries in the list first */
@@ -1379,7 +1388,7 @@ static BOOL UpdateMCastList(struct WiFiUnit *unit)
     PacketSetVarInt(sdio, "allmulti", (err != 0 && totalCount != 0) ? 1 : 0);
 
     FreeVecPooled(WiFiBase->w_MemPool, list);
-    return TRUE;
+    return 0;
 }
 
 static int Do_S2_ADDMULTICASTADDRESSES(struct IOSana2Req *io)
@@ -1420,17 +1429,11 @@ static int Do_S2_ADDMULTICASTADDRESSES(struct IOSana2Req *io)
         upper_bound = u.u64;
     }
 
-    for (uint64_t mac = lower_bound; mac <= upper_bound; mac++)
+    if (lower_bound > upper_bound)
     {
-        union {
-            uint64_t u64;
-            uint8_t u8[8];
-        } u;
-        u.u64 = mac;
-
-        D(bug("[WiFi.0] * "));
-        D(bug("%02lx:%02lx:%02lx:%02lx:%02lx:%02lx\n", 
-                u.u8[2], u.u8[3], u.u8[4], u.u8[5], u.u8[6], u.u8[7]));
+        io->ios2_Req.io_Error = S2ERR_BAD_ADDRESS;
+        io->ios2_WireError = S2WERR_BAD_MULTICAST;
+        return 1;
     }
 
     /* Go through already registered multicast ranges. If one is found, increase use count and return */
@@ -1458,12 +1461,13 @@ static int Do_S2_ADDMULTICASTADDRESSES(struct IOSana2Req *io)
 
     /* No firmware command is sent if the list allocation fails.  Undo the
        new range so a retry does not find a group that was never installed. */
-    if (!UpdateMCastList(unit))
+    LONG err = UpdateMCastList(unit);
+    if (err != 0)
     {
         Remove((struct Node *)range);
         FreePooled(WiFiBase->w_MemPool, range, sizeof(struct MulticastRange));
-        io->ios2_Req.io_Error = S2ERR_NO_RESOURCES;
-        io->ios2_WireError = S2WERR_BUFF_ERROR;
+        io->ios2_Req.io_Error = err;
+        io->ios2_WireError = err == S2ERR_NO_RESOURCES ? S2WERR_BUFF_ERROR : S2WERR_GENERIC_ERROR;
     }
 
     return 1;
@@ -1508,6 +1512,13 @@ static int Do_S2_DELMULTICASTADDRESSES(struct IOSana2Req *io)
         upper_bound = u.u64;
     }
 
+    if (lower_bound > upper_bound)
+    {
+        io->ios2_Req.io_Error = S2ERR_BAD_ADDRESS;
+        io->ios2_WireError = S2WERR_BAD_MULTICAST;
+        return 1;
+    }
+
     /* Go through already registered multicast ranges. Once found, decrease use count */
     ForeachNode(&unit->wu_MulticastRanges, range)
     {
@@ -1521,14 +1532,15 @@ static int Do_S2_DELMULTICASTADDRESSES(struct IOSana2Req *io)
                 Remove((struct Node *)range);
                 /* Keep the record alive until the replacement list exists.
                    On allocation failure the firmware still has the old list. */
-                if (UpdateMCastList(unit))
+                LONG err = UpdateMCastList(unit);
+                if (err == 0)
                     FreePooled(WiFiBase->w_MemPool, range, sizeof(struct MulticastRange));
                 else
                 {
                     range->mr_UseCount = 1;
                     AddHead((struct List *)&unit->wu_MulticastRanges, (struct Node *)range);
-                    io->ios2_Req.io_Error = S2ERR_NO_RESOURCES;
-                    io->ios2_WireError = S2WERR_BUFF_ERROR;
+                    io->ios2_Req.io_Error = err;
+                    io->ios2_WireError = err == S2ERR_NO_RESOURCES ? S2WERR_BUFF_ERROR : S2WERR_GENERIC_ERROR;
                 }
             }
             return 1;

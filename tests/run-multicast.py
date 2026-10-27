@@ -8,6 +8,7 @@ Run: python3 tests/run-multicast.py --build-dir <anxd>/build/wifi-multicast
 Use --source <old-unit.c> for the failing-parent negative control.
 """
 import argparse
+import re
 from pathlib import Path
 import subprocess
 import tempfile
@@ -25,6 +26,13 @@ args.build_dir.mkdir(parents=True, exist_ok=True)
 with tempfile.TemporaryDirectory(prefix="case-", dir=args.build_dir) as work:
     work = Path(work)
     (work / "multicast-under-test.inc").write_text(source[start:end])
+    # Use the driver's own status/control constants in the host shim.
+    constants = []
+    for header in [root / "include/devices/sana2.h", root / "src/packet.h"]:
+        for line in header.read_text().splitlines():
+            if re.match(r"#define\s+(S2ERR_\w+|S2WERR_\w+|S2_(?:ADD|DEL)MULTICAST\w+|PACKET_CTRL_(?:MAX_MSG|NORES|TIMEOUT))\s", line):
+                constants.append(line)
+    (work / "multicast-constants.inc").write_text("\n".join(constants) + "\n")
     binary = work / "multicast-test"
     subprocess.run(["clang", "-std=c11", "-Wall", "-Wextra", "-Werror",
                     "-Wno-unused-variable", "-fsanitize=address,undefined",

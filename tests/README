@@ -10,6 +10,9 @@ ASan/UBSan and fake Exec allocation/list and firmware SET functions. It checks
 allocation failures, subscription rollback, retry and reference counts. This
 does not exercise Exec scheduling, the device dispatcher or firmware delivery.
 Use --source <old-unit.c> for a failing-parent negative control.
+Range cases cover the control-message ceiling, aggregate ranges, 32-bit count
+overflow, a full 48-bit span, reversed endpoints and failed allmulti fallback.
+The shim imports status/control constants from the production headers.
 
 test_ctrl.c (#93) needs -DWIFIPI_TEST_SEAMS (the timer-failure seam).  Build
 from a v1.0.0-beta4 AmiNetXDuo tree, which provides include/ and, once
