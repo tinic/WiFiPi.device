@@ -1,6 +1,16 @@
 The tests here link the driver's own sources against a fake WiFiBase/WiFiUnit
 and run under an emulator (Amiberry, A1200); no Pi hardware is touched.
 
+The multicast allocation regression also has a host-only test:
+
+  python3 tests/run-multicast.py --build-dir <anxd>/build/wifi-multicast
+
+It compiles the actual three multicast handlers from src/unit.c with Clang
+ASan/UBSan and fake Exec allocation/list and firmware SET functions. It checks
+allocation failures, subscription rollback, retry and reference counts. This
+does not exercise Exec scheduling, the device dispatcher or firmware delivery.
+Use --source <old-unit.c> for a failing-parent negative control.
+
 test_ctrl.c (#93) needs -DWIFIPI_TEST_SEAMS (the timer-failure seam).  Build
 from a v1.0.0-beta4 AmiNetXDuo tree, which provides include/ and, once
 configured, the generated devicetree headers:
