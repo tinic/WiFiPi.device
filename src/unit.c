@@ -1330,7 +1330,7 @@ static int Do_CMD_WRITE(struct IOSana2Req *io)
     }
 }
 
-static void UpdateMCastList(struct WiFiUnit *unit)
+static BOOL UpdateMCastList(struct WiFiUnit *unit)
 {
     struct WiFiBase *WiFiBase = unit->wu_Base;
     struct SDIO *sdio = WiFiBase->w_SDIO;
@@ -1348,6 +1348,8 @@ static void UpdateMCastList(struct WiFiUnit *unit)
     }
 
     UBYTE *list = AllocVecPooled(WiFiBase->w_MemPool, totalCount * 6 + 4);
+    if (list == NULL)
+        return FALSE;
     UBYTE *dst = list + 4;
 
     /* Put number of entries in the list first */
@@ -1377,6 +1379,7 @@ static void UpdateMCastList(struct WiFiUnit *unit)
     PacketSetVarInt(sdio, "allmulti", (err != 0 && totalCount != 0) ? 1 : 0);
 
     FreeVecPooled(WiFiBase->w_MemPool, list);
+    return TRUE;
 }
 
 static int Do_S2_ADDMULTICASTADDRESSES(struct IOSana2Req *io)
@@ -1442,13 +1445,26 @@ static int Do_S2_ADDMULTICASTADDRESSES(struct IOSana2Req *io)
 
     /* No range was found. Create new one and add the multicast range on the WiFi module */
     range = AllocPooledClear(WiFiBase->w_MemPool, sizeof(struct MulticastRange));
+    if (range == NULL)
+    {
+        io->ios2_Req.io_Error = S2ERR_NO_RESOURCES;
+        io->ios2_WireError = S2WERR_BUFF_ERROR;
+        return 1;
+    }
     range->mr_UseCount = 1;
     range->mr_LowerBound = lower_bound;
     range->mr_UpperBound = upper_bound;
     AddHead((struct List *)&unit->wu_MulticastRanges, (struct Node *)range);
 
-    /* Add range on WiFi now */
-    UpdateMCastList(unit);
+    /* No firmware command is sent if the list allocation fails.  Undo the
+       new range so a retry does not find a group that was never installed. */
+    if (!UpdateMCastList(unit))
+    {
+        Remove((struct Node *)range);
+        FreePooled(WiFiBase->w_MemPool, range, sizeof(struct MulticastRange));
+        io->ios2_Req.io_Error = S2ERR_NO_RESOURCES;
+        io->ios2_WireError = S2WERR_BUFF_ERROR;
+    }
 
     return 1;
 }
@@ -1503,10 +1519,17 @@ static int Do_S2_DELMULTICASTADDRESSES(struct IOSana2Req *io)
             if (range->mr_UseCount == 0)
             {
                 Remove((struct Node *)range);
-                FreePooled(WiFiBase->w_MemPool, range, sizeof(struct MulticastRange));
-
-                /* Remove the range on WiFi now... */
-                UpdateMCastList(unit);
+                /* Keep the record alive until the replacement list exists.
+                   On allocation failure the firmware still has the old list. */
+                if (UpdateMCastList(unit))
+                    FreePooled(WiFiBase->w_MemPool, range, sizeof(struct MulticastRange));
+                else
+                {
+                    range->mr_UseCount = 1;
+                    AddHead((struct List *)&unit->wu_MulticastRanges, (struct Node *)range);
+                    io->ios2_Req.io_Error = S2ERR_NO_RESOURCES;
+                    io->ios2_WireError = S2WERR_BUFF_ERROR;
+                }
             }
             return 1;
         }
