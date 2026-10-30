@@ -149,7 +149,7 @@ static BOOL brcm_chip_cm3_set_active(struct Chip *chip, ULONG resetVector)
         return FALSE;
     }
 
-    sdio_activate(chip->GetCore(chip, BCMA_CORE_SDIO_DEV), 0);
+    sdio_activate(chip->c_SDIO->s_SDIOC, 0);
 
     core = chip->GetCore(chip, BCMA_CORE_ARM_CM3);
     chip->ResetCore(chip, core, 0, 0, 0);
@@ -208,7 +208,7 @@ static BOOL brcm_chip_cr4_set_active(struct Chip *chip, ULONG resetVector)
 {
     struct Core *core;
 
-    sdio_activate(chip->GetCore(chip, BCMA_CORE_SDIO_DEV), resetVector);
+    sdio_activate(chip->c_SDIO->s_SDIOC, resetVector);
 
     /* restore ARM */
     core = chip->GetCore(chip, BCMA_CORE_ARM_CR4);
@@ -234,7 +234,7 @@ static BOOL brcm_chip_ca7_set_active(struct Chip *chip, ULONG resetVector)
 {
     struct Core *core;
 
-    sdio_activate(chip->GetCore(chip, BCMA_CORE_SDIO_DEV), resetVector);
+    sdio_activate(chip->c_SDIO->s_SDIOC, resetVector);
 
     /* restore ARM */
     core = chip->GetCore(chip, BCMA_CORE_ARM_CA7);
@@ -361,8 +361,14 @@ static int brcm_chip_cores_check(struct Chip * chip)
     struct Core *core;
     UBYTE need_socram = FALSE;
     UBYTE has_socram = FALSE;
+    UBYTE need_d11 = FALSE;
+    UBYTE has_d11 = FALSE;
     UBYTE cpu_found = FALSE;
     int idx = 1;
+
+    /* SetActive and chip_init write through the SDIO core unchecked; it is
+       found here or the chip is refused (brcmfmac fails attach the same way) */
+    chip->c_SDIO->s_SDIOC = NULL;
 
     D(bug("[WiFi] Cores check\n"));
 
@@ -377,6 +383,7 @@ static int brcm_chip_cores_check(struct Chip * chip)
                 D(bug(" is ARM CM3, needs SOC RAM"));
                 cpu_found = TRUE;
                 need_socram = TRUE;
+                need_d11 = TRUE;
                 chip->SetActive = brcm_chip_cm3_set_active;
                 chip->SetPassive = brcm_chip_cm3_set_passive;
                 break;
@@ -396,14 +403,37 @@ static int brcm_chip_cores_check(struct Chip * chip)
             case BCMA_CORE_ARM_CA7:
                 D(bug(" is ARM_CA7"));
                 cpu_found = TRUE;
+                need_d11 = TRUE;
                 chip->SetActive = brcm_chip_ca7_set_active;
                 chip->SetPassive = brcm_chip_ca7_set_passive;
+                break;
+
+            case BCMA_CORE_80211:
+                has_d11 = TRUE;
+                break;
+
+            case BCMA_CORE_SDIO_DEV:
+                if (chip->c_SDIO->s_SDIOC == NULL)
+                    chip->c_SDIO->s_SDIOC = core;
                 break;
 
             default:
                 break;
         }
         D(bug("\n"));
+    }
+
+    if (chip->c_SDIO->s_SDIOC == NULL)
+    {
+        D(bug("[WiFi] SDIO device core not detected\n"));
+        return FALSE;
+    }
+
+    /* the CM3 and CA7 SetPassive reset the D11 core unchecked */
+    if (need_d11 && !has_d11)
+    {
+        D(bug("[WiFi] D11 core not detected\n"));
+        return FALSE;
     }
 
     if (!cpu_found)
@@ -646,9 +676,8 @@ int chip_setup(struct Chip *chip)
     cc = (struct Core *)chip->c_Cores.mlh_Head;
     base = cc->c_BaseAddress;
 
-    // Remember Chipcomm and SDIO cores in SDIO
+    // Remember Chipcomm core in SDIO; brcm_chip_cores_check set the SDIO core
     chip->c_SDIO->s_CC = cc;
-    chip->c_SDIO->s_SDIOC = chip->GetCore(chip, BCMA_CORE_SDIO_DEV);
 
     /* get chipcommon capabilites */
     chip->c_Caps = chip->c_SDIO->Read32(CORE_CC_REG(base, capabilities), chip->c_SDIO);
@@ -1124,6 +1153,7 @@ int chip_init(struct SDIO *sdio)
         {
             FreePooled(WiFiBase->w_MemPool, core, sizeof(struct Core));
         }
+        sdio->s_SDIOC = NULL;
         FreePooled(WiFiBase->w_MemPool, chip, sizeof(struct Chip));
         return 0;
     }
@@ -1251,7 +1281,7 @@ int chip_init(struct SDIO *sdio)
     }
 
     /* Enable function 2 (frame transfers) */
-    struct Core *core = chip->GetCore(chip, BCMA_CORE_SDIO_DEV);
+    struct Core *core = sdio->s_SDIOC;
     sdio->Write32(core->c_BaseAddress + SD_REG(tosbmailboxdata), SDPCM_PROT_VERSION << SMB_DATA_VERSION_SHIFT, sdio);
 
     /* Enable RAD function */
