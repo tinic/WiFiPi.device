@@ -14,6 +14,15 @@ Range cases cover the control-message ceiling, aggregate ranges, 32-bit count
 overflow, a full 48-bit span, reversed endpoints and failed allmulti fallback.
 The shim imports status/control constants from the production headers.
 
+brcm_chip_cores_check() has a host-only test as well:
+
+  python3 tests/run-corescheck.py --build-dir <anxd>/build/wifi-corescheck
+
+It runs the function from src/wifipi.c on fake core lists with ASan/UBSan. A
+chip without the SDIO device core, or a CM3/CA7 chip without a D11 core, is
+refused: SetActive, SetPassive and chip_init() use those cores unchecked.
+Use --source <old-wifipi.c> for a failing-parent negative control.
+
 test_ctrl.c (#93) needs -DWIFIPI_TEST_SEAMS (the timer-failure seam).  Build
 from a v1.0.0-beta4 AmiNetXDuo tree, which provides include/ and, once
 configured, the generated devicetree headers:
