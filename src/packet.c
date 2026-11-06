@@ -30,10 +30,11 @@
 #endif
 
 /*
- * S2_CopyToBuff and S2_CopyFromBuff are the opener's code.  WirelessManager
- * 1.5 hands in "exg a0,a1; move.l 4.w,a6; jsr CopyMem(a6); moveq #1,d0; rts"
- * for both, which returns with SysBase in a6.  Call them with a6 treated as
- * clobbered, beside the usual scratch registers.
+ * S2_CopyToBuff, S2_CopyFromBuff and S2_PacketFilter are the opener's code.
+ * WirelessManager 1.5 hands in "exg a0,a1; move.l 4.w,a6; jsr CopyMem(a6);
+ * moveq #1,d0; rts" for both buffer functions, which returns with SysBase in
+ * a6.  Call them with a6 treated as clobbered, beside the usual scratch
+ * registers.
  */
 static inline BOOL CallBufferFunc(APTR func, APTR to, APTR from, ULONG length)
 {
@@ -47,6 +48,25 @@ static inline BOOL CallBufferFunc(APTR func, APTR to, APTR from, ULONG length)
                  : "d1", "a6", "cc", "memory");
 
     return (BOOL)_d0;
+}
+
+/*
+ * The same for a Hook.  CallHookPkt() is no shield: in ROM 40.68 it is
+ * "move.l 8(a0),-(sp); rts", the hook returns straight to the caller.
+ */
+static inline ULONG CallHookFunc(struct Hook *hook, APTR object, APTR message)
+{
+    register ULONG _d0 asm("d0");
+    register struct Hook *_a0 asm("a0") = hook;
+    register APTR _a1 asm("a1") = message;
+    register APTR _a2 asm("a2") = object;
+
+    asm volatile("move.l %c4(%1),%%a6\n\tjsr (%%a6)"
+                 : "=r" (_d0), "+r" (_a0), "+r" (_a1)
+                 : "r" (_a2), "i" (offsetof(struct Hook, h_Entry))
+                 : "d1", "a6", "cc", "memory");
+
+    return _d0;
 }
 
 /*
@@ -1645,7 +1665,6 @@ void CopyPacket(struct IOSana2Req *io, UBYTE *packet, ULONG packetLength)
     struct WiFiBase *WiFiBase = unit->wu_Base;
     struct ExecBase *SysBase = WiFiBase->w_SysBase;
     struct Opener *opener = io->ios2_BufferManagement;
-    struct Library *UtilityBase = WiFiBase->w_UtilityBase;
     UBYTE packetFiltered = FALSE;
 
     UBYTE *copyData;
@@ -1693,7 +1712,7 @@ void CopyPacket(struct IOSana2Req *io, UBYTE *packet, ULONG packetLength)
     /* Filter packet if CMD_READ and filter hook is set */
     if (io->ios2_Req.io_Command == CMD_READ && opener->o_FilterHook)
     {
-        if (!CallHookPkt(opener->o_FilterHook, io, copyData))
+        if (!CallHookFunc(opener->o_FilterHook, io, copyData))
         {
             packetFiltered = TRUE;
         }
