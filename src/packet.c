@@ -30,6 +30,26 @@
 #endif
 
 /*
+ * S2_CopyToBuff and S2_CopyFromBuff are the opener's code.  WirelessManager
+ * 1.5 hands in "exg a0,a1; move.l 4.w,a6; jsr CopyMem(a6); moveq #1,d0; rts"
+ * for both, which returns with SysBase in a6.  Call them with a6 treated as
+ * clobbered, beside the usual scratch registers.
+ */
+static inline BOOL CallBufferFunc(APTR func, APTR to, APTR from, ULONG length)
+{
+    register ULONG _d0 asm("d0") = length;
+    register APTR _a0 asm("a0") = to;
+    register APTR _a1 asm("a1") = from;
+
+    asm volatile("jsr (%3)"
+                 : "+r" (_d0), "+r" (_a0), "+r" (_a1)
+                 : "a" (func)
+                 : "d1", "a6", "cc", "memory");
+
+    return (BOOL)_d0;
+}
+
+/*
  * brcmfmac sdio bus specific header
  * This is the lowest layer header wrapped on the packets transmitted between
  * host and WiFi dongle which contains information needed for SDIO core and
@@ -1719,7 +1739,7 @@ void CopyPacket(struct IOSana2Req *io, UBYTE *packet, ULONG packetLength)
     {
         if (copyLength != 0)
         {
-            if (opener->o_RXFunc(io->ios2_Data, copyData, copyLength) == 0)
+            if (CallBufferFunc((APTR)opener->o_RXFunc, io->ios2_Data, copyData, copyLength) == 0)
             {
                 io->ios2_WireError = S2WERR_BUFF_ERROR;
                 io->ios2_Req.io_Error = S2ERR_NO_RESOURCES;
@@ -1931,7 +1951,7 @@ int SendGlomDataPacket(struct SDIO *sdio, struct IOSana2Req **ioList, UBYTE coun
         if (io->ios2_DataLength != 0)
         {
             // Copy packet contents
-            opener->o_TXFunc(ptr, io->ios2_Data, io->ios2_DataLength);
+            CallBufferFunc((APTR)opener->o_TXFunc, ptr, io->ios2_Data, io->ios2_DataLength);
         }
         else
         {
@@ -2036,7 +2056,7 @@ int SendDataPacket(struct SDIO *sdio, struct IOSana2Req *io)
     if (io->ios2_DataLength != 0)
     {
         // Copy packet contents
-        opener->o_TXFunc(ptr, io->ios2_Data, io->ios2_DataLength);
+        CallBufferFunc((APTR)opener->o_TXFunc, ptr, io->ios2_Data, io->ios2_DataLength);
     }
     else
     {
